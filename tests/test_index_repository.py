@@ -52,7 +52,9 @@ class IndexRepositoryTests(unittest.TestCase):
             repository = Path(temporary_directory)
             self._write(repository / "src/main/java/example/App.java", "class App {}\n")
             environment = os.environ | {
-                "PYTHONPATH": str(Path(__file__).parents[1] / "src")
+                "PYTHONPATH": os.pathsep.join(
+                    filter(None, (os.environ.get("PYTHONPATH"), str(Path(__file__).parents[1] / "src")))
+                )
             }
 
             completed = subprocess.run(
@@ -75,7 +77,9 @@ class IndexRepositoryTests(unittest.TestCase):
             repository = Path(temporary_directory)
             self._write(repository / "src/main/java/example/App.java", "class App {}\n")
             environment = os.environ | {
-                "PYTHONPATH": str(Path(__file__).parents[1] / "src")
+                "PYTHONPATH": os.pathsep.join(
+                    filter(None, (os.environ.get("PYTHONPATH"), str(Path(__file__).parents[1] / "src")))
+                )
             }
 
             completed = subprocess.run(

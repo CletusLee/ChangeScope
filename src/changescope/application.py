@@ -9,6 +9,8 @@ import subprocess
 from typing import Iterable
 from xml.etree import ElementTree
 
+from tree_sitter import Language, Parser
+import tree_sitter_java
 
 EXCLUDED_DIRECTORY_NAMES = frozenset(
     {
@@ -47,11 +49,45 @@ class IndexSnapshot:
 
 
 @dataclass(frozen=True)
+class JavaDeclaration:
+    kind: str
+    name: str
+    qualified_name: str
+    signature: str
+    path: Path
+    start_line: int
+    end_line: int
+    is_test: bool
+
+
+@dataclass(frozen=True)
+class JavaInvocation:
+    name: str
+    receiver: str | None
+    caller: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    is_test: bool
+
+
+@dataclass(frozen=True)
+class ParseFailure:
+    path: Path
+    start_line: int
+    start_column: int
+    message: str
+
+
+@dataclass(frozen=True)
 class IndexResult:
     source_roots: tuple[Path, ...]
     indexed_files: tuple[Path, ...]
     excluded_directories: tuple[Path, ...]
     read_failures: tuple[Path, ...]
+    declarations: tuple[JavaDeclaration, ...]
+    invocations: tuple[JavaInvocation, ...]
+    parse_failures: tuple[ParseFailure, ...]
     snapshot: IndexSnapshot
 
 
@@ -72,13 +108,19 @@ def _index_repository(repository_root: Path) -> IndexResult:
     root = repository_root.resolve()
     source_roots = _discover_source_roots(root)
     excluded_directories = _excluded_directories(root)
-    indexed_files, read_failures = _java_files(root, source_roots)
+    indexed_files, read_failures, contents_by_path = _java_files(root, source_roots)
+    declarations, invocations, parse_failures = _analyze_java_files(
+        contents_by_path, _test_source_roots(root, source_roots)
+    )
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
         indexed_files=indexed_files,
         excluded_directories=excluded_directories,
         read_failures=read_failures,
+        declarations=declarations,
+        invocations=invocations,
+        parse_failures=parse_failures,
         snapshot=snapshot,
     )
     _write_index(result)
@@ -111,6 +153,14 @@ def _declared_build_source_roots(root: Path) -> tuple[Path, ...]:
 
 
 def _maven_source_roots(root: Path) -> tuple[Path, ...]:
+    return _maven_source_roots_named(root, {"sourceDirectory", "testSourceDirectory"})
+
+
+def _maven_test_source_roots(root: Path) -> tuple[Path, ...]:
+    return _maven_source_roots_named(root, {"testSourceDirectory"})
+
+
+def _maven_source_roots_named(root: Path, names: set[str]) -> tuple[Path, ...]:
     pom = root / "pom.xml"
     if not pom.is_file():
         return ()
@@ -121,7 +171,7 @@ def _maven_source_roots(root: Path) -> tuple[Path, ...]:
     roots = []
     for element in elements:
         name = element.tag.rsplit("}", maxsplit=1)[-1]
-        if name not in {"sourceDirectory", "testSourceDirectory"} or not element.text:
+        if name not in names or not element.text:
             continue
         candidate = Path(element.text.strip())
         if "$" not in str(candidate):
@@ -143,7 +193,40 @@ def _gradle_source_roots(root: Path) -> tuple[Path, ...]:
     return tuple(roots)
 
 
+def _gradle_test_source_roots(root: Path) -> tuple[Path, ...]:
+    roots = []
+    for filename in ("build.gradle", "build.gradle.kts"):
+        try:
+            contents = (root / filename).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for block in re.finditer(r"\btest\s*\{(?P<body>.*?\})", contents, re.DOTALL):
+            for match in re.finditer(
+                r"srcDirs?\s*(?:=)?\s*(?:\[\s*)?['\"]([^'\"]+)",
+                block.group("body"),
+            ):
+                roots.append(Path(match.group(1)))
+    return tuple(roots)
+
+
 def _eclipse_source_roots(root: Path) -> tuple[Path, ...]:
+    return _eclipse_source_roots_matching(root, lambda entry: True)
+
+
+def _eclipse_test_source_roots(root: Path) -> tuple[Path, ...]:
+    return _eclipse_source_roots_matching(root, _is_eclipse_test_source_entry)
+
+
+def _is_eclipse_test_source_entry(entry: ElementTree.Element) -> bool:
+    if entry.get("test") == "true":
+        return True
+    return any(
+        attribute.get("name") == "test" and attribute.get("value") == "true"
+        for attribute in entry.findall("attributes/attribute")
+    )
+
+
+def _eclipse_source_roots_matching(root: Path, predicate) -> tuple[Path, ...]:
     classpath = root / ".classpath"
     if not classpath.is_file():
         return ()
@@ -153,7 +236,7 @@ def _eclipse_source_roots(root: Path) -> tuple[Path, ...]:
         return ()
     roots = []
     for entry in entries:
-        if entry.get("kind") != "src":
+        if entry.get("kind") != "src" or not predicate(entry):
             continue
         path = entry.get("path")
         if not path:
@@ -190,9 +273,10 @@ def _excluded_directories(root: Path) -> tuple[Path, ...]:
 
 def _java_files(
     root: Path, source_roots: Iterable[Path]
-) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+) -> tuple[tuple[Path, ...], tuple[Path, ...], dict[Path, bytes]]:
     indexed_files: list[Path] = []
     read_failures: list[Path] = []
+    contents_by_path: dict[Path, bytes] = {}
 
     def record_walk_failure(error: OSError) -> None:
         if not error.filename:
@@ -215,12 +299,178 @@ def _java_files(
                 candidate = Path(directory) / filename
                 relative_path = candidate.relative_to(root)
                 try:
-                    candidate.read_bytes()
+                    contents_by_path[relative_path] = candidate.read_bytes()
                 except OSError:
                     read_failures.append(relative_path)
                     continue
                 indexed_files.append(relative_path)
-    return tuple(sorted(set(indexed_files), key=str)), tuple(sorted(read_failures, key=str))
+    return (
+        tuple(sorted(set(indexed_files), key=str)),
+        tuple(sorted(read_failures, key=str)),
+        contents_by_path,
+    )
+
+
+def _analyze_java_files(
+    contents_by_path: dict[Path, bytes], test_roots: tuple[Path, ...]
+) -> tuple[
+    tuple[JavaDeclaration, ...], tuple[JavaInvocation, ...], tuple[ParseFailure, ...]
+]:
+    parser = Parser(Language(tree_sitter_java.language()))
+    declarations: list[JavaDeclaration] = []
+    invocations: list[JavaInvocation] = []
+    parse_failures: list[ParseFailure] = []
+    for path, source in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        is_test = any(path.is_relative_to(root) for root in test_roots)
+        tree = parser.parse(source)
+        package_name = _package_name(tree.root_node, source)
+        _collect_java_facts(
+            tree.root_node,
+            source,
+            path,
+            package_name,
+            is_test,
+            (),
+            None,
+            declarations,
+            invocations,
+        )
+        issue = _first_parse_failure(tree.root_node, path)
+        if issue is not None:
+            parse_failures.append(issue)
+    return (
+        tuple(sorted(declarations, key=lambda item: (str(item.path), item.start_line, item.kind))),
+        tuple(sorted(invocations, key=lambda item: (str(item.path), item.start_line, item.name))),
+        tuple(sorted(parse_failures, key=lambda item: (str(item.path), item.start_line))),
+    )
+
+
+def _test_source_roots(root: Path, source_roots: tuple[Path, ...]) -> tuple[Path, ...]:
+    declared_test_roots = set(_maven_test_source_roots(root)) | set(
+        _gradle_test_source_roots(root)
+    ) | set(_eclipse_test_source_roots(root))
+    return tuple(
+        source_root
+        for source_root in source_roots
+        if source_root in declared_test_roots
+        or any(part.lower() in {"test", "tests"} for part in source_root.parts)
+    )
+
+
+def _package_name(root_node, source: bytes) -> str:
+    for child in root_node.children:
+        if child.type != "package_declaration":
+            continue
+        declaration = _node_text(child, source)
+        match = re.match(r"package\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;", declaration)
+        return match.group(1) if match else ""
+    return ""
+
+
+def _collect_java_facts(
+    node,
+    source: bytes,
+    path: Path,
+    package_name: str,
+    is_test: bool,
+    enclosing_types: tuple[str, ...],
+    caller: str | None,
+    declarations: list[JavaDeclaration],
+    invocations: list[JavaInvocation],
+) -> None:
+    type_kinds = {
+        "class_declaration": "class",
+        "interface_declaration": "interface",
+        "enum_declaration": "enum",
+        "annotation_type_declaration": "annotation",
+        "record_declaration": "record",
+    }
+    if node.type in type_kinds:
+        name = _node_text(node.child_by_field_name("name"), source)
+        qualified_name = _qualified_type_name(package_name, (*enclosing_types, name))
+        declarations.append(
+            JavaDeclaration(
+                type_kinds[node.type], name, qualified_name, qualified_name, path, node.start_point.row + 1,
+                node.end_point.row + 1, is_test,
+            )
+        )
+        for child in node.children:
+            _collect_java_facts(
+                child, source, path, package_name, is_test, (*enclosing_types, name), caller,
+                declarations, invocations,
+            )
+        return
+    if node.type in {"method_declaration", "constructor_declaration"}:
+        name = _node_text(node.child_by_field_name("name"), source)
+        kind = "constructor" if node.type == "constructor_declaration" else "method"
+        owner = _qualified_type_name(package_name, enclosing_types)
+        qualified_name = f"{owner}#{name}" if owner else name
+        signature = f"{qualified_name}({_parameter_types(node, source)})"
+        declarations.append(
+            JavaDeclaration(
+                kind, name, qualified_name, signature, path, node.start_point.row + 1,
+                node.end_point.row + 1, is_test,
+            )
+        )
+        for child in node.children:
+            _collect_java_facts(
+                child, source, path, package_name, is_test, enclosing_types, qualified_name,
+                declarations, invocations,
+            )
+        return
+    if node.type == "method_invocation":
+        name = _node_text(node.child_by_field_name("name"), source)
+        receiver_node = node.child_by_field_name("object")
+        receiver = _node_text(receiver_node, source) if receiver_node is not None else None
+        invocations.append(
+            JavaInvocation(
+                name, receiver, caller, path, node.start_point.row + 1, node.end_point.row + 1,
+                is_test,
+            )
+        )
+    for child in node.children:
+        _collect_java_facts(
+            child, source, path, package_name, is_test, enclosing_types, caller,
+            declarations, invocations,
+        )
+
+
+def _qualified_type_name(package_name: str, type_names: tuple[str, ...]) -> str:
+    segments = (*((package_name,) if package_name else ()), *type_names)
+    return ".".join(segments)
+
+
+def _node_text(node, source: bytes) -> str:
+    if node is None:
+        return ""
+    return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
+
+
+def _parameter_types(node, source: bytes) -> str:
+    parameters = node.child_by_field_name("parameters")
+    if parameters is None:
+        return ""
+    types = []
+    for parameter in parameters.named_children:
+        parameter_type = parameter.child_by_field_name("type")
+        if parameter_type is not None:
+            types.append(_node_text(parameter_type, source))
+    return ", ".join(types)
+
+
+def _first_parse_failure(root_node, path: Path) -> ParseFailure | None:
+    if not root_node.has_error:
+        return None
+    stack = [root_node]
+    while stack:
+        node = stack.pop()
+        if node.type == "ERROR" or node.is_missing:
+            return ParseFailure(
+                path, node.start_point.row + 1, node.start_point.column + 1,
+                "Java syntax error",
+            )
+        stack.extend(reversed(node.children))
+    return ParseFailure(path, root_node.start_point.row + 1, root_node.start_point.column + 1, "Java syntax error")
 
 
 def _is_excluded(relative_path: Path) -> bool:
@@ -306,8 +556,49 @@ def _replace_index_contents(
     connection.execute(
         "CREATE TABLE IF NOT EXISTS source_files (path TEXT PRIMARY KEY, status TEXT NOT NULL)"
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS java_declarations (
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        qualified_name TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        is_test INTEGER NOT NULL
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS java_invocations (
+        name TEXT NOT NULL,
+        receiver TEXT,
+        caller TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        is_test INTEGER NOT NULL
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS parse_failures (
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        start_column INTEGER NOT NULL,
+        message TEXT NOT NULL
+        )"""
+    )
+    declaration_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
+    }
+    if "signature" not in declaration_columns:
+        connection.execute(
+            "ALTER TABLE java_declarations ADD COLUMN signature TEXT NOT NULL DEFAULT ''"
+        )
     connection.execute("DELETE FROM metadata")
     connection.execute("DELETE FROM source_files")
+    connection.execute("DELETE FROM java_declarations")
+    connection.execute("DELETE FROM java_invocations")
+    connection.execute("DELETE FROM parse_failures")
     connection.executemany(
         "INSERT INTO metadata(key, value) VALUES (?, ?)",
         (
@@ -324,4 +615,46 @@ def _replace_index_contents(
     connection.executemany(
         "INSERT INTO source_files(path, status) VALUES (?, ?)",
         ((str(path), "unreadable") for path in result.read_failures),
+    )
+    connection.executemany(
+        """INSERT INTO java_declarations(
+        kind, name, qualified_name, signature, path, start_line, end_line, is_test
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                declaration.kind,
+                declaration.name,
+                declaration.qualified_name,
+                declaration.signature,
+                str(declaration.path),
+                declaration.start_line,
+                declaration.end_line,
+                int(declaration.is_test),
+            )
+            for declaration in result.declarations
+        ),
+    )
+    connection.executemany(
+        """INSERT INTO java_invocations(
+        name, receiver, caller, path, start_line, end_line, is_test
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                invocation.name,
+                invocation.receiver,
+                invocation.caller,
+                str(invocation.path),
+                invocation.start_line,
+                invocation.end_line,
+                int(invocation.is_test),
+            )
+            for invocation in result.invocations
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO parse_failures(path, start_line, start_column, message) VALUES (?, ?, ?, ?)",
+        (
+            (failure.path.as_posix(), failure.start_line, failure.start_column, failure.message)
+            for failure in result.parse_failures
+        ),
     )

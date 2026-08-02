@@ -7,6 +7,10 @@ name = "changescope"
 version = "0.1.0"
 description = "Local-first explainable impact analysis for legacy codebases"
 requires-python = ">=3.10"
+dependencies = [
+  "tree-sitter==0.26.0",
+  "tree-sitter-java==0.23.5",
+]
 
 [project.scripts]
 changescope = "changescope.cli:main"
