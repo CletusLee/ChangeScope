@@ -5,7 +5,13 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from changescope.application import ChangeScopeApplication, IndexRequest, IndexResult
+from changescope.application import (
+    ChangeScopeApplication,
+    ImpactRequest,
+    ImpactResult,
+    IndexRequest,
+    IndexResult,
+)
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -15,12 +21,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
     index_command.add_argument(
         "--format", choices=("text", "json"), default="text", help="report format"
     )
+    impact_command = subcommands.add_parser("impact", help="report local Java method impact")
+    impact_command.add_argument("target", help="Java target in Class#method form")
+    impact_command.add_argument(
+        "--format", choices=("text", "json"), default="text", help="report format"
+    )
     parsed = parser.parse_args(arguments)
 
     if parsed.command == "index":
         result = ChangeScopeApplication().execute(IndexRequest(Path.cwd()))
         _render_index_result(result, parsed.format)
         return 0
+    if parsed.command == "impact":
+        result = ChangeScopeApplication().execute(ImpactRequest(Path.cwd(), parsed.target))
+        _render_impact_result(result, parsed.format)
+        return 0 if result.outcome == "resolved" else 2
     raise AssertionError(f"Unhandled command: {parsed.command}")
 
 
@@ -76,3 +91,93 @@ def _index_report(result: IndexResult) -> dict[str, object]:
 
 def _report_path(path: Path) -> str:
     return path.as_posix()
+
+
+def _render_impact_result(result: ImpactResult, output_format: str) -> None:
+    report = _impact_report(result)
+    if output_format == "json":
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+    print(f"Impact target: {report['requested_target']}")
+    print(f"Outcome: {report['outcome']}")
+    if report["target"] is not None:
+        print(f"Resolved target: {report['target']['signature']}")
+        print(f"Evidence: {report['target']['evidence_handle']}")
+    if report["candidates"]:
+        print("Candidates:")
+        for candidate in report["candidates"]:
+            print(f"- {candidate['signature']} ({candidate['evidence_handle']})")
+    if report["relationships"]:
+        print("Affected relationships:")
+        for relationship in report["relationships"]:
+            print(
+                f"- {relationship['kind']} {relationship['caller']} "
+                f"[{relationship['confidence']}] {relationship['evidence_handle']}"
+            )
+    print("Assumptions:")
+    for assumption in report["assumptions"]:
+        print(f"- {assumption}")
+    print("Unresolved items:")
+    for item in report["unresolved_items"]:
+        evidence = f" {item['evidence_handle']}" if item["evidence_handle"] else ""
+        print(f"- {item['message']}{evidence}")
+    if report["snapshot"] is not None:
+        snapshot = report["snapshot"]
+        print(
+            "Snapshot: "
+            f"{snapshot['git_commit'] or 'no Git commit'} "
+            f"({snapshot['working_tree_state']})"
+        )
+
+
+def _impact_report(result: ImpactResult) -> dict[str, object]:
+    return {
+        "outcome": result.outcome,
+        "requested_target": result.requested_target,
+        "target": _target_report(result.target) if result.target else None,
+        "candidates": [_target_report(candidate) for candidate in result.candidates],
+        "relationships": [
+            {
+                "kind": relationship.kind,
+                "caller": relationship.caller,
+                "path": _report_path(relationship.path),
+                "start_line": relationship.start_line,
+                "end_line": relationship.end_line,
+                "evidence_handle": relationship.evidence_handle,
+                "confidence": relationship.confidence,
+            }
+            for relationship in result.relationships
+        ],
+        "assumptions": list(result.assumptions),
+        "unresolved_items": [
+            {
+                "message": item.message,
+                "path": _report_path(item.path) if item.path else None,
+                "start_line": item.start_line,
+                "end_line": item.end_line,
+                "evidence_handle": item.evidence_handle,
+            }
+            for item in result.unresolved_items
+        ],
+        "snapshot": _snapshot_report(result.snapshot),
+    }
+
+
+def _target_report(target) -> dict[str, object]:
+    return {
+        "signature": target.signature,
+        "path": _report_path(target.path),
+        "start_line": target.start_line,
+        "end_line": target.end_line,
+        "evidence_handle": target.evidence_handle,
+    }
+
+
+def _snapshot_report(snapshot) -> dict[str, object] | None:
+    if snapshot is None:
+        return None
+    return {
+        "repository_root": str(snapshot.repository_root),
+        "git_commit": snapshot.git_commit,
+        "working_tree_state": snapshot.working_tree_state,
+    }

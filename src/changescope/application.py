@@ -96,11 +96,221 @@ class IndexRequest:
     repository_root: Path
 
 
+@dataclass(frozen=True)
+class ImpactRequest:
+    repository_root: Path
+    target: str
+
+
+@dataclass(frozen=True)
+class ImpactTarget:
+    signature: str
+    path: Path
+    start_line: int
+    end_line: int
+    evidence_handle: str
+
+
+@dataclass(frozen=True)
+class ImpactRelationship:
+    kind: str
+    caller: str
+    path: Path
+    start_line: int
+    end_line: int
+    evidence_handle: str
+    confidence: str
+
+
+@dataclass(frozen=True)
+class UnresolvedItem:
+    message: str
+    path: Path | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    evidence_handle: str | None = None
+
+
+@dataclass(frozen=True)
+class ImpactResult:
+    outcome: str
+    requested_target: str
+    target: ImpactTarget | None
+    candidates: tuple[ImpactTarget, ...]
+    relationships: tuple[ImpactRelationship, ...]
+    assumptions: tuple[str, ...]
+    unresolved_items: tuple[UnresolvedItem, ...]
+    snapshot: IndexSnapshot | None
+
+
 class ChangeScopeApplication:
     """The application-service seam shared by CLI, tests, and future adapters."""
 
-    def execute(self, request: IndexRequest) -> IndexResult:
-        return _index_repository(request.repository_root)
+    def execute(self, request: IndexRequest | ImpactRequest) -> IndexResult | ImpactResult:
+        if isinstance(request, IndexRequest):
+            return _index_repository(request.repository_root)
+        return _impact_repository(request)
+
+
+def _impact_repository(request: ImpactRequest) -> ImpactResult:
+    root = request.repository_root.resolve()
+    database_path = root / ".changescope" / "index.sqlite"
+    if not database_path.is_file():
+        return ImpactResult(
+            "index_missing", request.target, None, (), (), (),
+            (_unresolved("No local Repository Index exists. Run `changescope index` first."),), None,
+        )
+    target_parts = request.target.split("#")
+    if len(target_parts) != 2 or not all(target_parts):
+        return ImpactResult(
+            "invalid_target", request.target, None, (), (), (),
+            (_unresolved("Use the target form Class#method."),), _read_index_snapshot(database_path, root),
+        )
+    class_name, method_name = target_parts
+    connection = sqlite3.connect(database_path)
+    try:
+        rows = connection.execute(
+            """SELECT qualified_name, signature, path, start_line, end_line
+            FROM java_declarations WHERE kind = 'method' AND name = ?
+            ORDER BY path, start_line""",
+            (method_name,),
+        ).fetchall()
+        candidates = tuple(
+            _impact_target(signature, path, start_line, end_line)
+            for qualified_name, signature, path, start_line, end_line in rows
+            if _matches_class_name(qualified_name, class_name)
+        )
+        snapshot = _read_index_snapshot(connection, root)
+    finally:
+        connection.close()
+    if not candidates:
+        return ImpactResult("not_found", request.target, None, (), (), (), (), snapshot)
+    if len(candidates) > 1:
+        return ImpactResult("ambiguous", request.target, None, candidates, (), (), (), snapshot)
+    relationships, unresolved_items = _direct_relationships(
+        database_path, candidates[0]
+    )
+    return ImpactResult(
+        "resolved",
+        request.target,
+        candidates[0],
+        (),
+        relationships,
+        (
+            "Structural analysis asserts only explicit invocation syntax tied to the resolved target.",
+        ),
+        unresolved_items,
+        snapshot,
+    )
+
+
+def _matches_class_name(qualified_name: str, class_name: str) -> bool:
+    owner = qualified_name.rsplit("#", maxsplit=1)[0]
+    return owner == class_name or owner.rsplit(".", maxsplit=1)[-1] == class_name
+
+
+def _impact_target(signature: str, path: str, start_line: int, end_line: int) -> ImpactTarget:
+    source_path = Path(path)
+    return ImpactTarget(
+        signature,
+        source_path,
+        start_line,
+        end_line,
+        _evidence_handle("declaration", source_path, start_line, end_line),
+    )
+
+
+def _evidence_handle(kind: str, path: Path, start_line: int, end_line: int) -> str:
+    return f"{kind}:{path.as_posix()}:{start_line}-{end_line}"
+
+
+def _unresolved(
+    message: str, path: Path | None = None, start_line: int | None = None, end_line: int | None = None
+) -> UnresolvedItem:
+    evidence_handle = (
+        _evidence_handle("invocation", path, start_line, end_line)
+        if path is not None and start_line is not None and end_line is not None
+        else None
+    )
+    return UnresolvedItem(message, path, start_line, end_line, evidence_handle)
+
+
+def _direct_relationships(
+    database_path: Path, target: ImpactTarget
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    owner, method_name = target.signature.split("#", maxsplit=1)
+    method_name = method_name.split("(", maxsplit=1)[0]
+    target_class = owner.rsplit(".", maxsplit=1)[-1]
+    connection = sqlite3.connect(database_path)
+    try:
+        rows = connection.execute(
+            """SELECT receiver, caller, path, start_line, end_line, is_test
+            FROM java_invocations WHERE name = ? ORDER BY path, start_line""",
+            (method_name,),
+        ).fetchall()
+    finally:
+        connection.close()
+    relationships: list[ImpactRelationship] = []
+    unresolved_items = [
+        _unresolved(
+            "Structural analysis does not resolve receiver types, overload dispatch, inheritance, reflection, dependency injection, or framework dispatch."
+        )
+    ]
+    for receiver, caller, path, start_line, end_line, is_test in rows:
+        source_path = Path(path)
+        relationship_kind = None
+        confidence = ""
+        if receiver and (receiver == owner or _is_direct_construction(receiver, owner)):
+            relationship_kind = "direct_test" if is_test else "direct_caller"
+            confidence = "high"
+        elif receiver is None and caller and caller.rsplit("#", maxsplit=1)[0] == owner:
+            relationship_kind = "possible_caller"
+            confidence = "medium"
+        else:
+            unresolved_items.append(
+                _unresolved(
+                    f"Invocation named {method_name} was not asserted because its receiver type is unresolved.",
+                    source_path,
+                    start_line,
+                    end_line,
+                )
+            )
+            continue
+        relationships.append(
+            ImpactRelationship(
+                relationship_kind,
+                caller or "<initializer>",
+                source_path,
+                start_line,
+                end_line,
+                _evidence_handle("invocation", source_path, start_line, end_line),
+                confidence,
+            )
+        )
+    return tuple(relationships), tuple(unresolved_items)
+
+
+def _is_direct_construction(receiver: str, owner: str) -> bool:
+    return bool(re.fullmatch(rf"new\s+{re.escape(owner)}\s*\([^)]*\)", receiver))
+
+
+def _read_index_snapshot(
+    connection_or_path: sqlite3.Connection | Path, root: Path
+) -> IndexSnapshot:
+    close_when_done = isinstance(connection_or_path, Path)
+    connection = (
+        sqlite3.connect(connection_or_path) if close_when_done else connection_or_path
+    )
+    try:
+        values = dict(connection.execute("SELECT key, value FROM metadata"))
+        return IndexSnapshot(
+            root,
+            values.get("git_commit") or None,
+            values.get("working_tree_state", "unknown"),
+        )
+    finally:
+        if close_when_done:
+            connection.close()
 
 
 def _index_repository(repository_root: Path) -> IndexResult:
