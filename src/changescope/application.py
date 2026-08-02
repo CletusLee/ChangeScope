@@ -108,11 +108,7 @@ def _discover_source_roots(root: Path) -> tuple[Path, ...]:
 
 def _declared_build_source_roots(root: Path) -> tuple[Path, ...]:
     candidates = [*_maven_source_roots(root), *_gradle_source_roots(root)]
-    existing_roots = (
-        candidate
-        for candidate in candidates
-        if not candidate.is_absolute() and (root / candidate).is_dir()
-    )
+    existing_roots = filter(None, (_repository_relative_root(root, path) for path in candidates))
     return tuple(dict.fromkeys(existing_roots))
 
 
@@ -164,11 +160,21 @@ def _eclipse_source_roots(root: Path) -> tuple[Path, ...]:
         path = entry.get("path")
         if not path:
             continue
-        candidate = Path(path)
-        if candidate.is_absolute() or not (root / candidate).is_dir():
+        candidate = _repository_relative_root(root, Path(path))
+        if candidate is None:
             continue
         roots.append(candidate)
     return tuple(dict.fromkeys(roots))
+
+
+def _repository_relative_root(root: Path, candidate: Path) -> Path | None:
+    if candidate.is_absolute():
+        return None
+    try:
+        relative_path = (root / candidate).resolve().relative_to(root)
+    except ValueError:
+        return None
+    return relative_path if (root / relative_path).is_dir() else None
 
 
 def _excluded_directories(root: Path) -> tuple[Path, ...]:
@@ -209,7 +215,9 @@ def _is_excluded(relative_path: Path) -> bool:
 
 def _snapshot(root: Path) -> IndexSnapshot:
     commit = _git_output(root, "rev-parse", "HEAD")
-    status = _git_output(root, "status", "--porcelain")
+    status = _git_output(
+        root, "status", "--porcelain", "--", ".", ":(exclude).changescope"
+    )
     if commit is None:
         commit = _head_commit(root)
     if commit is None:
@@ -220,12 +228,15 @@ def _snapshot(root: Path) -> IndexSnapshot:
 
 
 def _git_output(root: Path, *arguments: str) -> str | None:
-    completed = subprocess.run(
-        ("git", "-c", "safe.directory=*", "-C", str(root), *arguments),
-        capture_output=True,
-        check=False,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            ("git", "-c", "safe.directory=*", "-C", str(root), *arguments),
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError:
+        return None
     if completed.returncode != 0:
         return None
     return completed.stdout.strip()

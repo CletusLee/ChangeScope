@@ -153,6 +153,22 @@ class IndexRepositoryTests(unittest.TestCase):
                 ),
             )
 
+    def test_does_not_follow_a_declared_source_root_outside_the_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            repository = parent / "repository"
+            repository.mkdir()
+            self._write(
+                repository / "pom.xml",
+                "<project><build><sourceDirectory>../shared</sourceDirectory></build></project>",
+            )
+            self._write(parent / "shared/Outside.java", "class Outside {}\n")
+
+            result = self._index(repository)
+
+            self.assertEqual(result.source_roots, (Path("."),))
+            self.assertEqual(result.indexed_files, ())
+
     def test_reports_read_failures_without_aborting_the_index(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory)
@@ -188,6 +204,33 @@ class IndexRepositoryTests(unittest.TestCase):
 
             self.assertIsNotNone(result.snapshot.git_commit)
             self.assertEqual(result.snapshot.working_tree_state, "clean")
+
+    def test_indexes_when_git_is_not_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(repository / "src/main/java/example/App.java", "class App {}\n")
+
+            with patch("changescope.application.subprocess.run", side_effect=OSError):
+                result = self._index(repository)
+
+            self.assertEqual(result.snapshot.git_commit, None)
+            self.assertEqual(result.snapshot.working_tree_state, "unavailable")
+
+    def test_snapshot_ignores_the_local_index_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(repository / "src/main/java/example/App.java", "class App {}\n")
+            self._git(repository, "init")
+            self._git(repository, "config", "user.email", "test@example.com")
+            self._git(repository, "config", "user.name", "Test User")
+            self._git(repository, "add", ".")
+            self._git(repository, "commit", "-m", "fixture")
+
+            first_result = self._index(repository)
+            second_result = self._index(repository)
+
+            self.assertEqual(first_result.snapshot.working_tree_state, "clean")
+            self.assertEqual(second_result.snapshot.working_tree_state, "clean")
 
     @staticmethod
     def _write(path: Path, contents: str) -> None:
