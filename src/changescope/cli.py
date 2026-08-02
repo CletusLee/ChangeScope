@@ -7,10 +7,12 @@ from typing import Sequence
 
 from changescope.application import (
     ChangeScopeApplication,
+    EvidenceRequest,
     ImpactRequest,
     ImpactResult,
     IndexRequest,
     IndexResult,
+    SourceRequest,
 )
 
 
@@ -26,6 +28,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
     impact_command.add_argument(
         "--format", choices=("text", "json"), default="text", help="report format"
     )
+    evidence_command = subcommands.add_parser("evidence", help="retrieve bounded source evidence")
+    evidence_command.add_argument("evidence_handle")
+    evidence_command.add_argument("--context-lines", type=int, default=2)
+    evidence_command.add_argument("--max-characters", type=int, default=4_000)
+    evidence_command.add_argument("--enclosing-symbol", action="store_true")
+    evidence_command.add_argument("--format", choices=("text", "json"), default="text")
+    source_command = subcommands.add_parser("source", help="retrieve a bounded explicit source range")
+    source_command.add_argument("path", help="path relative to the current repository")
+    source_command.add_argument("start_line", type=int)
+    source_command.add_argument("end_line", type=int)
+    source_command.add_argument("--start-column", type=int, default=0)
+    source_command.add_argument("--max-characters", type=int, default=4_000)
+    source_command.add_argument("--format", choices=("text", "json"), default="text")
     parsed = parser.parse_args(arguments)
 
     if parsed.command == "index":
@@ -36,6 +51,24 @@ def main(arguments: Sequence[str] | None = None) -> int:
         result = ChangeScopeApplication().execute(ImpactRequest(Path.cwd(), parsed.target))
         _render_impact_result(result, parsed.format)
         return 0 if result.outcome == "resolved" else 2
+    if parsed.command == "evidence":
+        result = ChangeScopeApplication().execute(
+            EvidenceRequest(
+                Path.cwd(), parsed.evidence_handle, parsed.context_lines,
+                parsed.max_characters, parsed.enclosing_symbol,
+            )
+        )
+        _render_source_navigation(result, parsed.format)
+        return 0
+    if parsed.command == "source":
+        result = ChangeScopeApplication().execute(
+            SourceRequest(
+                Path.cwd(), Path(parsed.path), parsed.start_line,
+                parsed.end_line, parsed.max_characters, parsed.start_column,
+            )
+        )
+        _render_source_navigation(result, parsed.format)
+        return 0
     raise AssertionError(f"Unhandled command: {parsed.command}")
 
 
@@ -91,6 +124,30 @@ def _index_report(result: IndexResult) -> dict[str, object]:
 
 def _report_path(path: Path) -> str:
     return path.as_posix()
+
+
+def _render_source_navigation(result, output_format: str) -> None:
+    report = {
+        "evidence_handle": result.evidence_handle,
+        "path": _report_path(result.path),
+        "start_line": result.start_line,
+        "end_line": result.end_line,
+        "content": result.content,
+        "truncated": result.truncated,
+        "continuation_start_line": result.continuation_start_line,
+        "continuation_start_column": result.continuation_start_column,
+    }
+    if output_format == "json":
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+    print(f"Evidence: {report['evidence_handle']}")
+    print(f"Source: {report['path']}:{report['start_line']}-{report['end_line']}")
+    print(report["content"], end="")
+    if report["truncated"]:
+        print(
+            "Continuation starts at "
+            f"line {report['continuation_start_line']}, column {report['continuation_start_column']}"
+        )
 
 
 def _render_impact_result(result: ImpactResult, output_format: str) -> None:

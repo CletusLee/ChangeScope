@@ -103,6 +103,37 @@ class ImpactRequest:
 
 
 @dataclass(frozen=True)
+class EvidenceRequest:
+    repository_root: Path
+    evidence_handle: str
+    context_lines: int = 2
+    max_characters: int = 4_000
+    enclosing_symbol: bool = False
+
+
+@dataclass(frozen=True)
+class SourceRequest:
+    repository_root: Path
+    path: Path
+    start_line: int
+    end_line: int
+    max_characters: int = 4_000
+    start_column: int = 0
+
+
+@dataclass(frozen=True)
+class SourceNavigation:
+    evidence_handle: str
+    path: Path
+    start_line: int
+    end_line: int
+    content: str
+    truncated: bool
+    continuation_start_line: int | None
+    continuation_start_column: int | None
+
+
+@dataclass(frozen=True)
 class ImpactTarget:
     signature: str
     path: Path
@@ -146,10 +177,124 @@ class ImpactResult:
 class ChangeScopeApplication:
     """The application-service seam shared by CLI, tests, and future adapters."""
 
-    def execute(self, request: IndexRequest | ImpactRequest) -> IndexResult | ImpactResult:
+    def execute(self, request: IndexRequest | ImpactRequest | EvidenceRequest | SourceRequest) -> IndexResult | ImpactResult | SourceNavigation:
         if isinstance(request, IndexRequest):
             return _index_repository(request.repository_root)
+        if isinstance(request, EvidenceRequest):
+            return _evidence_context(request)
+        if isinstance(request, SourceRequest):
+            return _source_range(request)
         return _impact_repository(request)
+
+
+def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
+    match = re.fullmatch(r"(?:declaration|invocation):(.+):(\d+)-(\d+)", request.evidence_handle)
+    if match is None:
+        raise ValueError("Evidence handles must use kind:path:start-end form.")
+    path = _validate_relative_path(Path(match.group(1)))
+    evidence_start_line = int(match.group(2))
+    evidence_end_line = int(match.group(3))
+    if evidence_start_line > evidence_end_line or request.context_lines < 0:
+        raise ValueError("Evidence line ranges must be ordered and context lines cannot be negative.")
+    start_line = max(1, evidence_start_line - request.context_lines)
+    end_line = evidence_end_line + request.context_lines
+    if request.enclosing_symbol:
+        enclosing_range = _enclosing_symbol_range(request.repository_root.resolve(), path, evidence_start_line, evidence_end_line)
+        if enclosing_range is not None:
+            start_line, end_line = enclosing_range
+    return _read_bounded_source(
+        request.repository_root.resolve(), path, start_line, end_line,
+        request.evidence_handle, request.max_characters,
+    )
+
+
+def _source_range(request: SourceRequest) -> SourceNavigation:
+    path = _validate_relative_path(request.path)
+    if request.start_line < 1 or request.end_line < request.start_line:
+        raise ValueError("Source line ranges must start at line 1 and be ordered.")
+    if request.start_column < 0:
+        raise ValueError("Source start columns cannot be negative.")
+    evidence_handle = f"source:{path.as_posix()}:{request.start_line}-{request.end_line}"
+    return _read_bounded_source(
+        request.repository_root.resolve(), path, request.start_line, request.end_line,
+        evidence_handle, request.max_characters, request.start_column,
+    )
+
+
+def _validate_relative_path(path: Path) -> Path:
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("Source paths must be relative to the repository root.")
+    return path
+
+
+def _enclosing_symbol_range(root: Path, path: Path, start_line: int, end_line: int) -> tuple[int, int] | None:
+    database_path = root / ".changescope" / "index.sqlite"
+    if not database_path.is_file():
+        return None
+    connection = sqlite3.connect(database_path)
+    try:
+        row = connection.execute(
+            """SELECT start_line, end_line FROM java_declarations
+            WHERE path = ? AND kind IN ('method', 'constructor', 'class', 'interface', 'enum', 'annotation', 'record')
+            AND start_line <= ? AND end_line >= ?
+            ORDER BY end_line - start_line, start_line LIMIT 1""",
+            (str(path), start_line, end_line),
+        ).fetchone()
+    finally:
+        connection.close()
+    return (row[0], row[1]) if row else None
+
+
+def _read_bounded_source(
+    root: Path, path: Path, start_line: int, end_line: int, evidence_handle: str,
+    max_characters: int, start_column: int = 0,
+) -> SourceNavigation:
+    if max_characters < 1:
+        raise ValueError("The source size budget must be at least one character.")
+    source_path = _resolve_indexed_source(root, path)
+    lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    if start_line > len(lines):
+        raise ValueError("The source range starts beyond the end of the file.")
+    end_line = min(end_line, len(lines))
+    selected = lines[start_line - 1 : end_line]
+    content = ""
+    final_line = start_line - 1
+    for line_number, line in enumerate(selected, start_line):
+        column = start_column if line_number == start_line else 0
+        line_fragment = line[column:]
+        remaining = max_characters - len(content)
+        if remaining == 0:
+            return SourceNavigation(
+                evidence_handle, path, start_line, final_line, content, True, line_number, column
+            )
+        if len(line_fragment) > remaining:
+            content += line_fragment[:remaining]
+            return SourceNavigation(
+                evidence_handle, path, start_line, line_number, content, True,
+                line_number, column + remaining,
+            )
+        content += line_fragment
+        final_line = line_number
+    return SourceNavigation(evidence_handle, path, start_line, final_line, content, False, None, None)
+
+
+def _resolve_indexed_source(root: Path, path: Path) -> Path:
+    source_path = (root / path).resolve()
+    if not source_path.is_relative_to(root):
+        raise ValueError("Source paths must resolve inside the repository root.")
+    database_path = root / ".changescope" / "index.sqlite"
+    if not database_path.is_file():
+        raise ValueError("Source navigation requires a local Repository Index. Run `changescope index` first.")
+    connection = sqlite3.connect(database_path)
+    try:
+        row = connection.execute(
+            "SELECT 1 FROM source_files WHERE path = ? AND status = 'indexed'", (str(path),)
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise ValueError("Source navigation is limited to files in the local Repository Index.")
+    return source_path
 
 
 def _impact_repository(request: ImpactRequest) -> ImpactResult:
