@@ -70,6 +70,28 @@ class IndexRepositoryTests(unittest.TestCase):
             self.assertEqual(report["indexed_files"], ["src/main/java/example/App.java"])
             self.assertTrue((repository / ".changescope/index.sqlite").is_file())
 
+    def test_cli_text_report_lists_included_java_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(repository / "src/main/java/example/App.java", "class App {}\n")
+            environment = os.environ | {
+                "PYTHONPATH": str(Path(__file__).parents[1] / "src")
+            }
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "changescope", "index"],
+                capture_output=True,
+                check=False,
+                cwd=repository,
+                env=environment,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn(
+                "Included Java files:\n- src/main/java/example/App.java", completed.stdout
+            )
+
     def test_indexes_an_irregular_layout_without_vendor_or_build_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory)
@@ -103,6 +125,33 @@ class IndexRepositoryTests(unittest.TestCase):
 
             self.assertEqual(result.source_roots, (Path("java"),))
             self.assertEqual(result.indexed_files, (Path("java/example/LegacyApp.java"),))
+
+    def test_discovers_custom_maven_and_gradle_source_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "pom.xml",
+                "<project><build><sourceDirectory>legacy-main</sourceDirectory></build></project>",
+            )
+            self._write(
+                repository / "build.gradle",
+                "sourceSets { main { java { srcDirs = ['additional-main'] } } }",
+            )
+            self._write(repository / "legacy-main/example/Legacy.java", "class Legacy {}\n")
+            self._write(repository / "additional-main/example/Additional.java", "class Additional {}\n")
+
+            result = self._index(repository)
+
+            self.assertEqual(
+                result.source_roots, (Path("legacy-main"), Path("additional-main"))
+            )
+            self.assertEqual(
+                result.indexed_files,
+                (
+                    Path("additional-main/example/Additional.java"),
+                    Path("legacy-main/example/Legacy.java"),
+                ),
+            )
 
     def test_reports_read_failures_without_aborting_the_index(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

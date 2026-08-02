@@ -32,6 +32,9 @@ def _render_index_result(result: IndexResult, output_format: str) -> None:
     print(f"Indexed repository: {report['snapshot']['repository_root']}")
     print(f"Source roots: {', '.join(report['source_roots']) or 'none'}")
     print(f"Indexed Java files: {len(report['indexed_files'])}")
+    print("Included Java files:")
+    for path in report["indexed_files"]:
+        print(f"- {path}")
     print(f"Excluded directories: {', '.join(report['excluded_directories']) or 'none'}")
     print(f"Read failures: {', '.join(report['read_failures']) or 'none'}")
     print(

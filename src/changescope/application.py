@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 from typing import Iterable
@@ -84,6 +85,10 @@ def _index_repository(repository_root: Path) -> IndexResult:
 
 
 def _discover_source_roots(root: Path) -> tuple[Path, ...]:
+    declared_build_roots = _declared_build_source_roots(root)
+    if declared_build_roots:
+        return declared_build_roots
+
     conventional_roots = tuple(
         candidate
         for candidate in (Path("src/main/java"), Path("src/test/java"))
@@ -99,6 +104,49 @@ def _discover_source_roots(root: Path) -> tuple[Path, ...]:
     if (root / "src").is_dir():
         return (Path("src"),)
     return (Path("."),)
+
+
+def _declared_build_source_roots(root: Path) -> tuple[Path, ...]:
+    candidates = [*_maven_source_roots(root), *_gradle_source_roots(root)]
+    existing_roots = (
+        candidate
+        for candidate in candidates
+        if not candidate.is_absolute() and (root / candidate).is_dir()
+    )
+    return tuple(dict.fromkeys(existing_roots))
+
+
+def _maven_source_roots(root: Path) -> tuple[Path, ...]:
+    pom = root / "pom.xml"
+    if not pom.is_file():
+        return ()
+    try:
+        elements = ElementTree.parse(pom).getroot().iter()
+    except (ElementTree.ParseError, OSError):
+        return ()
+    roots = []
+    for element in elements:
+        name = element.tag.rsplit("}", maxsplit=1)[-1]
+        if name not in {"sourceDirectory", "testSourceDirectory"} or not element.text:
+            continue
+        candidate = Path(element.text.strip())
+        if "$" not in str(candidate):
+            roots.append(candidate)
+    return tuple(roots)
+
+
+def _gradle_source_roots(root: Path) -> tuple[Path, ...]:
+    roots = []
+    for filename in ("build.gradle", "build.gradle.kts"):
+        try:
+            contents = (root / filename).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for match in re.finditer(
+            r"srcDirs?\s*(?:=)?\s*(?:\[\s*)?['\"]([^'\"]+)", contents
+        ):
+            roots.append(Path(match.group(1)))
+    return tuple(roots)
 
 
 def _eclipse_source_roots(root: Path) -> tuple[Path, ...]:
@@ -162,8 +210,12 @@ def _is_excluded(relative_path: Path) -> bool:
 def _snapshot(root: Path) -> IndexSnapshot:
     commit = _git_output(root, "rev-parse", "HEAD")
     status = _git_output(root, "status", "--porcelain")
-    if commit is None or status is None:
+    if commit is None:
+        commit = _head_commit(root)
+    if commit is None:
         return IndexSnapshot(root, None, "unavailable")
+    if status is None:
+        return IndexSnapshot(root, commit, "unknown")
     return IndexSnapshot(root, commit, "dirty" if status else "clean")
 
 
@@ -177,6 +229,35 @@ def _git_output(root: Path, *arguments: str) -> str | None:
     if completed.returncode != 0:
         return None
     return completed.stdout.strip()
+
+
+def _head_commit(root: Path) -> str | None:
+    git_directory = _git_directory(root)
+    if git_directory is None:
+        return None
+    try:
+        head = (git_directory / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not head.startswith("ref: "):
+        return head or None
+    try:
+        return (git_directory / head.removeprefix("ref: ")).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _git_directory(root: Path) -> Path | None:
+    git_entry = root / ".git"
+    if git_entry.is_dir():
+        return git_entry
+    try:
+        reference = git_entry.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not reference.startswith("gitdir: "):
+        return None
+    return (root / reference.removeprefix("gitdir: ")).resolve()
 
 
 def _write_index(result: IndexResult) -> None:
