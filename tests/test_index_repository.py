@@ -7,8 +7,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from changescope.application import index_repository
+from changescope.application import ChangeScopeApplication, IndexRequest
 
 
 class IndexRepositoryTests(unittest.TestCase):
@@ -26,7 +27,7 @@ class IndexRepositoryTests(unittest.TestCase):
             )
             self._write(repository / "target/Generated.java", "class Generated {}\n")
 
-            result = index_repository(repository)
+            result = self._index(repository)
 
             self.assertEqual(
                 result.source_roots,
@@ -74,16 +75,20 @@ class IndexRepositoryTests(unittest.TestCase):
             repository = Path(temporary_directory)
             self._write(repository / "legacy/orders/OrderService.java", "class OrderService {}\n")
             self._write(repository / "vendor/Library.java", "class Library {}\n")
+            self._write(repository / "lib/LegacyLibrary.java", "class LegacyLibrary {}\n")
+            self._write(repository / ".svn/Metadata.java", "class Metadata {}\n")
             self._write(repository / "target/Generated.java", "class Generated {}\n")
 
-            result = index_repository(repository)
+            result = self._index(repository)
 
             self.assertEqual(result.source_roots, (Path("."),))
             self.assertEqual(
                 result.indexed_files, (Path("legacy/orders/OrderService.java"),)
             )
             self.assertEqual(
-                result.excluded_directories, (Path("target"), Path("vendor")))
+                result.excluded_directories,
+                (Path(".svn"), Path("lib"), Path("target"), Path("vendor")),
+            )
 
     def test_indexes_eclipse_source_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -94,12 +99,61 @@ class IndexRepositoryTests(unittest.TestCase):
             )
             self._write(repository / "java/example/LegacyApp.java", "class LegacyApp {}\n")
 
-            result = index_repository(repository)
+            result = self._index(repository)
 
             self.assertEqual(result.source_roots, (Path("java"),))
             self.assertEqual(result.indexed_files, (Path("java/example/LegacyApp.java"),))
+
+    def test_reports_read_failures_without_aborting_the_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            source = repository / "src/main/java/example/Unreadable.java"
+            self._write(source, "class Unreadable {}\n")
+            original_read_bytes = Path.read_bytes
+
+            def read_bytes(path: Path) -> bytes:
+                if path == source:
+                    raise PermissionError("denied")
+                return original_read_bytes(path)
+
+            with patch.object(Path, "read_bytes", read_bytes):
+                result = self._index(repository)
+
+            self.assertEqual(result.indexed_files, ())
+            self.assertEqual(
+                result.read_failures, (Path("src/main/java/example/Unreadable.java"),)
+            )
+            self.assertTrue((repository / ".changescope/index.sqlite").is_file())
+
+    def test_captures_available_git_snapshot_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(repository / "src/main/java/example/App.java", "class App {}\n")
+            self._git(repository, "init")
+            self._git(repository, "config", "user.email", "test@example.com")
+            self._git(repository, "config", "user.name", "Test User")
+            self._git(repository, "add", ".")
+            self._git(repository, "commit", "-m", "fixture")
+
+            result = self._index(repository)
+
+            self.assertIsNotNone(result.snapshot.git_commit)
+            self.assertEqual(result.snapshot.working_tree_state, "clean")
 
     @staticmethod
     def _write(path: Path, contents: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(contents, encoding="utf-8")
+
+    @staticmethod
+    def _index(repository: Path):
+        return ChangeScopeApplication().execute(IndexRequest(repository))
+
+    @staticmethod
+    def _git(repository: Path, *arguments: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )

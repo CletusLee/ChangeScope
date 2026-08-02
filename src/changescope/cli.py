@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from changescope.application import IndexResult, index_repository
+from changescope.application import ChangeScopeApplication, IndexRequest, IndexResult
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -18,7 +18,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parsed = parser.parse_args(arguments)
 
     if parsed.command == "index":
-        result = index_repository(Path.cwd())
+        result = ChangeScopeApplication().execute(IndexRequest(Path.cwd()))
         _render_index_result(result, parsed.format)
         return 0
     raise AssertionError(f"Unhandled command: {parsed.command}")

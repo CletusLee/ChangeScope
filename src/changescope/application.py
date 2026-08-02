@@ -13,17 +13,25 @@ EXCLUDED_DIRECTORY_NAMES = frozenset(
         ".changescope",
         ".git",
         ".gradle",
+        ".hg",
         ".idea",
+        ".m2",
         ".mvn",
         ".settings",
+        ".svn",
         "build",
+        "dependencies",
         "deps",
         "generated",
         "generated-sources",
         "generated-test-sources",
+        "lib",
+        "libs",
         "node_modules",
         "out",
         "target",
+        "third-party",
+        "third_party",
         "vendor",
     }
 )
@@ -45,21 +53,34 @@ class IndexResult:
     snapshot: IndexSnapshot
 
 
-def index_repository(repository_root: Path) -> IndexResult:
+@dataclass(frozen=True)
+class IndexRequest:
+    repository_root: Path
+
+
+class ChangeScopeApplication:
+    """The application-service seam shared by CLI, tests, and future adapters."""
+
+    def execute(self, request: IndexRequest) -> IndexResult:
+        return _index_repository(request.repository_root)
+
+
+def _index_repository(repository_root: Path) -> IndexResult:
     """Build a local repository index and describe exactly what it contains."""
     root = repository_root.resolve()
     source_roots = _discover_source_roots(root)
     excluded_directories = _excluded_directories(root)
     indexed_files, read_failures = _java_files(root, source_roots)
     snapshot = _snapshot(root)
-    _write_index(root, source_roots, indexed_files, read_failures, snapshot)
-    return IndexResult(
+    result = IndexResult(
         source_roots=source_roots,
         indexed_files=indexed_files,
         excluded_directories=excluded_directories,
         read_failures=read_failures,
         snapshot=snapshot,
     )
+    _write_index(result)
+    return result
 
 
 def _discover_source_roots(root: Path) -> tuple[Path, ...]:
@@ -148,7 +169,7 @@ def _snapshot(root: Path) -> IndexSnapshot:
 
 def _git_output(root: Path, *arguments: str) -> str | None:
     completed = subprocess.run(
-        ("git", "-C", str(root), "-c", f"safe.directory={root}", *arguments),
+        ("git", "-c", "safe.directory=*", "-C", str(root), *arguments),
         capture_output=True,
         check=False,
         text=True,
@@ -158,31 +179,20 @@ def _git_output(root: Path, *arguments: str) -> str | None:
     return completed.stdout.strip()
 
 
-def _write_index(
-    root: Path,
-    source_roots: tuple[Path, ...],
-    indexed_files: tuple[Path, ...],
-    read_failures: tuple[Path, ...],
-    snapshot: IndexSnapshot,
-) -> None:
-    database_directory = root / ".changescope"
+def _write_index(result: IndexResult) -> None:
+    database_directory = result.snapshot.repository_root / ".changescope"
     database_directory.mkdir(exist_ok=True)
     connection = sqlite3.connect(database_directory / "index.sqlite")
     try:
         with connection:
-            _replace_index_contents(
-                connection, source_roots, indexed_files, read_failures, snapshot
-            )
+            _replace_index_contents(connection, result)
     finally:
         connection.close()
 
 
 def _replace_index_contents(
     connection: sqlite3.Connection,
-    source_roots: tuple[Path, ...],
-    indexed_files: tuple[Path, ...],
-    read_failures: tuple[Path, ...],
-    snapshot: IndexSnapshot,
+    result: IndexResult,
 ) -> None:
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -195,17 +205,17 @@ def _replace_index_contents(
     connection.executemany(
         "INSERT INTO metadata(key, value) VALUES (?, ?)",
         (
-            ("repository_root", str(snapshot.repository_root)),
-            ("git_commit", snapshot.git_commit or ""),
-            ("working_tree_state", snapshot.working_tree_state),
-            ("source_roots", "\n".join(map(str, source_roots))),
+            ("repository_root", str(result.snapshot.repository_root)),
+            ("git_commit", result.snapshot.git_commit or ""),
+            ("working_tree_state", result.snapshot.working_tree_state),
+            ("source_roots", "\n".join(map(str, result.source_roots))),
         ),
     )
     connection.executemany(
         "INSERT INTO source_files(path, status) VALUES (?, ?)",
-        ((str(path), "indexed") for path in indexed_files),
+        ((str(path), "indexed") for path in result.indexed_files),
     )
     connection.executemany(
         "INSERT INTO source_files(path, status) VALUES (?, ?)",
-        ((str(path), "unreadable") for path in read_failures),
+        ((str(path), "unreadable") for path in result.read_failures),
     )
