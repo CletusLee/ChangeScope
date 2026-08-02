@@ -43,7 +43,8 @@ class OrderService {
                 repository / "src/main/java/example/OrderService.java",
                 """package example;
 class OrderService {
-    void placeOrder(String orderId) {}
+    void placeOrder(String orderId) { validateOrder(orderId); }
+    private void validateOrder(String orderId) {}
     void retryOrder(String orderId) { placeOrder(orderId); }
 }
 class OrderFacade {
@@ -70,13 +71,115 @@ class OrderServiceTest {
                     ("possible_caller", "example.OrderService#retryOrder", "medium"),
                     ("direct_caller", "example.OrderFacade#place", "high"),
                     ("direct_test", "example.OrderServiceTest#placesAnOrder", "high"),
+                    ("direct_callee", "example.OrderService#validateOrder", "high"),
                 ],
             )
             self.assertEqual(
                 result.relationships[0].evidence_handle,
-                "invocation:src/main/java/example/OrderService.java:4-4",
+                "invocation:src/main/java/example/OrderService.java:5-5",
             )
             self.assertIn("Structural analysis", result.assumptions[0])
+
+    def test_reports_a_proven_direct_callee_with_evidence_and_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+class OrderService {
+    void placeOrder(String orderId) { validateOrder(orderId); }
+    private void validateOrder(String orderId) {}
+}
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            direct_callees = [
+                relationship
+                for relationship in result.relationships
+                if relationship.kind == "direct_callee"
+            ]
+            self.assertEqual(len(direct_callees), 1)
+            self.assertEqual(direct_callees[0].caller, "example.OrderService#validateOrder")
+            self.assertEqual(direct_callees[0].confidence, "high")
+            self.assertEqual(
+                direct_callees[0].evidence_handle,
+                "invocation:src/main/java/example/OrderService.java:3-3",
+            )
+
+    def test_reports_a_this_qualified_direct_callee(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+class OrderService {
+    void placeOrder() { this.validateOrder(); }
+    private void validateOrder() {}
+}
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertEqual(
+                [relationship.caller for relationship in result.relationships if relationship.kind == "direct_callee"],
+                ["example.OrderService#validateOrder"],
+            )
+
+    def test_reports_a_direct_callee_on_an_explicitly_constructed_receiver(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+class OrderService {
+    void placeOrder() { new example.OrderRepository().save(); }
+}
+class OrderRepository {
+    void save() {}
+}
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertEqual(
+                [relationship.caller for relationship in result.relationships if relationship.kind == "direct_callee"],
+                ["example.OrderRepository#save"],
+            )
+
+    def test_leaves_an_overridable_same_class_callee_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+class OrderService {
+    void placeOrder() { validateOrder(); }
+    void validateOrder() {}
+}
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertEqual(
+                [relationship for relationship in result.relationships if relationship.kind == "direct_callee"],
+                [],
+            )
+            self.assertTrue(
+                any("validateOrder" in item.message for item in result.unresolved_items)
+            )
 
     def test_reports_overloads_as_ambiguous_and_missing_targets_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -234,7 +337,8 @@ class OrderServiceTest {
                 repository / "src/main/java/example/OrderService.java",
                 """package example;
 class OrderService {
-    void placeOrder(String orderId) {}
+    void placeOrder(String orderId) { validateOrder(orderId); }
+    private void validateOrder(String orderId) {}
     void retryOrder(String orderId) { placeOrder(orderId); }
 }
 """,
@@ -260,8 +364,14 @@ class OrderService {
             report = json.loads(json_result.stdout)
             self.assertEqual(report["outcome"], "resolved")
             self.assertEqual(report["relationships"][0]["caller"], "example.OrderService#retryOrder")
+            direct_callee = next(
+                relationship for relationship in report["relationships"] if relationship["kind"] == "direct_callee"
+            )
+            self.assertEqual(direct_callee["caller"], "example.OrderService#validateOrder")
+            self.assertEqual(direct_callee["confidence"], "high")
             self.assertIn("Resolved target: example.OrderService#placeOrder(String)", text_result.stdout)
             self.assertIn("example.OrderService#retryOrder", text_result.stdout)
+            self.assertIn("direct_callee example.OrderService#validateOrder [high]", text_result.stdout)
             self.assertIn("Snapshot:", text_result.stdout)
 
     def test_cli_returns_nonzero_for_a_non_resolved_target(self) -> None:

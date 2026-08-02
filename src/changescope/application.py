@@ -59,6 +59,7 @@ class JavaDeclaration:
     start_line: int
     end_line: int
     is_test: bool
+    is_private: bool
 
 
 @dataclass(frozen=True)
@@ -387,13 +388,21 @@ def _direct_relationships(
 ) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
     owner, method_name = target.signature.split("#", maxsplit=1)
     method_name = method_name.split("(", maxsplit=1)[0]
-    target_class = owner.rsplit(".", maxsplit=1)[-1]
     connection = sqlite3.connect(database_path)
     try:
         rows = connection.execute(
             """SELECT receiver, caller, path, start_line, end_line, is_test
             FROM java_invocations WHERE name = ? ORDER BY path, start_line""",
             (method_name,),
+        ).fetchall()
+        callee_rows = connection.execute(
+            """SELECT name, receiver, path, start_line, end_line
+            FROM java_invocations WHERE caller = ? ORDER BY path, start_line""",
+            (f"{owner}#{method_name}",),
+        ).fetchall()
+        declarations = connection.execute(
+            """SELECT qualified_name, name, signature, is_private FROM java_declarations
+            WHERE kind = 'method'"""
         ).fetchall()
     finally:
         connection.close()
@@ -432,6 +441,45 @@ def _direct_relationships(
                 end_line,
                 _evidence_handle("invocation", source_path, start_line, end_line),
                 confidence,
+            )
+        )
+    declarations_by_name: dict[str, list[tuple[str, str, bool]]] = {}
+    for declaration_owner, declaration_name, declaration_signature, is_private in declarations:
+        declarations_by_name.setdefault(declaration_name, []).append(
+            (declaration_owner.rsplit("#", maxsplit=1)[0], declaration_signature, bool(is_private))
+        )
+    for callee_name, receiver, path, start_line, end_line in callee_rows:
+        source_path = Path(path)
+        candidates = declarations_by_name.get(callee_name, [])
+        if receiver in {None, "this"}:
+            candidates = [
+                candidate for candidate in candidates if candidate[0] == owner and candidate[2]
+            ]
+        else:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if receiver == candidate[0] or _is_direct_construction(receiver, candidate[0])
+            ]
+        if len(candidates) == 1:
+            relationships.append(
+                ImpactRelationship(
+                    "direct_callee",
+                    candidates[0][1].split("(", maxsplit=1)[0],
+                    source_path,
+                    start_line,
+                    end_line,
+                    _evidence_handle("invocation", source_path, start_line, end_line),
+                    "high",
+                )
+            )
+            continue
+        unresolved_items.append(
+            _unresolved(
+                f"Invocation named {callee_name} was not asserted as a direct callee because its target is unresolved.",
+                source_path,
+                start_line,
+                end_line,
             )
         )
     return tuple(relationships), tuple(unresolved_items)
@@ -497,7 +545,7 @@ def _refresh_index_if_needed(root: Path) -> None:
     connection = sqlite3.connect(database_path)
     try:
         with connection:
-            _initialize_index_schema(connection)
+            declaration_schema_changed = _initialize_index_schema(connection)
             previous_files = {
                 path: (status, content_hash)
                 for path, status, content_hash in connection.execute(
@@ -512,6 +560,8 @@ def _refresh_index_if_needed(root: Path) -> None:
                 path for path in set(previous_files) | set(current_files)
                 if previous_files.get(path) != current_files.get(path)
             }
+            if declaration_schema_changed:
+                changed_paths.update(current_files)
             if previous_test_roots is None or previous_test_roots[0] != _root_list_value(current_test_roots):
                 changed_paths.update(current_files)
             if changed_paths:
@@ -810,6 +860,7 @@ def _collect_java_facts(
                     current.start_point.row + 1,
                     current.end_point.row + 1,
                     is_test,
+                    False,
                 )
             )
             child_types = (*current_types, name)
@@ -829,6 +880,7 @@ def _collect_java_facts(
                     current.start_point.row + 1,
                     current.end_point.row + 1,
                     is_test,
+                    _has_private_modifier(current, source),
                 )
             )
             child_caller = qualified_name
@@ -877,6 +929,13 @@ def _parameter_types(node, source: bytes) -> str:
         if parameter_type is not None:
             types.append(_node_text(parameter_type, source))
     return ", ".join(types)
+
+
+def _has_private_modifier(node, source: bytes) -> bool:
+    return any(
+        child.type == "modifiers" and re.search(r"\bprivate\b", _node_text(child, source))
+        for child in node.children
+    )
 
 
 def _first_parse_failure(root_node, path: Path) -> ParseFailure | None:
@@ -992,7 +1051,7 @@ def _replace_index_contents(
     _insert_java_facts(connection, result.declarations, result.invocations, result.parse_failures)
 
 
-def _initialize_index_schema(connection: sqlite3.Connection) -> None:
+def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
@@ -1008,7 +1067,8 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> None:
         path TEXT NOT NULL,
         start_line INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
-        is_test INTEGER NOT NULL
+        is_test INTEGER NOT NULL,
+        is_private INTEGER NOT NULL DEFAULT 0
         )"""
     )
     connection.execute(
@@ -1037,11 +1097,17 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE java_declarations ADD COLUMN signature TEXT NOT NULL DEFAULT ''"
         )
+    declaration_schema_changed = "is_private" not in declaration_columns
+    if declaration_schema_changed:
+        connection.execute(
+            "ALTER TABLE java_declarations ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0"
+        )
     source_file_columns = {row[1] for row in connection.execute("PRAGMA table_info(source_files)")}
     if "content_hash" not in source_file_columns:
         connection.execute(
             "ALTER TABLE source_files ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
         )
+    return declaration_schema_changed
 
 
 def _write_metadata(
@@ -1092,8 +1158,8 @@ def _insert_java_facts(
 ) -> None:
     connection.executemany(
         """INSERT INTO java_declarations(
-        kind, name, qualified_name, signature, path, start_line, end_line, is_test
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        kind, name, qualified_name, signature, path, start_line, end_line, is_test, is_private
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             (
                 declaration.kind,
@@ -1104,6 +1170,7 @@ def _insert_java_facts(
                 declaration.start_line,
                 declaration.end_line,
                 int(declaration.is_test),
+                int(declaration.is_private),
             )
             for declaration in declarations
         ),
