@@ -316,12 +316,14 @@ def _analyze_java_files(
 ) -> tuple[
     tuple[JavaDeclaration, ...], tuple[JavaInvocation, ...], tuple[ParseFailure, ...]
 ]:
-    parser = Parser(Language(tree_sitter_java.language()))
     declarations: list[JavaDeclaration] = []
     invocations: list[JavaInvocation] = []
     parse_failures: list[ParseFailure] = []
     for path, source in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
         is_test = any(path.is_relative_to(root) for root in test_roots)
+        # Keep native grammar and parser state scoped to one source file. This avoids
+        # retaining parser state across heterogeneous legacy source trees.
+        parser = Parser(Language(tree_sitter_java.language()))
         tree = parser.parse(source)
         package_name = _package_name(tree.root_node, source)
         _collect_java_facts(
@@ -385,54 +387,70 @@ def _collect_java_facts(
         "annotation_type_declaration": "annotation",
         "record_declaration": "record",
     }
-    if node.type in type_kinds:
-        name = _node_text(node.child_by_field_name("name"), source)
-        qualified_name = _qualified_type_name(package_name, (*enclosing_types, name))
-        declarations.append(
-            JavaDeclaration(
-                type_kinds[node.type], name, qualified_name, qualified_name, path, node.start_point.row + 1,
-                node.end_point.row + 1, is_test,
+    cursor = node.walk()
+    contexts = [(enclosing_types, caller)]
+    while True:
+        current = cursor.node
+        current_types, current_caller = contexts[-1]
+        child_types = current_types
+        child_caller = current_caller
+        if current.type in type_kinds:
+            name = _node_text(current.child_by_field_name("name"), source)
+            qualified_name = _qualified_type_name(package_name, (*current_types, name))
+            declarations.append(
+                JavaDeclaration(
+                    type_kinds[current.type],
+                    name,
+                    qualified_name,
+                    qualified_name,
+                    path,
+                    current.start_point.row + 1,
+                    current.end_point.row + 1,
+                    is_test,
+                )
             )
-        )
-        for child in node.children:
-            _collect_java_facts(
-                child, source, path, package_name, is_test, (*enclosing_types, name), caller,
-                declarations, invocations,
+            child_types = (*current_types, name)
+        elif current.type in {"method_declaration", "constructor_declaration"}:
+            name = _node_text(current.child_by_field_name("name"), source)
+            kind = "constructor" if current.type == "constructor_declaration" else "method"
+            owner = _qualified_type_name(package_name, current_types)
+            qualified_name = f"{owner}#{name}" if owner else name
+            signature = f"{qualified_name}({_parameter_types(current, source)})"
+            declarations.append(
+                JavaDeclaration(
+                    kind,
+                    name,
+                    qualified_name,
+                    signature,
+                    path,
+                    current.start_point.row + 1,
+                    current.end_point.row + 1,
+                    is_test,
+                )
             )
-        return
-    if node.type in {"method_declaration", "constructor_declaration"}:
-        name = _node_text(node.child_by_field_name("name"), source)
-        kind = "constructor" if node.type == "constructor_declaration" else "method"
-        owner = _qualified_type_name(package_name, enclosing_types)
-        qualified_name = f"{owner}#{name}" if owner else name
-        signature = f"{qualified_name}({_parameter_types(node, source)})"
-        declarations.append(
-            JavaDeclaration(
-                kind, name, qualified_name, signature, path, node.start_point.row + 1,
-                node.end_point.row + 1, is_test,
+            child_caller = qualified_name
+        elif current.type == "method_invocation":
+            name = _node_text(current.child_by_field_name("name"), source)
+            receiver_node = current.child_by_field_name("object")
+            receiver = _node_text(receiver_node, source) if receiver_node is not None else None
+            invocations.append(
+                JavaInvocation(
+                    name,
+                    receiver,
+                    current_caller,
+                    path,
+                    current.start_point.row + 1,
+                    current.end_point.row + 1,
+                    is_test,
+                )
             )
-        )
-        for child in node.children:
-            _collect_java_facts(
-                child, source, path, package_name, is_test, enclosing_types, qualified_name,
-                declarations, invocations,
-            )
-        return
-    if node.type == "method_invocation":
-        name = _node_text(node.child_by_field_name("name"), source)
-        receiver_node = node.child_by_field_name("object")
-        receiver = _node_text(receiver_node, source) if receiver_node is not None else None
-        invocations.append(
-            JavaInvocation(
-                name, receiver, caller, path, node.start_point.row + 1, node.end_point.row + 1,
-                is_test,
-            )
-        )
-    for child in node.children:
-        _collect_java_facts(
-            child, source, path, package_name, is_test, enclosing_types, caller,
-            declarations, invocations,
-        )
+        if cursor.goto_first_child():
+            contexts.append((child_types, child_caller))
+            continue
+        while not cursor.goto_next_sibling():
+            if not cursor.goto_parent():
+                return
+            contexts.pop()
 
 
 def _qualified_type_name(package_name: str, type_names: tuple[str, ...]) -> str:
