@@ -126,6 +126,29 @@ class IndexRepositoryTests(unittest.TestCase):
             self.assertEqual(result.source_roots, (Path("java"),))
             self.assertEqual(result.indexed_files, (Path("java/example/LegacyApp.java"),))
 
+    def test_includes_eclipse_roots_in_addition_to_conventional_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / ".classpath",
+                "<classpath><classpathentry kind=\"src\" path=\"legacy-java\" /></classpath>",
+            )
+            self._write(repository / "src/main/java/example/App.java", "class App {}\n")
+            self._write(repository / "legacy-java/example/Legacy.java", "class Legacy {}\n")
+
+            result = self._index(repository)
+
+            self.assertEqual(
+                result.source_roots, (Path("src/main/java"), Path("legacy-java"))
+            )
+            self.assertEqual(
+                result.indexed_files,
+                (
+                    Path("legacy-java/example/Legacy.java"),
+                    Path("src/main/java/example/App.java"),
+                ),
+            )
+
     def test_discovers_custom_maven_and_gradle_source_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -94,12 +95,9 @@ def _discover_source_roots(root: Path) -> tuple[Path, ...]:
         for candidate in (Path("src/main/java"), Path("src/test/java"))
         if (root / candidate).is_dir()
     )
-    if conventional_roots:
-        return conventional_roots
-
     eclipse_roots = _eclipse_source_roots(root)
-    if eclipse_roots:
-        return eclipse_roots
+    if conventional_roots or eclipse_roots:
+        return tuple(dict.fromkeys((*conventional_roots, *eclipse_roots)))
 
     if (root / "src").is_dir():
         return (Path("src"),)
@@ -195,17 +193,33 @@ def _java_files(
 ) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
     indexed_files: list[Path] = []
     read_failures: list[Path] = []
+
+    def record_walk_failure(error: OSError) -> None:
+        if not error.filename:
+            return
+        try:
+            read_failures.append(Path(error.filename).relative_to(root))
+        except ValueError:
+            return
+
     for source_root in source_roots:
-        for candidate in (root / source_root).rglob("*.java"):
-            relative_path = candidate.relative_to(root)
-            if _is_excluded(relative_path):
-                continue
-            try:
-                candidate.read_bytes()
-            except OSError:
-                read_failures.append(relative_path)
-                continue
-            indexed_files.append(relative_path)
+        for directory, directories, filenames in os.walk(
+            root / source_root, onerror=record_walk_failure
+        ):
+            directories[:] = [
+                name for name in directories if name not in EXCLUDED_DIRECTORY_NAMES
+            ]
+            for filename in filenames:
+                if not filename.endswith(".java"):
+                    continue
+                candidate = Path(directory) / filename
+                relative_path = candidate.relative_to(root)
+                try:
+                    candidate.read_bytes()
+                except OSError:
+                    read_failures.append(relative_path)
+                    continue
+                indexed_files.append(relative_path)
     return tuple(sorted(set(indexed_files), key=str)), tuple(sorted(read_failures, key=str))
 
 
