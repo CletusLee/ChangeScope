@@ -129,6 +129,104 @@ class ExternalCaller {
                 "invocation:src/main/java/example/OrderService.java:6-6",
             )
 
+    def test_refreshes_changed_java_source_before_impact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            source = repository / "src/main/java/example/OrderService.java"
+            self._write(
+                source,
+                """package example;
+class OrderService {
+    void placeOrder() {}
+}
+class OrderFacade {
+    void place() {}
+}
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            self._write(
+                source,
+                """package example;
+class OrderService {
+    void placeOrder() {}
+}
+class OrderFacade {
+    void place() { new example.OrderService().placeOrder(); }
+}
+""",
+            )
+
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertEqual(result.outcome, "resolved")
+            self.assertEqual(
+                [(relationship.kind, relationship.caller) for relationship in result.relationships],
+                [("direct_caller", "example.OrderFacade#place")],
+            )
+
+    def test_refreshes_snapshot_provenance_after_a_local_java_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            source = repository / "src/main/java/example/OrderService.java"
+            self._write(source, "package example; class OrderService { void placeOrder() {} }\n")
+            self._git(repository, "init")
+            self._git(repository, "config", "user.email", "test@example.com")
+            self._git(repository, "config", "user.name", "Test User")
+            self._git(repository, "add", ".")
+            self._git(repository, "commit", "-m", "fixture")
+            application = ChangeScopeApplication()
+            indexed = application.execute(IndexRequest(repository))
+            self._write(source, "package example; class OrderService { void placeOrder() {} void cancel() {} }\n")
+
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertEqual(result.outcome, "resolved")
+            self.assertEqual(result.snapshot.git_commit, indexed.snapshot.git_commit)
+            self.assertEqual(result.snapshot.working_tree_state, "dirty")
+
+    def test_refreshes_added_and_deleted_java_files_before_impact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            source = repository / "src/main/java/example/OrderService.java"
+            self._write(source, "package example; class OrderService { void placeOrder() {} }\n")
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            added_source = repository / "src/main/java/example/AddedService.java"
+            self._write(added_source, "package example; class AddedService { void added() {} }\n")
+
+            added = application.execute(ImpactRequest(repository, "AddedService#added"))
+            added_source.unlink()
+            deleted = application.execute(ImpactRequest(repository, "AddedService#added"))
+
+            self.assertEqual(added.outcome, "resolved")
+            self.assertEqual(deleted.outcome, "not_found")
+
+    def test_reclassifies_unchanged_java_source_when_a_test_root_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            source = repository / "src/main/java/example/OrderService.java"
+            self._write(
+                source,
+                """package example;
+class OrderService { void placeOrder() {} }
+class OrderServiceTest {
+    void places() { new example.OrderService().placeOrder(); }
+}
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            self._write(
+                repository / "pom.xml",
+                "<project><build><testSourceDirectory>src/main/java</testSourceDirectory></build></project>",
+            )
+
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertEqual(result.relationships[0].kind, "direct_test")
+
     def test_cli_renders_the_same_resolved_impact_result_as_json_and_text(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory)
@@ -185,3 +283,12 @@ class OrderService {
     def _write(path: Path, contents: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(contents, encoding="utf-8")
+
+    @staticmethod
+    def _git(repository: Path, *arguments: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )

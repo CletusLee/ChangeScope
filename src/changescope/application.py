@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -305,6 +306,7 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
             "index_missing", request.target, None, (), (), (),
             (_unresolved("No local Repository Index exists. Run `changescope index` first."),), None,
         )
+    _refresh_index_if_needed(root)
     target_parts = request.target.split("#")
     if len(target_parts) != 2 or not all(target_parts):
         return ImpactResult(
@@ -480,6 +482,52 @@ def _index_repository(repository_root: Path) -> IndexResult:
     )
     _write_index(result)
     return result
+
+
+def _refresh_index_if_needed(root: Path) -> None:
+    """Refresh changed Java paths, or all paths when test-root classification changes."""
+    database_path = root / ".changescope" / "index.sqlite"
+    source_roots = _discover_source_roots(root)
+    indexed_files, read_failures, contents_by_path = _java_files(root, source_roots)
+    current_files = {
+        str(path): ("indexed", _content_hash(contents_by_path[path]))
+        for path in indexed_files
+    }
+    current_files.update({str(path): ("unreadable", "") for path in read_failures})
+    connection = sqlite3.connect(database_path)
+    try:
+        with connection:
+            _initialize_index_schema(connection)
+            previous_files = {
+                path: (status, content_hash)
+                for path, status, content_hash in connection.execute(
+                    "SELECT path, status, content_hash FROM source_files"
+                )
+            }
+            previous_test_roots = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'test_source_roots'"
+            ).fetchone()
+            current_test_roots = _test_source_roots(root, source_roots)
+            changed_paths = {
+                path for path in set(previous_files) | set(current_files)
+                if previous_files.get(path) != current_files.get(path)
+            }
+            if previous_test_roots is None or previous_test_roots[0] != _root_list_value(current_test_roots):
+                changed_paths.update(current_files)
+            if changed_paths:
+                changed_contents = {
+                    path: source for path, source in contents_by_path.items()
+                    if str(path) in changed_paths
+                }
+                declarations, invocations, parse_failures = _analyze_java_files(
+                    changed_contents, current_test_roots
+                )
+                _replace_changed_source_records(
+                    connection, changed_paths, current_files, declarations, invocations, parse_failures
+                )
+            _write_metadata(connection, _snapshot(root), source_roots)
+    finally:
+        connection.close()
 
 
 def _discover_source_roots(root: Path) -> tuple[Path, ...]:
@@ -923,11 +971,33 @@ def _replace_index_contents(
     connection: sqlite3.Connection,
     result: IndexResult,
 ) -> None:
+    _initialize_index_schema(connection)
+    connection.execute("DELETE FROM metadata")
+    connection.execute("DELETE FROM source_files")
+    connection.execute("DELETE FROM java_declarations")
+    connection.execute("DELETE FROM java_invocations")
+    connection.execute("DELETE FROM parse_failures")
+    _write_metadata(connection, result.snapshot, result.source_roots)
+    connection.executemany(
+        "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
+        (
+            (str(path), "indexed", _file_content_hash(result.snapshot.repository_root / path))
+            for path in result.indexed_files
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
+        ((str(path), "unreadable", "") for path in result.read_failures),
+    )
+    _insert_java_facts(connection, result.declarations, result.invocations, result.parse_failures)
+
+
+def _initialize_index_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
     connection.execute(
-        "CREATE TABLE IF NOT EXISTS source_files (path TEXT PRIMARY KEY, status TEXT NOT NULL)"
+        "CREATE TABLE IF NOT EXISTS source_files (path TEXT PRIMARY KEY, status TEXT NOT NULL, content_hash TEXT NOT NULL DEFAULT '')"
     )
     connection.execute(
         """CREATE TABLE IF NOT EXISTS java_declarations (
@@ -967,28 +1037,59 @@ def _replace_index_contents(
         connection.execute(
             "ALTER TABLE java_declarations ADD COLUMN signature TEXT NOT NULL DEFAULT ''"
         )
+    source_file_columns = {row[1] for row in connection.execute("PRAGMA table_info(source_files)")}
+    if "content_hash" not in source_file_columns:
+        connection.execute(
+            "ALTER TABLE source_files ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
+        )
+
+
+def _write_metadata(
+    connection: sqlite3.Connection, snapshot: IndexSnapshot, source_roots: tuple[Path, ...]
+) -> None:
     connection.execute("DELETE FROM metadata")
-    connection.execute("DELETE FROM source_files")
-    connection.execute("DELETE FROM java_declarations")
-    connection.execute("DELETE FROM java_invocations")
-    connection.execute("DELETE FROM parse_failures")
     connection.executemany(
         "INSERT INTO metadata(key, value) VALUES (?, ?)",
         (
-            ("repository_root", str(result.snapshot.repository_root)),
-            ("git_commit", result.snapshot.git_commit or ""),
-            ("working_tree_state", result.snapshot.working_tree_state),
-            ("source_roots", "\n".join(map(str, result.source_roots))),
+            ("repository_root", str(snapshot.repository_root)),
+            ("git_commit", snapshot.git_commit or ""),
+            ("working_tree_state", snapshot.working_tree_state),
+            ("source_roots", _root_list_value(source_roots)),
+            ("test_source_roots", _root_list_value(_test_source_roots(snapshot.repository_root, source_roots))),
         ),
     )
+
+
+def _root_list_value(roots: tuple[Path, ...]) -> str:
+    return "\n".join(map(str, roots))
+
+
+def _replace_changed_source_records(
+    connection: sqlite3.Connection,
+    changed_paths: set[str],
+    current_files: dict[str, tuple[str, str]],
+    declarations: tuple[JavaDeclaration, ...],
+    invocations: tuple[JavaInvocation, ...],
+    parse_failures: tuple[ParseFailure, ...],
+) -> None:
+    for path in changed_paths:
+        connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
+        connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
+        connection.execute("DELETE FROM java_invocations WHERE path = ?", (path,))
+        connection.execute("DELETE FROM parse_failures WHERE path = ?", (path,))
     connection.executemany(
-        "INSERT INTO source_files(path, status) VALUES (?, ?)",
-        ((str(path), "indexed") for path in result.indexed_files),
+        "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
+        ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
     )
-    connection.executemany(
-        "INSERT INTO source_files(path, status) VALUES (?, ?)",
-        ((str(path), "unreadable") for path in result.read_failures),
-    )
+    _insert_java_facts(connection, declarations, invocations, parse_failures)
+
+
+def _insert_java_facts(
+    connection: sqlite3.Connection,
+    declarations: Iterable[JavaDeclaration],
+    invocations: Iterable[JavaInvocation],
+    parse_failures: Iterable[ParseFailure],
+) -> None:
     connection.executemany(
         """INSERT INTO java_declarations(
         kind, name, qualified_name, signature, path, start_line, end_line, is_test
@@ -1004,7 +1105,7 @@ def _replace_index_contents(
                 declaration.end_line,
                 int(declaration.is_test),
             )
-            for declaration in result.declarations
+            for declaration in declarations
         ),
     )
     connection.executemany(
@@ -1021,13 +1122,24 @@ def _replace_index_contents(
                 invocation.end_line,
                 int(invocation.is_test),
             )
-            for invocation in result.invocations
+            for invocation in invocations
         ),
     )
     connection.executemany(
         "INSERT INTO parse_failures(path, start_line, start_column, message) VALUES (?, ?, ?, ?)",
         (
-            (failure.path.as_posix(), failure.start_line, failure.start_column, failure.message)
-            for failure in result.parse_failures
+            (str(failure.path), failure.start_line, failure.start_column, failure.message)
+            for failure in parse_failures
         ),
     )
+
+
+def _content_hash(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _file_content_hash(path: Path) -> str:
+    try:
+        return _content_hash(path.read_bytes())
+    except OSError:
+        return ""
