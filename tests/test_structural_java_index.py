@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import sqlite3
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
+from importlib.metadata import version
 from pathlib import Path
 
 from changescope.application import ChangeScopeApplication, IndexRequest
 
 
 class StructuralJavaIndexTests(unittest.TestCase):
+    def test_uses_tree_sitter_runtime_compatible_with_java_grammar(self) -> None:
+        self.assertEqual(version("tree-sitter"), "0.25.2")
+
     def test_records_java_declarations_and_explicit_invocation_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory)
@@ -233,6 +240,55 @@ enum OrderState {
             self.assertEqual(issue.path, Path("src/main/java/example/Broken.java"))
             self.assertGreaterEqual(issue.start_line, 1)
             self.assertIn("syntax", issue.message)
+
+    def test_indexes_nested_anonymous_class_literals_without_native_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/NestedAnonymous.java",
+                """package example;
+import java.util.HashMap;
+import java.util.Map;
+
+class NestedAnonymous {
+    void build(String email, String password) {
+        Map<String, Object> param = new HashMap<String, Object>() {
+            {
+                put("user", new HashMap<String, Object>() {
+                    {
+                        put("email", email);
+                        put("password", password);
+                    }
+                });
+            }
+        };
+    }
+}
+""",
+            )
+
+            source_root = Path(__file__).resolve().parents[1] / "src"
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = os.pathsep.join(
+                (str(source_root), environment.get("PYTHONPATH", ""))
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path; "
+                        "from changescope.application import ChangeScopeApplication, IndexRequest; "
+                        "ChangeScopeApplication().execute(IndexRequest(Path.cwd()))"
+                    ),
+                ],
+                cwd=repository,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
 
     @staticmethod
     def _write(path: Path, contents: str) -> None:
