@@ -143,6 +143,7 @@ class OrderService { void placeOrder() {} }
             )
             self._write(repository / "src/main/resources/application.yml", "orders:\n  timeout: 30\n")
             self._write(repository / "src/main/resources/application-prod.yml", "orders:\n  timeout: 60\n")
+            self._write(repository / "src/main/resources/application-test.yml", "orders:\n  timeout: 45\n")
 
             application = ChangeScopeApplication()
             application.execute(IndexRequest(repository))
@@ -153,12 +154,13 @@ class OrderService { void placeOrder() {} }
                 relationship for relationship in result.relationships
                 if relationship.kind == "property_source"
             ]
-            self.assertEqual(len(sources), 2)
+            self.assertEqual(len(sources), 3)
             self.assertEqual(
                 {relationship.profile for relationship in sources},
-                {None, "prod"},
+                {None, "prod", "test"},
             )
             self.assertTrue(next(relationship for relationship in sources if relationship.profile == "prod").conditional)
+            self.assertTrue(next(relationship for relationship in sources if relationship.profile == "test").conditional)
 
             selected = application.execute(
                 ImpactRequest(repository, "OrderService#placeOrder", profiles=("prod",))
@@ -169,6 +171,118 @@ class OrderService { void placeOrder() {} }
             ]
             self.assertEqual(len(selected_sources), 2)
             self.assertFalse(next(relationship for relationship in selected_sources if relationship.profile == "prod").conditional)
+            self.assertNotIn("test", {relationship.profile for relationship in selected_sources})
+
+            selected_both = application.execute(
+                ImpactRequest(repository, "OrderService#placeOrder", profiles=("prod", "test"))
+            )
+            selected_both_sources = [
+                relationship for relationship in selected_both.relationships
+                if relationship.kind == "property_source"
+            ]
+            self.assertEqual(len(selected_both_sources), 3)
+            self.assertEqual(
+                {relationship.profile for relationship in selected_both_sources},
+                {None, "prod", "test"},
+            )
+            self.assertFalse(any(relationship.conditional for relationship in selected_both_sources))
+
+    def test_cli_text_exposes_selected_profile_metadata_like_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Service;
+@Service
+@ConfigurationProperties(prefix = "orders")
+class OrderService { void placeOrder() {} }
+""",
+            )
+            self._write(repository / "src/main/resources/application.yml", "orders:\n  timeout: 30\n")
+            self._write(repository / "src/main/resources/application-prod.yml", "orders:\n  timeout: 60\n")
+            ChangeScopeApplication().execute(IndexRequest(repository))
+
+            with patch("changescope.cli.Path.cwd", return_value=repository):
+                with patch("sys.stdout", new_callable=StringIO) as json_output:
+                    main([
+                        "impact", "OrderService#placeOrder",
+                        "--profile", "prod", "--format", "json",
+                    ])
+                with patch("sys.stdout", new_callable=StringIO) as text_output:
+                    main([
+                        "impact", "OrderService#placeOrder",
+                        "--profile", "prod",
+                    ])
+
+            report = json.loads(json_output.getvalue())
+            selected_source = next(
+                relationship
+                for relationship in report["relationships"]
+                if relationship["kind"] == "property_source"
+                and relationship["profile"] == "prod"
+            )
+            self.assertEqual(selected_source["conditional"], False)
+            self.assertIn("profile: prod", text_output.getvalue())
+
+    def test_reports_profile_expressions_as_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+import org.springframework.context.annotation.Profile;
+import org.springframework.stereotype.Service;
+@Service
+@Profile({"prod", "!test"})
+class OrderService { void placeOrder() {} }
+""",
+            )
+
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertTrue(
+                any("profile expression" in item.message.lower() for item in result.unresolved_items)
+            )
+            self.assertFalse(
+                any(
+                    relationship.kind == "spring_configuration_boundary"
+                    for relationship in result.relationships
+                )
+            )
+
+    def test_reports_conditional_configuration_as_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+import org.springframework.stereotype.Service;
+@Service
+class OrderService { void placeOrder() {} }
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/AppConfig.java",
+                """package example;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.Configuration;
+@Configuration
+@ConditionalOnProperty(name = "orders.enabled")
+class AppConfig {}
+""",
+            )
+
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertTrue(
+                any("conditional" in item.message.lower() for item in result.unresolved_items)
+            )
 
     def test_reports_a_java_bean_factory_as_configuration_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -238,6 +352,49 @@ class AppConfig {
                 )
             )
 
+    def test_cli_exposes_xml_relationships_in_text_and_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                "package example; class OrderService { void placeOrder() {} }\n",
+            )
+            self._write(
+                repository / "src/main/java/example/OrderController.java",
+                "package example; class OrderController {}\n",
+            )
+            self._write(
+                repository / "src/main/resources/application-context.xml",
+                """<beans>
+  <bean id="orderService" class="example.OrderService" />
+  <bean id="orderController" class="example.OrderController">
+    <property name="service" ref="orderService" />
+  </bean>
+</beans>
+""",
+            )
+            ChangeScopeApplication().execute(IndexRequest(repository))
+
+            with patch("changescope.cli.Path.cwd", return_value=repository):
+                with patch("sys.stdout", new_callable=StringIO) as json_output:
+                    main([
+                        "impact", "OrderService#placeOrder", "--format", "json",
+                    ])
+                with patch("sys.stdout", new_callable=StringIO) as text_output:
+                    main(["impact", "OrderService#placeOrder"])
+
+            report = json.loads(json_output.getvalue())
+            relationship = next(
+                relationship
+                for relationship in report["relationships"]
+                if relationship["kind"] == "bean_consumer"
+            )
+            self.assertEqual(relationship["caller"], "example.OrderController")
+            self.assertIn(
+                relationship["evidence_handle"],
+                text_output.getvalue(),
+            )
+
     def test_reports_xml_property_placeholder_consumption_with_local_source_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory)
@@ -252,13 +409,17 @@ class AppConfig {
         class="example.OrderService">
     <property name="timeout" value="${orders.timeout}" />
   </bean>
-  <context:property-placeholder location="classpath:application.properties" />
+  <context:property-placeholder location="classpath:declared.properties" />
 </beans>
 """,
             )
             self._write(
-                repository / "src/main/resources/application.properties",
+                repository / "src/main/resources/declared.properties",
                 "orders.timeout=30\n",
+            )
+            self._write(
+                repository / "src/main/resources/application.properties",
+                "orders.timeout=99\n",
             )
 
             application = ChangeScopeApplication()
@@ -266,7 +427,38 @@ class AppConfig {
             result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
 
             self.assertTrue(any(relationship.kind == "property_consumer" for relationship in result.relationships))
-            self.assertTrue(any(relationship.kind == "property_source" for relationship in result.relationships))
+            property_sources = [
+                relationship
+                for relationship in result.relationships
+                if relationship.kind == "property_source"
+            ]
+            self.assertEqual(
+                [relationship.path.as_posix() for relationship in property_sources],
+                ["src/main/resources/declared.properties"],
+            )
+
+    def test_reports_xml_profile_expressions_as_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                "package example; class OrderService { void placeOrder() {} }\n",
+            )
+            self._write(
+                repository / "src/main/resources/application-context.xml",
+                """<beans profile="prod &amp; !test">
+  <bean id="orderService" class="example.OrderService" />
+</beans>
+""",
+            )
+
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertTrue(
+                any("profile expression" in item.message.lower() for item in result.unresolved_items)
+            )
 
     def test_reports_spring_test_context_evidence_for_a_changed_component(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

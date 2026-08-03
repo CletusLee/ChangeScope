@@ -181,10 +181,16 @@ def _render_impact_result(result: ImpactResult, output_format: str) -> None:
     if report["relationships"]:
         print("Affected relationships:")
         for relationship in report["relationships"]:
+            profile = relationship["profile"]
+            profile_suffix = ""
+            if relationship["conditional"]:
+                profile_suffix = f" (conditional profile: {profile or 'unspecified'})"
+            elif profile:
+                profile_suffix = f" (profile: {profile})"
             print(
                 f"- {relationship['kind']} {relationship['caller']} "
                 f"[{relationship['confidence']}] {relationship['evidence_handle']}"
-                + (f" (conditional profile: {relationship['profile'] or 'unspecified'})" if relationship["conditional"] else "")
+                + profile_suffix
             )
     print("Assumptions:")
     for assumption in report["assumptions"]:

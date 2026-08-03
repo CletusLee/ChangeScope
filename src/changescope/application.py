@@ -566,6 +566,8 @@ def _spring_relationships(
     def active(fact: SpringFact) -> tuple[bool, bool]:
         if fact.profile is None:
             return True, False
+        if _spring_profile_is_expression(fact.profile):
+            return False, False
         if profiles:
             return fact.profile in profiles, False
         return True, True
@@ -688,6 +690,9 @@ def _spring_relationships(
         ):
             property_consumers.append(fact)
     property_sources = [fact for fact in facts if fact.kind == "spring_property_source"]
+    property_placeholders = [
+        fact for fact in facts if fact.kind == "spring_property_placeholder"
+    ]
     for consumer in property_consumers:
         applies, _ = active(consumer)
         if not applies:
@@ -700,6 +705,33 @@ def _spring_relationships(
             or (consumer.target.endswith(".") and source.subject.startswith(consumer.target))
             or (consumer.target and source.subject.startswith(consumer.target + "."))
         ]
+        if consumer.path.suffix.lower() == ".xml":
+            placeholders = [
+                placeholder
+                for placeholder in property_placeholders
+                if placeholder.path == consumer.path and active(placeholder)[0]
+            ]
+            if placeholders:
+                matches = [
+                    source for source in matches
+                    if any(
+                        _spring_placeholder_matches(placeholder.target, source.path)
+                        for placeholder in placeholders
+                    )
+                ]
+                if not matches:
+                    placeholder = placeholders[0]
+                    unresolved.append(
+                        _unresolved(
+                            "Spring XML property placeholder did not match a local property source.",
+                            placeholder.path,
+                            placeholder.start_line,
+                            placeholder.end_line,
+                            "spring",
+                        )
+                    )
+            else:
+                matches = []
         for source in matches:
             add_relationship("property_source", source.subject, source, "medium" if active(source)[1] else "high")
 
@@ -1240,15 +1272,32 @@ def _spring_java_facts(
         if configuration_properties:
             line = annotation_start + context[:configuration_properties.start()].count("\n") + 1
             add("spring_property_consumer", declaration.qualified_name, configuration_properties.group(1), "prefix", line, profile=profile)
-        if re.search(r"@ComponentScan\b|@Import\b|@Conditional\b", context):
-            line = annotation_start + next(
-                index for index, value in enumerate(annotation_lines)
-                if re.search(r"@ComponentScan\b|@Import\b|@Conditional\b", value)
-            ) + 1
+        unsupported_annotation = next(
+            (
+                (annotation, line, end_line)
+                for annotation, line, end_line in class_annotations
+                if _simple_annotation_name(annotation) in {"ComponentScan", "Import"}
+                or _simple_annotation_name(annotation).startswith("Conditional")
+            ),
+            None,
+        )
+        if unsupported_annotation is None:
+            unsupported_match = re.search(
+                r"@ComponentScan\b|@Import\b|@Conditional\w*\b", context
+            )
+            if unsupported_match:
+                unsupported_annotation = (
+                    "",
+                    annotation_start + context[:unsupported_match.start()].count("\n") + 1,
+                    annotation_start + context[:unsupported_match.start()].count("\n") + 1,
+                )
+        if unsupported_annotation is not None:
+            line = unsupported_annotation[1]
             add("spring_unresolved", "", None,
                 "Spring component scanning, imports, or conditional configuration was not resolved.", line, profile=profile)
-        if profile and any(operator in profile for operator in ("!", "&", "|")):
-            line = annotation_start + context[:context.find("@Profile")].count("\n") + 1
+        if profile and _spring_profile_is_expression(profile):
+            profile_match = re.search(r"@(?:[A-Za-z_$][\w$.]*\.)?Profile\b", context)
+            line = annotation_start + context[:profile_match.start()].count("\n") + 1 if profile_match else annotation_start + 1
             add("spring_unresolved", declaration.qualified_name, None,
                 "Spring profile expression was not resolved.", line)
 
@@ -1613,6 +1662,25 @@ def _spring_xml_facts(path: Path, lines: list[str]) -> tuple[SpringFact, ...]:
     for match in re.finditer(r"<[^>]*(?:component-scan|import)\b", text, re.DOTALL):
         start_line = line_number(match.start())
         facts.append(SpringFact("spring_unresolved", "", None, "Spring XML scan or import indirection was not resolved.", path, start_line, start_line, _spring_xml_profile_at(text, match.start())))
+    for match in re.finditer(
+        r"<beans\b[^>]*\bprofile\s*=\s*['\"]([^'\"]+)['\"]",
+        text,
+        re.DOTALL,
+    ):
+        profile = match.group(1).strip()
+        if _spring_profile_is_expression(profile):
+            start_line = line_number(match.start())
+            facts.append(
+                SpringFact(
+                    "spring_unresolved",
+                    "",
+                    None,
+                    "Spring XML profile expression was not resolved.",
+                    path,
+                    start_line,
+                    start_line,
+                )
+            )
     try:
         ElementTree.fromstring(text)
     except ElementTree.ParseError:
@@ -1629,8 +1697,33 @@ def _spring_xml_profile_at(text: str, position: int) -> str | None:
 
 
 def _spring_annotation_profile(context: str) -> str | None:
-    match = re.search(r"@Profile\s*\(\s*[\"']([^\"']+)[\"']", context)
-    return match.group(1).strip() if match else None
+    match = re.search(
+        r"@(?:[A-Za-z_$][\w$.]*\.)?Profile\s*\((?P<arguments>[^)]*)\)",
+        context,
+        re.DOTALL,
+    )
+    if match is None:
+        return None
+    arguments = match.group("arguments").strip()
+    values = re.findall(r"[\"']([^\"']+)[\"']", arguments)
+    if len(values) == 1 and not _spring_profile_is_expression(arguments):
+        return values[0].strip()
+    return arguments
+
+
+def _spring_profile_is_expression(profile: str) -> bool:
+    return any(operator in profile for operator in ("!", "&", "|", "{", "}", ","))
+
+
+def _spring_placeholder_matches(location: str | None, path: Path) -> bool:
+    if not location:
+        return False
+    for candidate in re.split(r"\s*,\s*", location):
+        normalized = re.sub(r"^(?:classpath\*:|classpath:|file:)", "", candidate.strip())
+        normalized = normalized.lstrip("/")
+        if normalized and path.as_posix().endswith(normalized):
+            return True
+    return False
 
 
 def _spring_type_line_index(lines: list[str], declaration: JavaDeclaration) -> int:
