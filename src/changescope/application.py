@@ -706,7 +706,9 @@ def _spring_relationships(
     for fact in facts:
         if fact.kind == "spring_test" and matching_type(fact.target, owner):
             add_relationship("spring_test", fact.subject, fact, "medium")
-        elif fact.kind == "spring_unresolved" and (not fact.subject or fact.subject == owner):
+        elif fact.kind == "spring_unresolved" and (
+            not fact.subject or matching_type(fact.subject, owner)
+        ):
             applies, _ = active(fact)
             if applies:
                 unresolved.append(
@@ -1199,14 +1201,38 @@ def _spring_java_facts(
             annotation_start = class_annotations[0][1] - 1
             annotation_lines = [annotation for annotation, _, _ in class_annotations]
             context = "\n".join(annotation_lines)
+        component_annotation = next(
+            (
+                (annotation, line, end_line)
+                for annotation, line, end_line in class_annotations
+                if _simple_annotation_name(annotation)
+                in {"Component", "Service", "Repository", "Controller", "RestController", "Configuration"}
+            ),
+            None,
+        )
         component_match = re.search(
             r"@(Component|Service|Repository|Controller|RestController|Configuration)\b",
             context,
         )
         profile = _spring_annotation_profile(context)
-        if component_match:
-            add("spring_component", declaration.qualified_name, declaration.qualified_name, component_match.group(1),
-                annotation_start + context[:component_match.start()].count("\n") + 1, profile=profile)
+        if component_annotation is not None:
+            add(
+                "spring_component",
+                declaration.qualified_name,
+                declaration.qualified_name,
+                _simple_annotation_name(component_annotation[0]),
+                component_annotation[1],
+                profile=profile,
+            )
+        elif component_match:
+            add(
+                "spring_component",
+                declaration.qualified_name,
+                declaration.qualified_name,
+                component_match.group(1),
+                annotation_start + context[:component_match.start()].count("\n") + 1,
+                profile=profile,
+            )
         configuration_properties = re.search(
             r"@ConfigurationProperties\s*\(\s*(?:(?:prefix|value)\s*=\s*)?['\"]([^'\"]+)['\"]",
             context,
@@ -1225,6 +1251,32 @@ def _spring_java_facts(
             line = annotation_start + context[:context.find("@Profile")].count("\n") + 1
             add("spring_unresolved", declaration.qualified_name, None,
                 "Spring profile expression was not resolved.", line)
+
+        for annotation, line, _ in class_annotations:
+            annotation_name = _simple_annotation_name(annotation)
+            if annotation_name == "Primary":
+                add(
+                    "spring_unresolved",
+                    declaration.qualified_name,
+                    None,
+                    "Spring @Primary bean selection was not resolved.",
+                    line,
+                    profile=profile,
+                )
+            elif annotation_name in _SPRING_PROXY_ANNOTATIONS:
+                configuration_level = annotation_name.startswith("Enable")
+                add(
+                    "spring_unresolved",
+                    "" if configuration_level else declaration.qualified_name,
+                    None,
+                    (
+                        f"Spring proxy or advice behavior declared by {declaration.qualified_name} was not resolved."
+                        if configuration_level
+                        else "Spring proxy or advice behavior was not resolved."
+                    ),
+                    line,
+                    profile=profile,
+                )
 
         class_lines = lines[declaration.start_line - 1:declaration.end_line]
         for offset, line in enumerate(class_lines, declaration.start_line):
@@ -1256,17 +1308,57 @@ def _spring_java_facts(
             method_context = "\n".join(lines[context_start:method_type_line_index])
             if method_annotations:
                 method_context = "\n".join(annotation for annotation, _, _ in method_annotations)
-            if any(_simple_annotation_name(annotation) == "Bean" for annotation, _, _ in method_annotations) or (not method_annotations and "@Bean" in method_context):
+            bean_annotation = next(
+                (
+                    (annotation, line, end_line)
+                    for annotation, line, end_line in method_annotations
+                    if _simple_annotation_name(annotation) == "Bean"
+                ),
+                None,
+            )
+            if bean_annotation is not None or (not method_annotations and "@Bean" in method_context):
                 method_line = lines[method_type_line_index] if method_type_line_index < len(lines) else ""
                 return_match = re.search(
-                    rf"(?:public|protected|private)?\s*(?:static\s+)?([A-Za-z_$][\w$]*(?:\s*<[^>]+>)?(?:\[\])?)\s+{re.escape(method.name)}\s*\(",
+                    rf"(?:public|protected|private)?\s*(?:static\s+)?((?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*(?:\s*<[^>]+>)?(?:\[\])?)\s+{re.escape(method.name)}\s*\(",
                     method_line,
                 )
-                target = return_match.group(1).replace(" ", "") if return_match else None
+                target = _simple_java_type(return_match.group(1)) if return_match else None
                 if target:
-                    annotation_line = method_annotations[0][1] if method_annotations else context_start + method_context.count("\n") + 1
+                    annotation_line = bean_annotation[1] if bean_annotation else context_start + method_context.count("\n") + 1
                     add("spring_bean", method.qualified_name, target, "@Bean", annotation_line,
                         profile=_spring_annotation_profile(method_context))
+                    if any(
+                        _simple_annotation_name(annotation) == "Primary"
+                        for annotation, _, _ in method_annotations
+                    ):
+                        add(
+                            "spring_unresolved",
+                            target,
+                            None,
+                            "Spring @Primary bean selection was not resolved.",
+                            next(
+                                line
+                                for annotation, line, _ in method_annotations
+                                if _simple_annotation_name(annotation) == "Primary"
+                            ),
+                            profile=_spring_annotation_profile(method_context),
+                        )
+            for annotation, line, _ in method_annotations:
+                annotation_name = _simple_annotation_name(annotation)
+                if annotation_name in _SPRING_PROXY_ANNOTATIONS:
+                    configuration_level = annotation_name.startswith("Enable")
+                    add(
+                        "spring_unresolved",
+                        "" if configuration_level else declaration.qualified_name,
+                        None,
+                        (
+                            f"Spring proxy or advice behavior declared by {declaration.qualified_name} was not resolved."
+                            if configuration_level
+                            else "Spring proxy or advice behavior was not resolved."
+                        ),
+                        line,
+                        profile=profile,
+                    )
 
     for declaration in type_declarations:
         class_text = "\n".join(lines[declaration.start_line - 1:declaration.end_line])
@@ -1281,12 +1373,60 @@ def _spring_java_facts(
             or _spring_annotation_context(lines, _spring_type_line_index(lines, declaration))[1]
         )
         if managed:
-            for match in re.finditer(
-                r"@(?:Autowired|Inject|Resource)(?:\([^)]*\))?\s*(?:\r?\n\s*)*(?:private|protected|public)?\s*(?:final\s+)?([A-Za-z_$][\w$.]*(?:<[^>]+>)?(?:\[\])?)\s+[A-Za-z_$][\w$]*\s*(?:=|;)",
-                class_text,
-            ):
-                line = declaration.start_line + class_text[:match.start()].count("\n")
-                add("spring_injection", declaration.qualified_name, _simple_java_type(match.group(1)), "field", line, profile=owner_profile)
+            for (region_type, start_line, end_line), field_annotations in ast_annotations.items():
+                if region_type != "field_declaration" or not (
+                    declaration.start_line <= start_line <= declaration.end_line
+                ):
+                    continue
+                annotation_names = {
+                    _simple_annotation_name(annotation)
+                    for annotation, _, _ in field_annotations
+                }
+                injection_annotations = {"Autowired", "Inject", "Resource"}
+                if not annotation_names & injection_annotations:
+                    continue
+                field_text = "\n".join(lines[start_line - 1:end_line])
+                type_match = re.search(
+                    r"(?:private|protected|public)?\s*(?:final\s+)?"
+                    r"(?P<type>[A-Za-z_$][\w$.]*(?:\s*<[^;=]+>)?(?:\[\])?)\s+"
+                    r"[A-Za-z_$][\w$]*\s*(?:=|;)",
+                    field_text,
+                )
+                if type_match is None:
+                    continue
+                raw_type = type_match.group("type")
+                target = _simple_java_type(raw_type)
+                injection_line = next(
+                    line
+                    for annotation, line, _ in field_annotations
+                    if _simple_annotation_name(annotation) in injection_annotations
+                )
+                resource_name = any(
+                    _simple_annotation_name(annotation) == "Resource"
+                    and re.search(r"\b(?:name|mappedName)\s*=", annotation)
+                    for annotation, _, _ in field_annotations
+                )
+                if "Qualifier" in annotation_names or resource_name:
+                    selection = "qualifier" if "Qualifier" in annotation_names else "named @Resource"
+                    add(
+                        "spring_unresolved",
+                        target,
+                        None,
+                        f"Spring {selection} bean selection was not resolved.",
+                        injection_line,
+                        profile=owner_profile,
+                    )
+                if _is_spring_collection_type(raw_type):
+                    add(
+                        "spring_unresolved",
+                        _spring_generic_argument(raw_type) or target,
+                        None,
+                        "Spring collection injection was not resolved.",
+                        injection_line,
+                        profile=owner_profile,
+                    )
+                if "Qualifier" not in annotation_names and not resource_name and not _is_spring_collection_type(raw_type):
+                    add("spring_injection", declaration.qualified_name, target, "field", injection_line, profile=owner_profile)
         constructor_declarations = [
             constructor for constructor in declarations
             if constructor.kind == "constructor" and constructor.path == path
@@ -1297,20 +1437,69 @@ def _spring_java_facts(
             constructor_text = "\n".join(
                 lines[constructor.start_line - 1:min(len(lines), constructor.start_line + 8)]
             )
-            parameter_match = re.search(
-                rf"\b{re.escape(declaration.name)}\s*\(([^)]*)\)", constructor_text
+            constructor_match = re.search(
+                rf"\b{re.escape(declaration.name)}\s*\(", constructor_text
             )
-            if parameter_match:
-                parameter_types = _spring_parameter_types(parameter_match.group(1))
-                for parameter_type in parameter_types:
-                    add("spring_injection", declaration.qualified_name, parameter_type, "constructor", constructor.start_line, profile=owner_profile)
+            parameter_text = (
+                _parenthesized_content(constructor_text, constructor_match.end() - 1)
+                if constructor_match
+                else None
+            )
+            if parameter_text is not None:
+                for parameter_type, parameter_annotations in _spring_constructor_parameters(
+                    parameter_text
+                ):
+                    annotation_names = {
+                        _simple_annotation_name(annotation)
+                        for annotation in parameter_annotations
+                    }
+                    resource_name = any(
+                        _simple_annotation_name(annotation) == "Resource"
+                        and re.search(r"\b(?:name|mappedName)\s*=", annotation)
+                        for annotation in parameter_annotations
+                    )
+                    if "Qualifier" in annotation_names or resource_name:
+                        selection = "qualifier" if "Qualifier" in annotation_names else "named @Resource"
+                        add(
+                            "spring_unresolved",
+                            parameter_type,
+                            None,
+                            f"Spring constructor {selection} bean selection was not resolved.",
+                            constructor.start_line,
+                            profile=owner_profile,
+                        )
+                    elif _is_spring_collection_type(parameter_type):
+                        add(
+                            "spring_unresolved",
+                            _spring_generic_argument(parameter_type) or parameter_type,
+                            None,
+                            "Spring collection injection was not resolved.",
+                            constructor.start_line,
+                            profile=owner_profile,
+                        )
+                    else:
+                        add(
+                            "spring_injection",
+                            declaration.qualified_name,
+                            _simple_java_type(parameter_type),
+                            "constructor",
+                            constructor.start_line,
+                            profile=owner_profile,
+                        )
 
         if declaration.is_test:
             class_annotations = ast_annotations.get(
                 ("class_declaration", declaration.start_line, declaration.end_line), ()
             )
             for annotation, line, _ in class_annotations:
-                if _simple_annotation_name(annotation) not in {"SpringBootTest", "ContextConfiguration", "WebMvcTest", "DataJpaTest"}:
+                if _simple_annotation_name(annotation) not in {
+                    "SpringBootTest",
+                    "ContextConfiguration",
+                    "DataJpaTest",
+                    "SpringJUnitConfig",
+                    "SpringJUnitWebConfig",
+                    "WebMvcTest",
+                }:
                     continue
                 classes = re.findall(r"([A-Za-z_$][\w$]*)\.class", annotation)
                 for target in classes:
@@ -1518,6 +1707,26 @@ def _simple_annotation_name(annotation: str) -> str:
     return match.group(1).rsplit(".", maxsplit=1)[-1] if match else ""
 
 
+_SPRING_PROXY_ANNOTATIONS = frozenset(
+    {
+        "After",
+        "AfterReturning",
+        "AfterThrowing",
+        "Around",
+        "Async",
+        "Before",
+        "CacheEvict",
+        "CachePut",
+        "Cacheable",
+        "EnableAspectJAutoProxy",
+        "EnableCaching",
+        "EnableTransactionManagement",
+        "Retryable",
+        "Transactional",
+    }
+)
+
+
 def _spring_file_profile(path: Path) -> str | None:
     match = re.match(r"application-([^./]+)\.(?:properties|ya?ml)$", path.name, re.IGNORECASE)
     return match.group(1) if match else None
@@ -1527,13 +1736,76 @@ def _simple_java_type(value: str) -> str:
     return re.sub(r"\s+", "", value).split("<", maxsplit=1)[0].replace("[]", "")
 
 
+def _is_spring_collection_type(value: str) -> bool:
+    base_type = _simple_java_type(value).rsplit(".", maxsplit=1)[-1]
+    return (
+        "<" in value
+        or "[]" in value
+        or base_type in {"Collection", "Iterable", "List", "Map", "Set", "Stream"}
+    )
+
+
+def _spring_generic_argument(value: str) -> str | None:
+    match = re.search(r"<\s*([A-Za-z_$][\w$.]*)", value)
+    return _simple_java_type(match.group(1)) if match else None
+
+
 def _spring_parameter_types(value: str) -> tuple[str, ...]:
     types: list[str] = []
-    for parameter in value.split(","):
+    for parameter in _split_spring_parameters(value):
         tokens = parameter.strip().split()
         if len(tokens) >= 2:
             types.append(_simple_java_type(" ".join(tokens[:-1])))
     return tuple(types)
+
+
+def _spring_constructor_parameters(value: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    parameters: list[tuple[str, tuple[str, ...]]] = []
+    for parameter in _split_spring_parameters(value):
+        match = re.fullmatch(
+            r"(?P<annotations>(?:@[A-Za-z_$][\w$.]*(?:\([^)]*\))?\s*)*)"
+            r"(?P<type>[A-Za-z_$][\w$.]*(?:\s*<[^>]+>)?(?:\[\])?)\s+"
+            r"[A-Za-z_$][\w$]*",
+            parameter.strip(),
+        )
+        if match is None:
+            continue
+        annotations = tuple(
+            re.findall(r"@[A-Za-z_$][\w$.]*(?:\([^)]*\))?", match.group("annotations"))
+        )
+        parameters.append((match.group("type"), annotations))
+    if parameters:
+        return tuple(parameters)
+    return tuple((parameter_type, ()) for parameter_type in _spring_parameter_types(value))
+
+
+def _split_spring_parameters(value: str) -> tuple[str, ...]:
+    parameters: list[str] = []
+    start = 0
+    nesting = 0
+    for index, character in enumerate(value):
+        if character in "(<[":
+            nesting += 1
+        elif character in ")>]":
+            nesting = max(0, nesting - 1)
+        elif character == "," and nesting == 0:
+            parameters.append(value[start:index])
+            start = index + 1
+    parameters.append(value[start:])
+    return tuple(parameter for parameter in parameters if parameter.strip())
+
+
+def _parenthesized_content(value: str, opening_index: int) -> str | None:
+    nesting = 0
+    for index in range(opening_index, len(value)):
+        character = value[index]
+        if character == "(":
+            nesting += 1
+        elif character == ")":
+            nesting -= 1
+            if nesting == 0:
+                return value[opening_index + 1:index]
+    return None
 
 
 def _package_name(root_node, source: bytes) -> str:

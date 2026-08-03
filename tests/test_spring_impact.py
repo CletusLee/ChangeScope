@@ -340,6 +340,217 @@ class OrderController {
             self.assertFalse(any(relationship.kind == "bean_consumer" for relationship in result.relationships))
             self.assertTrue(any("multiple local bean candidates" in item.message for item in result.unresolved_items))
 
+    def test_leaves_qualifier_and_primary_selection_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+import org.springframework.stereotype.Service;
+@Service
+class OrderService { void placeOrder() {} }
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/AppConfig.java",
+                """package example;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+@Configuration
+class AppConfig {
+    @Bean
+    @Primary
+    OrderService primaryOrderService() { return new OrderService(); }
+}
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/OrderController.java",
+                """package example;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Controller;
+@Controller
+class OrderController {
+    @Autowired
+    @Qualifier("primaryOrderService")
+    private OrderService service;
+}
+""",
+            )
+
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertFalse(any(relationship.kind == "bean_consumer" for relationship in result.relationships))
+            messages = [item.message.lower() for item in result.unresolved_items]
+            self.assertTrue(any("qualifier" in message for message in messages))
+            self.assertTrue(any("primary" in message for message in messages))
+
+    def test_leaves_collection_injection_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+import org.springframework.stereotype.Service;
+@Service
+class OrderService { void placeOrder() {} }
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/OrderController.java",
+                """package example;
+import java.util.List;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Controller;
+@Controller
+class OrderController {
+    @Autowired
+    private List<OrderService> services;
+}
+""",
+            )
+
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertFalse(any(relationship.kind == "bean_consumer" for relationship in result.relationships))
+            self.assertTrue(
+                any("collection injection" in item.message.lower() for item in result.unresolved_items)
+            )
+
+    def test_leaves_spring_proxy_annotations_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+@Service
+@Transactional
+class OrderService { void placeOrder() {} }
+""",
+            )
+
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertTrue(
+                any("proxy" in item.message.lower() for item in result.unresolved_items)
+            )
+
+    def test_leaves_constructor_qualifier_and_collection_injection_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+import org.springframework.stereotype.Service;
+@Service
+class OrderService { void placeOrder() {} }
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/OrderController.java",
+                """package example;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Controller;
+@Controller
+class OrderController {
+    OrderController(@Qualifier("orderService") OrderService service) {}
+}
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/BatchController.java",
+                """package example;
+import java.util.List;
+import org.springframework.stereotype.Controller;
+@Controller
+class BatchController {
+    BatchController(List<OrderService> services) {}
+}
+""",
+            )
+
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertFalse(any(relationship.kind == "bean_consumer" for relationship in result.relationships))
+            messages = [item.message.lower() for item in result.unresolved_items]
+            self.assertTrue(any("qualifier" in message for message in messages))
+            self.assertTrue(any("collection injection" in message for message in messages))
+
+    def test_reports_spring_junit_test_loading_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+import org.springframework.stereotype.Service;
+@Service
+class OrderService { void placeOrder() {} }
+""",
+            )
+            self._write(
+                repository / "src/test/java/example/OrderServiceTest.java",
+                """package example;
+import org.springframework.test.context.junit.jupiter.SpringJUnitConfig;
+@SpringJUnitConfig(OrderService.class)
+class OrderServiceTest {}
+""",
+            )
+
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertTrue(
+                any(
+                    relationship.kind == "spring_test"
+                    and relationship.caller == "example.OrderServiceTest"
+                    and relationship.confidence == "medium"
+                    for relationship in result.relationships
+                )
+            )
+
+    def test_reports_configuration_proxy_enablement_as_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/OrderService.java",
+                """package example;
+import org.springframework.stereotype.Service;
+@Service
+class OrderService { void placeOrder() {} }
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/AppConfig.java",
+                """package example;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.transaction.annotation.EnableTransactionManagement;
+@Configuration
+@EnableTransactionManagement
+class AppConfig {}
+""",
+            )
+
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            result = application.execute(ImpactRequest(repository, "OrderService#placeOrder"))
+
+            self.assertTrue(
+                any("proxy" in item.message.lower() for item in result.unresolved_items)
+            )
+
     def test_reports_unsupported_component_scan_as_an_unresolved_item(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory)
