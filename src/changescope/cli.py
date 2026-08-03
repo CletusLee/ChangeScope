@@ -28,6 +28,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
     impact_command.add_argument(
         "--format", choices=("text", "json"), default="text", help="report format"
     )
+    impact_command.add_argument(
+        "--profile", dest="profiles", action="append", default=[],
+        help="select an active Spring profile; repeat for multiple profiles",
+    )
     evidence_command = subcommands.add_parser("evidence", help="retrieve bounded source evidence")
     evidence_command.add_argument("evidence_handle")
     evidence_command.add_argument("--context-lines", type=int, default=2)
@@ -48,7 +52,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
         _render_index_result(result, parsed.format)
         return 0
     if parsed.command == "impact":
-        result = ChangeScopeApplication().execute(ImpactRequest(Path.cwd(), parsed.target))
+        result = ChangeScopeApplication().execute(
+            ImpactRequest(Path.cwd(), parsed.target, tuple(parsed.profiles))
+        )
         _render_impact_result(result, parsed.format)
         return 0 if result.outcome == "resolved" else 2
     if parsed.command == "evidence":
@@ -80,11 +86,17 @@ def _render_index_result(result: IndexResult, output_format: str) -> None:
     print(f"Indexed repository: {report['snapshot']['repository_root']}")
     print(f"Source roots: {', '.join(report['source_roots']) or 'none'}")
     print(f"Indexed Java files: {len(report['indexed_files'])}")
+    print(f"Indexed configuration files: {len(report['configuration_files'])}")
     print(f"Java declarations: {report['declaration_count']}")
     print(f"Explicit invocation evidence: {report['invocation_count']}")
+    print(f"Spring Configuration Evidence: {report['spring_configuration_evidence_count']}")
     print("Included Java files:")
     for path in report["indexed_files"]:
         print(f"- {path}")
+    if report["configuration_files"]:
+        print("Included configuration files:")
+        for path in report["configuration_files"]:
+            print(f"- {path}")
     print(f"Excluded directories: {', '.join(report['excluded_directories']) or 'none'}")
     print(f"Read failures: {', '.join(report['read_failures']) or 'none'}")
     print(f"Parse failures: {len(report['parse_failures'])}")
@@ -101,10 +113,12 @@ def _index_report(result: IndexResult) -> dict[str, object]:
     return {
         "source_roots": [_report_path(path) for path in result.source_roots],
         "indexed_files": [_report_path(path) for path in result.indexed_files],
+        "configuration_files": [_report_path(path) for path in result.configuration_files],
         "excluded_directories": [_report_path(path) for path in result.excluded_directories],
         "read_failures": [_report_path(path) for path in result.read_failures],
         "declaration_count": len(result.declarations),
         "invocation_count": len(result.invocations),
+        "spring_configuration_evidence_count": len(result.spring_facts),
         "parse_failures": [
             {
                 "path": _report_path(failure.path),
@@ -170,6 +184,7 @@ def _render_impact_result(result: ImpactResult, output_format: str) -> None:
             print(
                 f"- {relationship['kind']} {relationship['caller']} "
                 f"[{relationship['confidence']}] {relationship['evidence_handle']}"
+                + (f" (conditional profile: {relationship['profile'] or 'unspecified'})" if relationship["conditional"] else "")
             )
     print("Assumptions:")
     for assumption in report["assumptions"]:
@@ -202,6 +217,8 @@ def _impact_report(result: ImpactResult) -> dict[str, object]:
                 "end_line": relationship.end_line,
                 "evidence_handle": relationship.evidence_handle,
                 "confidence": relationship.confidence,
+                "conditional": relationship.conditional,
+                "profile": relationship.profile,
             }
             for relationship in result.relationships
         ],

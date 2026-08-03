@@ -24,6 +24,8 @@ EXCLUDED_DIRECTORY_NAMES = frozenset(
         ".mvn",
         ".settings",
         ".svn",
+        ".venv",
+        "__pycache__",
         "build",
         "dependencies",
         "deps",
@@ -74,6 +76,18 @@ class JavaInvocation:
 
 
 @dataclass(frozen=True)
+class SpringFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    profile: str | None = None
+
+
+@dataclass(frozen=True)
 class ParseFailure:
     path: Path
     start_line: int
@@ -91,6 +105,8 @@ class IndexResult:
     invocations: tuple[JavaInvocation, ...]
     parse_failures: tuple[ParseFailure, ...]
     snapshot: IndexSnapshot
+    spring_facts: tuple[SpringFact, ...] = ()
+    configuration_files: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -102,6 +118,7 @@ class IndexRequest:
 class ImpactRequest:
     repository_root: Path
     target: str
+    profiles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -153,6 +170,8 @@ class ImpactRelationship:
     end_line: int
     evidence_handle: str
     confidence: str
+    conditional: bool = False
+    profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -190,7 +209,7 @@ class ChangeScopeApplication:
 
 
 def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
-    match = re.fullmatch(r"(?:declaration|invocation):(.+):(\d+)-(\d+)", request.evidence_handle)
+    match = re.fullmatch(r"(?:declaration|invocation|spring):(.+):(\d+)-(\d+)", request.evidence_handle)
     if match is None:
         raise ValueError("Evidence handles must use kind:path:start-end form.")
     path = _validate_relative_path(Path(match.group(1)))
@@ -336,17 +355,26 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
     if len(candidates) > 1:
         return ImpactResult("ambiguous", request.target, None, candidates, (), (), (), snapshot)
     relationships, unresolved_items = _direct_relationships(
-        database_path, candidates[0]
+        database_path, candidates[0], request.profiles
     )
+    assumptions = [
+        "Structural analysis asserts only explicit invocation syntax tied to the resolved target.",
+    ]
+    if request.profiles:
+        assumptions.append(
+            "Active Spring profiles: " + ", ".join(request.profiles) + "."
+        )
+    else:
+        assumptions.append(
+            "No Spring profile was selected; profile-specific configuration remains conditional."
+        )
     return ImpactResult(
         "resolved",
         request.target,
         candidates[0],
         (),
         relationships,
-        (
-            "Structural analysis asserts only explicit invocation syntax tied to the resolved target.",
-        ),
+        tuple(assumptions),
         unresolved_items,
         snapshot,
     )
@@ -372,11 +400,19 @@ def _evidence_handle(kind: str, path: Path, start_line: int, end_line: int) -> s
     return f"{kind}:{path.as_posix()}:{start_line}-{end_line}"
 
 
+def _spring_evidence_handle(path: Path, start_line: int, end_line: int) -> str:
+    return _evidence_handle("spring", path, start_line, end_line)
+
+
 def _unresolved(
-    message: str, path: Path | None = None, start_line: int | None = None, end_line: int | None = None
+    message: str,
+    path: Path | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    evidence_kind: str = "invocation",
 ) -> UnresolvedItem:
     evidence_handle = (
-        _evidence_handle("invocation", path, start_line, end_line)
+        _evidence_handle(evidence_kind, path, start_line, end_line)
         if path is not None and start_line is not None and end_line is not None
         else None
     )
@@ -384,7 +420,7 @@ def _unresolved(
 
 
 def _direct_relationships(
-    database_path: Path, target: ImpactTarget
+    database_path: Path, target: ImpactTarget, profiles: tuple[str, ...] = ()
 ) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
     owner, method_name = target.signature.split("#", maxsplit=1)
     method_name = method_name.split("(", maxsplit=1)[0]
@@ -482,11 +518,222 @@ def _direct_relationships(
                 end_line,
             )
         )
+    spring_relationships, spring_unresolved = _spring_relationships(
+        connection_data_path=database_path,
+        owner=owner,
+        profiles=profiles,
+    )
+    relationships.extend(spring_relationships)
+    unresolved_items.extend(spring_unresolved)
     return tuple(relationships), tuple(unresolved_items)
 
 
 def _is_direct_construction(receiver: str, owner: str) -> bool:
     return bool(re.fullmatch(rf"new\s+{re.escape(owner)}\s*\([^)]*\)", receiver))
+
+
+def _spring_relationships(
+    connection_data_path: Path, owner: str, profiles: tuple[str, ...]
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, profile
+            FROM spring_facts ORDER BY path, start_line, kind, subject"""
+        ).fetchall()
+        test_owners = {
+            row[0]
+            for row in connection.execute(
+                "SELECT qualified_name FROM java_declarations WHERE is_test = 1 AND kind IN ('class', 'interface', 'enum', 'record')"
+            )
+        }
+        declared_owners = {
+            row[0]
+            for row in connection.execute(
+                "SELECT qualified_name FROM java_declarations WHERE kind IN ('class', 'interface', 'enum', 'record')"
+            )
+        }
+    except sqlite3.OperationalError:
+        return (), (_unresolved("Spring evidence is unavailable because the local index is missing Spring facts."),)
+    finally:
+        connection.close()
+
+    facts = tuple(SpringFact(kind, subject, target, value, Path(path), start, end, profile)
+                  for kind, subject, target, value, path, start, end, profile in rows)
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+
+    def active(fact: SpringFact) -> tuple[bool, bool]:
+        if fact.profile is None:
+            return True, False
+        if profiles:
+            return fact.profile in profiles, False
+        return True, True
+
+    def add_relationship(
+        kind: str, caller: str, fact: SpringFact, confidence: str = "medium",
+    ) -> None:
+        applies, conditional = active(fact)
+        if not applies:
+            return
+        relationships.append(
+            ImpactRelationship(
+                kind,
+                caller,
+                fact.path,
+                fact.start_line,
+                fact.end_line,
+                _spring_evidence_handle(fact.path, fact.start_line, fact.end_line),
+                confidence,
+                conditional,
+                fact.profile,
+            )
+        )
+
+    def matching_type(candidate: str | None, requested: str | None) -> bool:
+        if not candidate or not requested:
+            return False
+        if candidate == requested:
+            return True
+        candidate_name = candidate.rsplit(".", maxsplit=1)[-1]
+        requested_name = requested.rsplit(".", maxsplit=1)[-1]
+        if candidate_name != requested_name:
+            return False
+        return sum(
+            1 for owner_name in declared_owners
+            if owner_name.rsplit(".", maxsplit=1)[-1] == requested_name
+        ) <= 1
+
+    owner_facts = [
+        fact for fact in facts
+        if fact.subject == owner or matching_type(fact.target, owner)
+    ]
+    for fact in owner_facts:
+        if fact.kind == "spring_component" and fact.subject == owner:
+            add_relationship("spring_configuration_boundary", owner, fact)
+        elif fact.kind in {"spring_bean", "spring_xml_bean"} and matching_type(fact.target, owner):
+            add_relationship("spring_configuration_boundary", fact.subject, fact)
+
+    bean_facts = [
+        fact for fact in facts
+        if fact.kind in {"spring_component", "spring_bean", "spring_xml_bean"}
+    ]
+    xml_beans = [fact for fact in facts if fact.kind == "spring_xml_bean"]
+    for fact in facts:
+        if fact.kind != "spring_xml_ref":
+            continue
+        referenced_beans = [
+            bean for bean in xml_beans
+            if bean.subject == fact.target and matching_type(bean.target, owner)
+            and active(bean)[0]
+        ]
+        consumer_beans = [bean for bean in xml_beans if bean.subject == fact.subject and active(bean)[0]]
+        if len(referenced_beans) == 1 and len(consumer_beans) == 1:
+            add_relationship("bean_consumer", consumer_beans[0].target or fact.subject, fact, "high")
+        elif referenced_beans and not consumer_beans:
+            unresolved.append(
+                _unresolved(
+                    f"Spring XML reference {fact.target} has no proven consumer bean.",
+                    fact.path,
+                    fact.start_line,
+                    fact.end_line,
+                    "spring",
+                )
+            )
+    for fact in facts:
+        if fact.kind != "spring_injection" or not matching_type(fact.target, owner):
+            continue
+        applies, _ = active(fact)
+        if not applies:
+            continue
+        candidates = [
+            candidate for candidate in bean_facts
+            if matching_type(candidate.subject if candidate.kind == "spring_component" else candidate.target, owner)
+            and active(candidate)[0]
+        ]
+        if len(candidates) == 1:
+            kind = "spring_test" if fact.subject in test_owners else "bean_consumer"
+            add_relationship(kind, fact.subject, fact, "medium" if kind == "spring_test" else "high")
+        elif len(candidates) > 1:
+            unresolved.append(
+                _unresolved(
+                    f"Spring injection of {owner} in {fact.subject} has multiple local bean candidates.",
+                    fact.path,
+                    fact.start_line,
+                    fact.end_line,
+                    "spring",
+                )
+            )
+        else:
+            unresolved.append(
+                _unresolved(
+                    f"Spring injection of {owner} in {fact.subject} has no proven local bean candidate.",
+                    fact.path,
+                    fact.start_line,
+                    fact.end_line,
+                    "spring",
+                )
+            )
+
+    property_consumers: list[SpringFact] = []
+    for fact in facts:
+        if fact.kind != "spring_property_consumer":
+            continue
+        if fact.subject == owner:
+            property_consumers.append(fact)
+            continue
+        if any(
+            bean.subject == fact.subject and matching_type(bean.target, owner)
+            for bean in xml_beans
+        ):
+            property_consumers.append(fact)
+    property_sources = [fact for fact in facts if fact.kind == "spring_property_source"]
+    for consumer in property_consumers:
+        applies, _ = active(consumer)
+        if not applies:
+            continue
+        if consumer.target:
+            add_relationship("property_consumer", consumer.target, consumer, "high")
+        matches = [
+            source for source in property_sources
+            if source.subject == consumer.target
+            or (consumer.target.endswith(".") and source.subject.startswith(consumer.target))
+            or (consumer.target and source.subject.startswith(consumer.target + "."))
+        ]
+        for source in matches:
+            add_relationship("property_source", source.subject, source, "medium" if active(source)[1] else "high")
+
+    for fact in facts:
+        if fact.kind == "spring_test" and matching_type(fact.target, owner):
+            add_relationship("spring_test", fact.subject, fact, "medium")
+        elif fact.kind == "spring_unresolved" and (not fact.subject or fact.subject == owner):
+            applies, _ = active(fact)
+            if applies:
+                unresolved.append(
+                    _unresolved(
+                        fact.value or "Spring behavior remains unresolved.",
+                        fact.path,
+                        fact.start_line,
+                        fact.end_line,
+                        "spring",
+                    )
+                )
+
+    unique_relationships: list[ImpactRelationship] = []
+    seen_relationships: set[tuple[object, ...]] = set()
+    for relationship in relationships:
+        key = (
+            relationship.kind,
+            relationship.caller,
+            relationship.path,
+            relationship.start_line,
+            relationship.end_line,
+            relationship.conditional,
+        )
+        if key not in seen_relationships:
+            seen_relationships.add(key)
+            unique_relationships.append(relationship)
+    return tuple(unique_relationships), tuple(unresolved)
 
 
 def _read_index_snapshot(
@@ -514,19 +761,27 @@ def _index_repository(repository_root: Path) -> IndexResult:
     source_roots = _discover_source_roots(root)
     excluded_directories = _excluded_directories(root)
     indexed_files, read_failures, contents_by_path = _java_files(root, source_roots)
+    configuration_files, configuration_read_failures, configuration_contents = _configuration_files(
+        root, source_roots
+    )
     declarations, invocations, parse_failures = _analyze_java_files(
         contents_by_path, _test_source_roots(root, source_roots)
+    )
+    spring_facts = _analyze_spring_files(
+        {**contents_by_path, **configuration_contents}, declarations
     )
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
         indexed_files=indexed_files,
         excluded_directories=excluded_directories,
-        read_failures=read_failures,
+        read_failures=tuple(sorted(set(read_failures) | set(configuration_read_failures), key=str)),
         declarations=declarations,
         invocations=invocations,
         parse_failures=parse_failures,
         snapshot=snapshot,
+        spring_facts=spring_facts,
+        configuration_files=configuration_files,
     )
     _write_index(result)
     return result
@@ -537,11 +792,21 @@ def _refresh_index_if_needed(root: Path) -> None:
     database_path = root / ".changescope" / "index.sqlite"
     source_roots = _discover_source_roots(root)
     indexed_files, read_failures, contents_by_path = _java_files(root, source_roots)
+    configuration_files, configuration_read_failures, configuration_contents = _configuration_files(
+        root, source_roots
+    )
     current_files = {
         str(path): ("indexed", _content_hash(contents_by_path[path]))
         for path in indexed_files
     }
-    current_files.update({str(path): ("unreadable", "") for path in read_failures})
+    current_files.update({
+        str(path): ("indexed", _content_hash(configuration_contents[path]))
+        for path in configuration_files
+    })
+    current_files.update({
+        str(path): ("unreadable", "")
+        for path in (*read_failures, *configuration_read_failures)
+    })
     connection = sqlite3.connect(database_path)
     try:
         with connection:
@@ -572,8 +837,21 @@ def _refresh_index_if_needed(root: Path) -> None:
                 declarations, invocations, parse_failures = _analyze_java_files(
                     changed_contents, current_test_roots
                 )
+                changed_configuration_contents = {
+                    path: source for path, source in configuration_contents.items()
+                    if str(path) in changed_paths
+                }
+                spring_facts = _analyze_spring_files(
+                    {**changed_contents, **changed_configuration_contents}, declarations
+                )
                 _replace_changed_source_records(
-                    connection, changed_paths, current_files, declarations, invocations, parse_failures
+                    connection,
+                    changed_paths,
+                    current_files,
+                    declarations,
+                    invocations,
+                    parse_failures,
+                    spring_facts,
                 )
             _write_metadata(connection, _snapshot(root), source_roots)
     finally:
@@ -812,6 +1090,452 @@ def _test_source_roots(root: Path, source_roots: tuple[Path, ...]) -> tuple[Path
     )
 
 
+def _configuration_files(
+    root: Path, source_roots: tuple[Path, ...]
+) -> tuple[tuple[Path, ...], tuple[Path, ...], dict[Path, bytes]]:
+    """Discover bounded local configuration files used by Spring applications."""
+    resource_roots = [
+        Path("src/main/resources"),
+        Path("src/test/resources"),
+        Path("resources"),
+        Path("config"),
+        *source_roots,
+    ]
+    indexed: dict[Path, bytes] = {}
+    read_failures: set[Path] = set()
+    visited_roots: set[Path] = set()
+    for relative_root in resource_roots:
+        candidate_root = root / relative_root
+        if not candidate_root.is_dir():
+            continue
+        resolved_root = candidate_root.resolve()
+        if resolved_root in visited_roots:
+            continue
+        visited_roots.add(resolved_root)
+        for directory, directories, filenames in os.walk(candidate_root):
+            directories[:] = [
+                name for name in directories if name not in EXCLUDED_DIRECTORY_NAMES
+            ]
+            for filename in filenames:
+                path = Path(directory) / filename
+                if path.suffix.lower() not in {".properties", ".yml", ".yaml", ".xml"}:
+                    continue
+                relative_path = path.relative_to(root)
+                try:
+                    indexed[relative_path] = path.read_bytes()
+                except OSError:
+                    read_failures.add(relative_path)
+
+    for path in root.iterdir():
+        if not path.is_file() or path.suffix.lower() not in {".properties", ".yml", ".yaml", ".xml"}:
+            continue
+        name = path.name.lower()
+        if not (
+            name.startswith("application")
+            or "spring" in name
+            or "context" in name
+            or "beans" in name
+        ):
+            continue
+        relative_path = path.relative_to(root)
+        try:
+            indexed[relative_path] = path.read_bytes()
+        except OSError:
+            read_failures.add(relative_path)
+    return (
+        tuple(sorted(indexed, key=str)),
+        tuple(sorted(read_failures, key=str)),
+        indexed,
+    )
+
+
+def _analyze_spring_files(
+    contents_by_path: dict[Path, bytes],
+    declarations: tuple[JavaDeclaration, ...] = (),
+) -> tuple[SpringFact, ...]:
+    facts: list[SpringFact] = []
+    java_by_path: dict[Path, tuple[JavaDeclaration, ...]] = {}
+    for declaration in declarations:
+        java_by_path.setdefault(declaration.path, ())
+        java_by_path[declaration.path] = (*java_by_path[declaration.path], declaration)
+    for path, source in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        if path.suffix.lower() == ".java":
+            facts.extend(_spring_java_facts(path, source, java_by_path.get(path, ())))
+        else:
+            facts.extend(_spring_configuration_facts(path, source))
+    return tuple(sorted(facts, key=lambda fact: (str(fact.path), fact.start_line, fact.kind, fact.subject)))
+
+
+def _spring_java_facts(
+    path: Path, source: bytes, declarations: tuple[JavaDeclaration, ...]
+) -> tuple[SpringFact, ...]:
+    text = source.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    facts: list[SpringFact] = []
+    ast_annotations = _spring_ast_annotations(source)
+    type_declarations = [
+        declaration for declaration in declarations
+        if declaration.kind in {"class", "interface", "enum", "record"}
+    ]
+    def add(
+        kind: str,
+        subject: str,
+        target: str | None,
+        value: str | None,
+        start_line: int,
+        end_line: int | None = None,
+        profile: str | None = None,
+    ) -> None:
+        facts.append(SpringFact(kind, subject, target, value, path, start_line, end_line or start_line, profile))
+
+    for declaration in type_declarations:
+        type_line_index = _spring_type_line_index(lines, declaration)
+        annotation_start, context = _spring_annotation_context(lines, type_line_index)
+        annotation_lines = lines[annotation_start:type_line_index]
+        class_annotations = ast_annotations.get(
+            ("class_declaration", declaration.start_line, declaration.end_line), ()
+        )
+        if class_annotations:
+            annotation_start = class_annotations[0][1] - 1
+            annotation_lines = [annotation for annotation, _, _ in class_annotations]
+            context = "\n".join(annotation_lines)
+        component_match = re.search(
+            r"@(Component|Service|Repository|Controller|RestController|Configuration)\b",
+            context,
+        )
+        profile = _spring_annotation_profile(context)
+        if component_match:
+            add("spring_component", declaration.qualified_name, declaration.qualified_name, component_match.group(1),
+                annotation_start + context[:component_match.start()].count("\n") + 1, profile=profile)
+        configuration_properties = re.search(
+            r"@ConfigurationProperties\s*\(\s*(?:(?:prefix|value)\s*=\s*)?['\"]([^'\"]+)['\"]",
+            context,
+        )
+        if configuration_properties:
+            line = annotation_start + context[:configuration_properties.start()].count("\n") + 1
+            add("spring_property_consumer", declaration.qualified_name, configuration_properties.group(1), "prefix", line, profile=profile)
+        if re.search(r"@ComponentScan\b|@Import\b|@Conditional\b", context):
+            line = annotation_start + next(
+                index for index, value in enumerate(annotation_lines)
+                if re.search(r"@ComponentScan\b|@Import\b|@Conditional\b", value)
+            ) + 1
+            add("spring_unresolved", "", None,
+                "Spring component scanning, imports, or conditional configuration was not resolved.", line, profile=profile)
+        if profile and any(operator in profile for operator in ("!", "&", "|")):
+            line = annotation_start + context[:context.find("@Profile")].count("\n") + 1
+            add("spring_unresolved", declaration.qualified_name, None,
+                "Spring profile expression was not resolved.", line)
+
+        class_lines = lines[declaration.start_line - 1:declaration.end_line]
+        for offset, line in enumerate(class_lines, declaration.start_line):
+            value_match = re.search(r"@Value\s*\(\s*['\"]\$\{([^}\s]+)", line)
+            if value_match:
+                property_key = value_match.group(1).split(":", maxsplit=1)[0]
+                add("spring_property_consumer", declaration.qualified_name, property_key, "value", offset, profile=profile)
+            if "@Value" in line and "#{" in line:
+                add("spring_unresolved", declaration.qualified_name, None,
+                    "Spring SpEL property expression was not resolved.", offset, profile=profile)
+            if "System.getenv(" in line:
+                add("spring_unresolved", "", None,
+                    "Environment-variable configuration override was not resolved.", offset)
+
+        methods = [
+            method for method in declarations
+            if method.kind == "method" and method.path == path and method.start_line >= declaration.start_line and method.end_line <= declaration.end_line
+        ]
+        for method in methods:
+            method_type_line_index = method.start_line - 1
+            for candidate_line in range(method_type_line_index, min(len(lines), method_type_line_index + 8)):
+                if re.search(rf"\b{re.escape(method.name)}\s*\(", lines[candidate_line]):
+                    method_type_line_index = candidate_line
+                    break
+            method_annotations = ast_annotations.get(
+                ("method_declaration", method.start_line, method.end_line), ()
+            )
+            context_start = max(declaration.start_line - 1, method_type_line_index - 6)
+            method_context = "\n".join(lines[context_start:method_type_line_index])
+            if method_annotations:
+                method_context = "\n".join(annotation for annotation, _, _ in method_annotations)
+            if any(_simple_annotation_name(annotation) == "Bean" for annotation, _, _ in method_annotations) or (not method_annotations and "@Bean" in method_context):
+                method_line = lines[method_type_line_index] if method_type_line_index < len(lines) else ""
+                return_match = re.search(
+                    rf"(?:public|protected|private)?\s*(?:static\s+)?([A-Za-z_$][\w$]*(?:\s*<[^>]+>)?(?:\[\])?)\s+{re.escape(method.name)}\s*\(",
+                    method_line,
+                )
+                target = return_match.group(1).replace(" ", "") if return_match else None
+                if target:
+                    annotation_line = method_annotations[0][1] if method_annotations else context_start + method_context.count("\n") + 1
+                    add("spring_bean", method.qualified_name, target, "@Bean", annotation_line,
+                        profile=_spring_annotation_profile(method_context))
+
+    for declaration in type_declarations:
+        class_text = "\n".join(lines[declaration.start_line - 1:declaration.end_line])
+        managed = declaration.is_test or any(
+            fact.kind == "spring_component" and fact.subject == declaration.qualified_name
+            for fact in facts
+        )
+        owner_profile = _spring_annotation_profile(
+            "\n".join(annotation for annotation, _, _ in ast_annotations.get(
+                ("class_declaration", declaration.start_line, declaration.end_line), ()
+            ))
+            or _spring_annotation_context(lines, _spring_type_line_index(lines, declaration))[1]
+        )
+        if managed:
+            for match in re.finditer(
+                r"@(?:Autowired|Inject|Resource)(?:\([^)]*\))?\s*(?:\r?\n\s*)*(?:private|protected|public)?\s*(?:final\s+)?([A-Za-z_$][\w$.]*(?:<[^>]+>)?(?:\[\])?)\s+[A-Za-z_$][\w$]*\s*(?:=|;)",
+                class_text,
+            ):
+                line = declaration.start_line + class_text[:match.start()].count("\n")
+                add("spring_injection", declaration.qualified_name, _simple_java_type(match.group(1)), "field", line, profile=owner_profile)
+        constructor_declarations = [
+            constructor for constructor in declarations
+            if constructor.kind == "constructor" and constructor.path == path
+            and constructor.qualified_name.startswith(declaration.qualified_name + "#")
+        ]
+        if managed and len(constructor_declarations) == 1:
+            constructor = constructor_declarations[0]
+            constructor_text = "\n".join(
+                lines[constructor.start_line - 1:min(len(lines), constructor.start_line + 8)]
+            )
+            parameter_match = re.search(
+                rf"\b{re.escape(declaration.name)}\s*\(([^)]*)\)", constructor_text
+            )
+            if parameter_match:
+                parameter_types = _spring_parameter_types(parameter_match.group(1))
+                for parameter_type in parameter_types:
+                    add("spring_injection", declaration.qualified_name, parameter_type, "constructor", constructor.start_line, profile=owner_profile)
+
+        if declaration.is_test:
+            class_annotations = ast_annotations.get(
+                ("class_declaration", declaration.start_line, declaration.end_line), ()
+            )
+            for annotation, line, _ in class_annotations:
+                if _simple_annotation_name(annotation) not in {"SpringBootTest", "ContextConfiguration", "WebMvcTest", "DataJpaTest"}:
+                    continue
+                classes = re.findall(r"([A-Za-z_$][\w$]*)\.class", annotation)
+                for target in classes:
+                    add("spring_test", declaration.qualified_name, target, "test context", line, profile=owner_profile)
+
+    return tuple(facts)
+
+
+def _spring_configuration_facts(path: Path, source: bytes) -> tuple[SpringFact, ...]:
+    text = source.decode("utf-8", errors="replace")
+    suffix = path.suffix.lower()
+    if suffix == ".properties":
+        return _spring_properties_facts(path, text.splitlines())
+    if suffix in {".yml", ".yaml"}:
+        return _spring_yaml_facts(path, text.splitlines())
+    return _spring_xml_facts(path, text.splitlines())
+
+
+def _spring_properties_facts(path: Path, lines: list[str]) -> tuple[SpringFact, ...]:
+    profile = _spring_file_profile(path)
+    facts: list[SpringFact] = []
+    for line_number, line in enumerate(lines, 1):
+        match = re.match(r"\s*([^#!\s][^:=\s]*)\s*[:=]\s*(.*?)\s*$", line)
+        if match:
+            facts.append(SpringFact("spring_property_source", match.group(1), None, match.group(2), path, line_number, line_number, profile))
+            if re.search(r"\$\{[A-Z][A-Z0-9_]*(?::[^}]*)?\}", match.group(2)):
+                facts.append(SpringFact("spring_unresolved", "", None, "Environment-variable configuration override was not resolved.", path, line_number, line_number, profile))
+    return tuple(facts)
+
+
+def _spring_yaml_facts(path: Path, lines: list[str]) -> tuple[SpringFact, ...]:
+    profile = _spring_file_profile(path)
+    document_profile = profile
+    facts: list[SpringFact] = []
+    parents: list[tuple[int, str]] = []
+    for line_number, line in enumerate(lines, 1):
+        if line.strip() == "---":
+            parents.clear()
+            document_profile = None
+            continue
+        if not line.strip() or line.lstrip().startswith("#") or line.lstrip().startswith("-"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        match = re.match(r"\s*([^:#]+):(?:\s*(.*?))?\s*$", line)
+        if not match:
+            continue
+        key, value = match.group(1).strip(), (match.group(2) or "").strip()
+        while parents and parents[-1][0] >= indent:
+            parents.pop()
+        full_key = ".".join([parent[1] for parent in parents] + [key])
+        if value:
+            value = value.strip("'\"")
+            if full_key == "spring.config.activate.on-profile":
+                document_profile = value
+                continue
+            facts.append(SpringFact("spring_property_source", full_key, None, value, path, line_number, line_number, document_profile))
+            if re.search(r"\$\{[A-Z][A-Z0-9_]*(?::[^}]*)?\}", value):
+                facts.append(SpringFact("spring_unresolved", "", None, "Environment-variable configuration override was not resolved.", path, line_number, line_number, document_profile))
+        else:
+            parents.append((indent, key))
+    return tuple(facts)
+
+
+def _spring_xml_facts(path: Path, lines: list[str]) -> tuple[SpringFact, ...]:
+    text = "\n".join(lines)
+    facts: list[SpringFact] = []
+    def line_number(position: int) -> int:
+        return text.count("\n", 0, position) + 1
+
+    bean_ranges: list[tuple[int, int, str]] = []
+    for match in re.finditer(r"<bean\b(?P<attributes>[^>]*?)(?P<close>/?>)", text, re.DOTALL):
+        attributes = match.group("attributes")
+        class_match = re.search(r"\bclass\s*=\s*['\"]([^'\"]+)['\"]", attributes)
+        id_match = re.search(r"\b(?:id|name)\s*=\s*['\"]([^'\"]+)['\"]", attributes)
+        if class_match is None:
+            continue
+        subject = id_match.group(1) if id_match else class_match.group(1)
+        end = match.end()
+        if match.group("close") != "/>":
+            closing = re.search(r"</bean\s*>", text[match.end():], re.DOTALL)
+            end = match.end() + closing.end() if closing else len(text)
+        bean_ranges.append((match.start(), end, subject))
+        profile = _spring_xml_profile_at(text, match.start())
+        start_line = line_number(match.start())
+        facts.append(SpringFact("spring_xml_bean", subject, class_match.group(1), "xml bean", path, start_line, start_line, profile))
+
+    for match in re.finditer(r"<property\b(?P<attributes>[^>]*?)(?:/?>)", text, re.DOTALL):
+        container = next(
+            (bean for bean_start, bean_end, bean in bean_ranges if bean_start < match.start() < bean_end),
+            None,
+        )
+        if container is None:
+            continue
+        attributes = match.group("attributes")
+        start_line = line_number(match.start())
+        profile = _spring_xml_profile_at(text, match.start())
+        ref_match = re.search(r"\bref\s*=\s*['\"]([^'\"]+)['\"]", attributes)
+        value_match = re.search(r"\bvalue\s*=\s*['\"]\$\{([^}]+)\}", attributes)
+        if ref_match:
+            facts.append(SpringFact("spring_xml_ref", container, ref_match.group(1), "xml ref", path, start_line, start_line, profile))
+        if value_match:
+            facts.append(SpringFact("spring_property_consumer", container, value_match.group(1), "xml value", path, start_line, start_line, profile))
+
+    for match in re.finditer(
+        r"<[^>]*property-placeholder\b[^>]*\blocation\s*=\s*['\"]([^'\"]+)['\"]",
+        text,
+        re.DOTALL,
+    ):
+        start_line = line_number(match.start())
+        facts.append(SpringFact("spring_property_placeholder", "", match.group(1), "xml placeholder", path, start_line, start_line, _spring_xml_profile_at(text, match.start())))
+    for match in re.finditer(r"<[^>]*(?:component-scan|import)\b", text, re.DOTALL):
+        start_line = line_number(match.start())
+        facts.append(SpringFact("spring_unresolved", "", None, "Spring XML scan or import indirection was not resolved.", path, start_line, start_line, _spring_xml_profile_at(text, match.start())))
+    try:
+        ElementTree.fromstring(text)
+    except ElementTree.ParseError:
+        facts.append(SpringFact("spring_unresolved", "", None, "Malformed Spring XML was not fully indexed.", path, 1, 1))
+    return tuple(facts)
+
+
+def _spring_xml_profile_at(text: str, position: int) -> str | None:
+    profiles: list[str] = []
+    for match in re.finditer(r"<beans\b[^>]*\bprofile\s*=\s*['\"]([^'\"]+)['\"]", text[:position], re.DOTALL):
+        profiles.append(match.group(1).strip())
+    profile = profiles[-1] if profiles else None
+    return profile
+
+
+def _spring_annotation_profile(context: str) -> str | None:
+    match = re.search(r"@Profile\s*\(\s*[\"']([^\"']+)[\"']", context)
+    return match.group(1).strip() if match else None
+
+
+def _spring_type_line_index(lines: list[str], declaration: JavaDeclaration) -> int:
+    type_line_index = declaration.start_line - 1
+    for candidate_line in range(type_line_index, min(len(lines), type_line_index + 8)):
+        if re.search(
+            rf"\b(?:class|interface|enum|record)\s+{re.escape(declaration.name)}\b",
+            lines[candidate_line],
+        ):
+            return candidate_line
+    return type_line_index
+
+
+def _spring_annotation_context(lines: list[str], type_line_index: int) -> tuple[int, str]:
+    index = type_line_index - 1
+    saw_annotation = False
+    while index >= 0:
+        stripped = lines[index].strip()
+        if not stripped:
+            if saw_annotation:
+                index -= 1
+                continue
+            break
+        if stripped.startswith("@"):
+            saw_annotation = True
+            index -= 1
+            continue
+        if saw_annotation and (
+            stripped.endswith(")")
+            or stripped.startswith(("{", "}", "value", "prefix"))
+        ):
+            index -= 1
+            continue
+        break
+    start = index + 1
+    return start, "\n".join(lines[start:type_line_index])
+
+
+def _spring_ast_annotations(
+    source: bytes,
+) -> dict[tuple[str, int, int], tuple[tuple[str, int, int], ...]]:
+    parser = Parser(Language(tree_sitter_java.language()))
+    tree = parser.parse(source)
+    regions: dict[tuple[str, int, int], tuple[tuple[str, int, int], ...]] = {}
+    region_types = {"class_declaration", "method_declaration", "constructor_declaration", "field_declaration"}
+
+    def visit(node) -> None:
+        if node.type in region_types:
+            annotations: list[tuple[str, int, int]] = []
+            for child in node.named_children:
+                annotation_nodes = (
+                    child.named_children
+                    if child.type == "modifiers"
+                    else (child,) if child.type in {"marker_annotation", "annotation"} else ()
+                )
+                for annotation_node in annotation_nodes:
+                    if annotation_node.type not in {"marker_annotation", "annotation"}:
+                        continue
+                    annotation = _node_text(annotation_node, source)
+                    annotations.append(
+                        (annotation, annotation_node.start_point.row + 1, annotation_node.end_point.row + 1)
+                    )
+            if annotations:
+                regions[(node.type, node.start_point.row + 1, node.end_point.row + 1)] = tuple(annotations)
+        for child in node.named_children:
+            visit(child)
+
+    visit(tree.root_node)
+    return regions
+
+
+def _simple_annotation_name(annotation: str) -> str:
+    match = re.match(r"@([A-Za-z_$][\w$.]*)", annotation.strip())
+    return match.group(1).rsplit(".", maxsplit=1)[-1] if match else ""
+
+
+def _spring_file_profile(path: Path) -> str | None:
+    match = re.match(r"application-([^./]+)\.(?:properties|ya?ml)$", path.name, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _simple_java_type(value: str) -> str:
+    return re.sub(r"\s+", "", value).split("<", maxsplit=1)[0].replace("[]", "")
+
+
+def _spring_parameter_types(value: str) -> tuple[str, ...]:
+    types: list[str] = []
+    for parameter in value.split(","):
+        tokens = parameter.strip().split()
+        if len(tokens) >= 2:
+            types.append(_simple_java_type(" ".join(tokens[:-1])))
+    return tuple(types)
+
+
 def _package_name(root_node, source: bytes) -> str:
     for child in root_node.children:
         if child.type != "package_declaration":
@@ -1036,12 +1760,14 @@ def _replace_index_contents(
     connection.execute("DELETE FROM java_declarations")
     connection.execute("DELETE FROM java_invocations")
     connection.execute("DELETE FROM parse_failures")
+    connection.execute("DELETE FROM spring_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
+    indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         (
             (str(path), "indexed", _file_content_hash(result.snapshot.repository_root / path))
-            for path in result.indexed_files
+            for path in indexed_paths
         ),
     )
     connection.executemany(
@@ -1049,9 +1775,13 @@ def _replace_index_contents(
         ((str(path), "unreadable", "") for path in result.read_failures),
     )
     _insert_java_facts(connection, result.declarations, result.invocations, result.parse_failures)
+    _insert_spring_facts(connection, result.spring_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
+    spring_schema_missing = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spring_facts'"
+    ).fetchone() is None
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
@@ -1090,6 +1820,18 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         message TEXT NOT NULL
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS spring_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        profile TEXT
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -1107,7 +1849,7 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         connection.execute(
             "ALTER TABLE source_files ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
         )
-    return declaration_schema_changed
+    return declaration_schema_changed or spring_schema_missing
 
 
 def _write_metadata(
@@ -1137,17 +1879,20 @@ def _replace_changed_source_records(
     declarations: tuple[JavaDeclaration, ...],
     invocations: tuple[JavaInvocation, ...],
     parse_failures: tuple[ParseFailure, ...],
+    spring_facts: tuple[SpringFact, ...],
 ) -> None:
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_invocations WHERE path = ?", (path,))
         connection.execute("DELETE FROM parse_failures WHERE path = ?", (path,))
+        connection.execute("DELETE FROM spring_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
     )
     _insert_java_facts(connection, declarations, invocations, parse_failures)
+    _insert_spring_facts(connection, spring_facts)
 
 
 def _insert_java_facts(
@@ -1197,6 +1942,29 @@ def _insert_java_facts(
         (
             (str(failure.path), failure.start_line, failure.start_column, failure.message)
             for failure in parse_failures
+        ),
+    )
+
+
+def _insert_spring_facts(
+    connection: sqlite3.Connection, facts: Iterable[SpringFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO spring_facts(
+        kind, subject, target, value, path, start_line, end_line, profile
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.profile,
+            )
+            for fact in facts
         ),
     )
 
