@@ -365,6 +365,11 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
             for qualified_name, signature, path, start_line, end_line in rows
             if _matches_class_name(qualified_name, class_name)
         )
+        inherited_candidates = _inherited_impact_targets(connection, class_name, method_name)
+        candidates_by_signature = {candidate.signature: candidate for candidate in candidates}
+        for candidate in inherited_candidates:
+            candidates_by_signature.setdefault(candidate.signature, candidate)
+        candidates = tuple(candidates_by_signature.values())
         snapshot = _read_index_snapshot(connection, root)
     finally:
         connection.close()
@@ -401,6 +406,82 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
 def _matches_class_name(qualified_name: str, class_name: str) -> bool:
     owner = qualified_name.rsplit("#", maxsplit=1)[0]
     return owner == class_name or owner.rsplit(".", maxsplit=1)[-1] == class_name
+
+
+def _inherited_impact_targets(
+    connection: sqlite3.Connection, class_name: str, method_name: str
+) -> tuple[ImpactTarget, ...]:
+    fact_rows = connection.execute(
+        "SELECT kind, subject, target FROM ejb_facts"
+    ).fetchall()
+    session_subjects = {
+        subject
+        for kind, subject, target in fact_rows
+        if kind == "session_bean"
+    }
+    relevant_types = {
+        subject
+        for kind, subject, target in fact_rows
+        if kind == "interface_view"
+    }
+    relevant_types.update(
+        target
+        for kind, subject, target in fact_rows
+        if kind == "type_implements" and subject in session_subjects and target
+    )
+    inheritance_rows = [
+        (subject, target)
+        for kind, subject, target in fact_rows
+        if kind == "type_extends" and target is not None
+    ]
+    while True:
+        inherited_types = {
+            target for subject, target in inheritance_rows if subject in relevant_types
+        }
+        new_types = inherited_types - relevant_types
+        if not new_types:
+            break
+        relevant_types.update(new_types)
+    parents_by_child: dict[str, list[str]] = {}
+    for subject, target in inheritance_rows:
+        if subject in relevant_types and target in relevant_types:
+            parents_by_child.setdefault(subject, []).append(target)
+    roots = [subject for subject in parents_by_child if _matches_class_name(subject, class_name)]
+    if not roots:
+        return ()
+    method_rows = connection.execute(
+        """SELECT qualified_name, signature, path, start_line, end_line
+        FROM java_declarations WHERE kind = 'method' AND name = ?""",
+        (method_name,),
+    ).fetchall()
+    queue: list[tuple[str, str, frozenset[str]]] = [
+        (root, root, frozenset({root})) for root in roots
+    ]
+    aliases: list[ImpactTarget] = []
+    seen: set[tuple[str, str]] = set()
+    while queue:
+        root, current, visited = queue.pop(0)
+        for parent in parents_by_child.get(current, ()):
+            if parent in visited:
+                continue
+            queue.append((root, parent, visited | {parent}))
+            for qualified_name, signature, path, start_line, end_line in method_rows:
+                if not qualified_name.startswith(parent + "#"):
+                    continue
+                method_part = signature.split("#", maxsplit=1)[1]
+                key = (root, method_part)
+                if key in seen:
+                    continue
+                seen.add(key)
+                aliases.append(
+                    _impact_target(
+                        f"{root}#{method_part}",
+                        path,
+                        start_line,
+                        end_line,
+                    )
+                )
+    return tuple(aliases)
 
 
 def _impact_target(signature: str, path: str, start_line: int, end_line: int) -> ImpactTarget:
@@ -597,33 +678,83 @@ def _ejb_relationships(
     implements = [
         fact for fact in parsed_facts if fact.kind == "type_implements" and fact.target
     ]
+    extends = [
+        fact for fact in parsed_facts if fact.kind == "type_extends" and fact.target
+    ]
     bean_views = [fact for fact in parsed_facts if fact.kind == "bean_view"]
     mappings: list[tuple[str, str, str, tuple[EJBFact, ...]]] = []
     for implementation in implements:
         if implementation.subject not in sessions:
             continue
-        view_fact = views.get(implementation.target or "")
-        if view_fact is not None:
+        direct_view = views.get(implementation.target or "")
+        implementation_facts = (implementation, sessions[implementation.subject])
+        if direct_view is not None:
             mappings.append(
                 (
                     implementation.target,
                     implementation.subject,
-                    view_fact.value or "local",
-                    (view_fact, implementation, sessions[implementation.subject]),
+                    direct_view.value or "local",
+                    (direct_view, *implementation_facts),
                 )
             )
-        for bean_view in bean_views:
-            if bean_view.subject != implementation.subject:
-                continue
-            if bean_view.target is None or bean_view.target == implementation.target:
+            for ancestor, inheritance_facts in _ejb_interface_ancestors(
+                implementation.target, extends
+            ):
+                mappings.append(
+                    (
+                        ancestor,
+                        implementation.subject,
+                        direct_view.value or "local",
+                        (direct_view, *inheritance_facts, *implementation_facts),
+                    )
+                )
+        else:
+            for ancestor, inheritance_facts in _ejb_interface_ancestors(
+                implementation.target, extends
+            ):
+                ancestor_view = views.get(ancestor)
+                if ancestor_view is None:
+                    continue
+                mappings.append(
+                    (
+                        ancestor,
+                        implementation.subject,
+                        ancestor_view.value or "local",
+                        (ancestor_view, *inheritance_facts, *implementation_facts),
+                    )
+                )
                 mappings.append(
                     (
                         implementation.target,
                         implementation.subject,
-                        bean_view.value or "local",
-                        (bean_view, implementation, sessions[implementation.subject]),
+                        ancestor_view.value or "local",
+                        (ancestor_view, *inheritance_facts, *implementation_facts),
                     )
                 )
+        for bean_view in bean_views:
+            if bean_view.subject != implementation.subject:
+                continue
+            if bean_view.target is None or bean_view.target == implementation.target:
+                view = bean_view.value or "local"
+                mappings.append(
+                    (
+                        implementation.target,
+                        implementation.subject,
+                        view,
+                        (bean_view, *implementation_facts),
+                    )
+                )
+                for ancestor, inheritance_facts in _ejb_interface_ancestors(
+                    implementation.target, extends
+                ):
+                    mappings.append(
+                        (
+                            ancestor,
+                            implementation.subject,
+                            view,
+                            (bean_view, *inheritance_facts, *implementation_facts),
+                        )
+                    )
     unique_mappings = _unique_ejb_mappings(mappings)
     declaration_rows = [
         (qualified_name, signature, Path(path), start_line, end_line)
@@ -637,7 +768,12 @@ def _ejb_relationships(
             continue
         counterpart = bean_name if owner == interface_name else interface_name
         counterpart_declaration = _matching_ejb_method(
-            declaration_rows, counterpart, method_name, parameters
+            declaration_rows,
+            counterpart,
+            method_name,
+            parameters,
+            connection_data_path.parent.parent,
+            target.path,
         )
         if counterpart_declaration is None:
             unresolved.append(
@@ -646,8 +782,47 @@ def _ejb_relationships(
                 )
             )
             continue
-        evidence_chain = tuple(_ejb_evidence_handle(fact.path, fact.start_line, fact.end_line) for fact in mapping_facts)
-        primary_fact = mapping_facts[0]
+        effective_mapping_facts = mapping_facts
+        target_declared = _matching_ejb_method(
+            declaration_rows,
+            owner,
+            method_name,
+            parameters,
+            connection_data_path.parent.parent,
+            target.path,
+        )
+        if owner == interface_name and target_declared is None:
+            for ancestor, inheritance_facts in _ejb_interface_ancestors(owner, extends):
+                if _matching_ejb_method(
+                    declaration_rows,
+                    ancestor,
+                    method_name,
+                    parameters,
+                    connection_data_path.parent.parent,
+                    target.path,
+                ) is None:
+                    continue
+                existing_edges = tuple(
+                    fact for fact in mapping_facts if fact.kind == "type_extends"
+                )
+                combined_edges = list(existing_edges)
+                for edge in inheritance_facts:
+                    if edge not in combined_edges:
+                        combined_edges.append(edge)
+                non_inheritance_facts = tuple(
+                    fact for fact in mapping_facts if fact.kind != "type_extends"
+                )
+                effective_mapping_facts = (
+                    non_inheritance_facts[0],
+                    *combined_edges,
+                    *non_inheritance_facts[1:],
+                )
+                break
+        evidence_chain = tuple(
+            _ejb_evidence_handle(fact.path, fact.start_line, fact.end_line)
+            for fact in effective_mapping_facts
+        )
+        primary_fact = effective_mapping_facts[0]
         relationships.append(
             ImpactRelationship(
                 "ejb_business_implementation",
@@ -684,11 +859,36 @@ def _unique_ejb_mappings(
     return tuple(unique)
 
 
+def _ejb_interface_ancestors(
+    interface_name: str, extends: Iterable[EJBFact]
+) -> tuple[tuple[str, tuple[EJBFact, ...]], ...]:
+    parents_by_child: dict[str, list[EJBFact]] = {}
+    for relationship in extends:
+        if relationship.target:
+            parents_by_child.setdefault(relationship.subject, []).append(relationship)
+    ancestors: list[tuple[str, tuple[EJBFact, ...]]] = []
+    queue: list[tuple[str, tuple[EJBFact, ...], frozenset[str]]] = [
+        (interface_name, (), frozenset({interface_name}))
+    ]
+    while queue:
+        current, path, visited = queue.pop(0)
+        for relationship in parents_by_child.get(current, ()):
+            parent = relationship.target
+            if parent in visited:
+                continue
+            next_path = (*path, relationship)
+            ancestors.append((parent, next_path))
+            queue.append((parent, next_path, visited | {parent}))
+    return tuple(ancestors)
+
+
 def _matching_ejb_method(
     declarations: Iterable[tuple[str, str, Path, int, int]],
     owner: str,
     name: str,
     parameters: str,
+    repository_root: Path,
+    requested_path: Path | None = None,
 ) -> tuple[str, str, Path, int, int] | None:
     expected = _normalize_java_parameters(parameters)
     matches = [
@@ -698,11 +898,135 @@ def _matching_ejb_method(
         and signature.split("#", maxsplit=1)[1].split("(", maxsplit=1)[0] == name
         and _normalize_java_parameters(signature.split("(", maxsplit=1)[1].removesuffix(")")) == expected
     ]
+    if len(matches) > 1:
+        return None
+    if len(matches) == 1 and _conflicting_ejb_parameter_imports(
+        parameters,
+        matches[0][1].split("(", maxsplit=1)[1].removesuffix(")"),
+        requested_path,
+        matches[0][2],
+        repository_root,
+    ):
+        return None
     return matches[0] if len(matches) == 1 else None
 
 
 def _normalize_java_parameters(parameters: str) -> str:
     return re.sub(r"\s+", "", parameters)
+
+
+def _conflicting_ejb_parameter_imports(
+    requested_parameters: str,
+    candidate_parameters: str,
+    requested_path: Path | None,
+    candidate_path: Path,
+    repository_root: Path,
+) -> bool:
+    requested_types = _split_java_parameters(requested_parameters)
+    candidate_types = _split_java_parameters(candidate_parameters)
+    if len(requested_types) != len(candidate_types):
+        return True
+    candidate_imports = _java_imports_for_path(repository_root, candidate_path)
+    for requested_type, candidate_type in zip(requested_types, candidate_types):
+        if _contains_generic_type_variable(requested_type) or _contains_generic_type_variable(
+            candidate_type
+        ):
+            return True
+        requested_names = _java_type_references(requested_type)
+        candidate_names = _java_type_references(candidate_type)
+        if requested_names != candidate_names:
+            return True
+        requested_imports = _java_imports_for_path(repository_root, requested_path)
+        for requested_name, candidate_name in zip(requested_names, candidate_names):
+            if "." in requested_name or "." in candidate_name:
+                if requested_name != candidate_name:
+                    return True
+                continue
+            if re.fullmatch(r"[A-Z]", requested_name):
+                return True
+            requested_candidates = _java_type_import_candidates(requested_imports, requested_name)
+            candidate_candidates = _java_type_import_candidates(candidate_imports, candidate_name)
+            if not requested_candidates and not candidate_candidates:
+                requested_package = _java_package_for_path(repository_root, requested_path)
+                candidate_package = _java_package_for_path(repository_root, candidate_path)
+                if (
+                    requested_package != candidate_package
+                    and requested_name not in _JAVA_LANG_TYPES
+                    and not re.fullmatch(
+                        r"(?:boolean|byte|char|double|float|int|long|short|void)", requested_name
+                    )
+                ):
+                    return True
+            if requested_candidates != candidate_candidates and (
+                requested_candidates or candidate_candidates
+            ):
+                return True
+    return False
+
+
+def _contains_generic_type_variable(value: str) -> bool:
+    return "<" in value and bool(re.search(r"\b[A-Z]\b", value))
+
+
+def _java_type_references(value: str) -> tuple[str, ...]:
+    return tuple(
+        re.findall(r"(?:[A-Za-z_$][\w$]*\.)*[A-Z_$][\w$]*", value)
+    )
+
+
+def _split_java_parameters(parameters: str) -> tuple[str, ...]:
+    values: list[str] = []
+    start = 0
+    nesting = 0
+    for index, character in enumerate(parameters):
+        if character in "<[(":
+            nesting += 1
+        elif character in ">)]":
+            nesting = max(0, nesting - 1)
+        elif character == "," and nesting == 0:
+            values.append(parameters[start:index].strip())
+            start = index + 1
+    if parameters.strip():
+        values.append(parameters[start:].strip())
+    return tuple(values)
+
+
+def _java_type_import_candidates(imports: dict[str, str], simple_name: str) -> set[str]:
+    explicit = imports.get(simple_name)
+    if explicit and not explicit.endswith(".*"):
+        return {explicit}
+    return {
+        f"{package}.{simple_name}"
+        for package in imports
+        if imports[package].endswith(".*")
+    }
+
+
+def _java_imports_for_path(repository_root: Path, path: Path | None) -> dict[str, str]:
+    if path is None:
+        return {}
+    try:
+        source = (repository_root / path).read_bytes()
+    except OSError:
+        return {}
+    return _java_imports(source)
+
+
+_JAVA_LANG_TYPES = frozenset(
+    {"Boolean", "Byte", "Character", "Double", "Float", "Integer", "Long", "Object", "Short", "String"}
+)
+
+
+def _java_package_for_path(repository_root: Path, path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        source = (repository_root / path).read_bytes()
+    except OSError:
+        return ""
+    parser = Parser(Language(tree_sitter_java.language()))
+    tree = parser.parse(source)
+    return _package_name(tree.root_node, source)
 
 
 def _spring_relationships(
