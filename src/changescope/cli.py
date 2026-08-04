@@ -192,6 +192,7 @@ def _render_impact_result(result: ImpactResult, output_format: str) -> None:
                 f"[{relationship['confidence']}] {relationship['evidence_handle']}"
                 + profile_suffix
             )
+            print(f"  Evidence chain: {' -> '.join(relationship['evidence_chain'])}")
     print("Assumptions:")
     for assumption in report["assumptions"]:
         print(f"- {assumption}")
@@ -222,6 +223,7 @@ def _impact_report(result: ImpactResult) -> dict[str, object]:
                 "start_line": relationship.start_line,
                 "end_line": relationship.end_line,
                 "evidence_handle": relationship.evidence_handle,
+                "evidence_chain": list(relationship.evidence_chain),
                 "confidence": relationship.confidence,
                 "conditional": relationship.conditional,
                 "profile": relationship.profile,

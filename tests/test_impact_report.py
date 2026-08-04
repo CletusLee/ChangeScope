@@ -369,9 +369,17 @@ class OrderService {
             )
             self.assertEqual(direct_callee["caller"], "example.OrderService#validateOrder")
             self.assertEqual(direct_callee["confidence"], "high")
+            self.assertEqual(
+                direct_callee["evidence_chain"],
+                [direct_callee["evidence_handle"]],
+            )
             self.assertIn("Resolved target: example.OrderService#placeOrder(String)", text_result.stdout)
             self.assertIn("example.OrderService#retryOrder", text_result.stdout)
             self.assertIn("direct_callee example.OrderService#validateOrder [high]", text_result.stdout)
+            self.assertIn(
+                "Evidence chain: invocation:src/main/java/example/OrderService.java:3-3",
+                text_result.stdout,
+            )
             self.assertIn("Snapshot:", text_result.stdout)
 
     def test_cli_returns_nonzero_for_a_non_resolved_target(self) -> None:

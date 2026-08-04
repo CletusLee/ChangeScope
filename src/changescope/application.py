@@ -172,6 +172,11 @@ class ImpactRelationship:
     confidence: str
     conditional: bool = False
     profile: str | None = None
+    evidence_chain: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.evidence_chain:
+            object.__setattr__(self, "evidence_chain", (self.evidence_handle,))
 
 
 @dataclass(frozen=True)
