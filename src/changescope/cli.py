@@ -187,10 +187,16 @@ def _render_impact_result(result: ImpactResult, output_format: str) -> None:
                 profile_suffix = f" (conditional profile: {profile or 'unspecified'})"
             elif profile:
                 profile_suffix = f" (profile: {profile})"
+            view_suffix = (
+                f" (business view: {relationship['business_view']})"
+                if relationship.get("business_view")
+                else ""
+            )
             print(
                 f"- {relationship['kind']} {relationship['caller']} "
                 f"[{relationship['confidence']}] {relationship['evidence_handle']}"
                 + profile_suffix
+                + view_suffix
             )
             print(f"  Evidence chain: {' -> '.join(relationship['evidence_chain'])}")
     print("Assumptions:")
@@ -227,6 +233,7 @@ def _impact_report(result: ImpactResult) -> dict[str, object]:
                 "confidence": relationship.confidence,
                 "conditional": relationship.conditional,
                 "profile": relationship.profile,
+                "business_view": relationship.business_view,
             }
             for relationship in result.relationships
         ],

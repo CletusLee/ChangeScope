@@ -88,6 +88,17 @@ class SpringFact:
 
 
 @dataclass(frozen=True)
+class EJBFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+
+
+@dataclass(frozen=True)
 class ParseFailure:
     path: Path
     start_line: int
@@ -106,6 +117,7 @@ class IndexResult:
     parse_failures: tuple[ParseFailure, ...]
     snapshot: IndexSnapshot
     spring_facts: tuple[SpringFact, ...] = ()
+    ejb_facts: tuple[EJBFact, ...] = ()
     configuration_files: tuple[Path, ...] = ()
 
 
@@ -173,6 +185,7 @@ class ImpactRelationship:
     conditional: bool = False
     profile: str | None = None
     evidence_chain: tuple[str, ...] = ()
+    business_view: str | None = None
 
     def __post_init__(self) -> None:
         if not self.evidence_chain:
@@ -214,7 +227,7 @@ class ChangeScopeApplication:
 
 
 def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
-    match = re.fullmatch(r"(?:declaration|invocation|spring):(.+):(\d+)-(\d+)", request.evidence_handle)
+    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb):(.+):(\d+)-(\d+)", request.evidence_handle)
     if match is None:
         raise ValueError("Evidence handles must use kind:path:start-end form.")
     path = _validate_relative_path(Path(match.group(1)))
@@ -409,6 +422,10 @@ def _spring_evidence_handle(path: Path, start_line: int, end_line: int) -> str:
     return _evidence_handle("spring", path, start_line, end_line)
 
 
+def _ejb_evidence_handle(path: Path, start_line: int, end_line: int) -> str:
+    return _evidence_handle("ejb", path, start_line, end_line)
+
+
 def _unresolved(
     message: str,
     path: Path | None = None,
@@ -530,11 +547,162 @@ def _direct_relationships(
     )
     relationships.extend(spring_relationships)
     unresolved_items.extend(spring_unresolved)
+    ejb_relationships, ejb_unresolved = _ejb_relationships(
+        connection_data_path=database_path,
+        target=target,
+    )
+    relationships.extend(ejb_relationships)
+    unresolved_items.extend(ejb_unresolved)
     return tuple(relationships), tuple(unresolved_items)
 
 
 def _is_direct_construction(receiver: str, owner: str) -> bool:
     return bool(re.fullmatch(rf"new\s+{re.escape(owner)}\s*\([^)]*\)", receiver))
+
+
+def _ejb_relationships(
+    connection_data_path: Path, target: ImpactTarget
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    owner, method_with_parameters = target.signature.split("#", maxsplit=1)
+    method_name, _, parameters = method_with_parameters.partition("(")
+    parameters = parameters.removesuffix(")")
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        facts = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line
+            FROM ejb_facts ORDER BY path, start_line, kind, subject"""
+        ).fetchall()
+        declarations = connection.execute(
+            """SELECT kind, qualified_name, signature, path, start_line, end_line
+            FROM java_declarations WHERE kind IN ('class', 'interface', 'method')"""
+        ).fetchall()
+    finally:
+        connection.close()
+    if not facts:
+        return (), ()
+    parsed_facts = tuple(
+        EJBFact(kind, subject, fact_target, value, Path(path), start_line, end_line)
+        for kind, subject, fact_target, value, path, start_line, end_line in facts
+    )
+    views = {
+        fact.subject: fact
+        for fact in parsed_facts
+        if fact.kind == "interface_view"
+    }
+    sessions = {
+        fact.subject: fact
+        for fact in parsed_facts
+        if fact.kind == "session_bean"
+    }
+    implements = [
+        fact for fact in parsed_facts if fact.kind == "type_implements" and fact.target
+    ]
+    bean_views = [fact for fact in parsed_facts if fact.kind == "bean_view"]
+    mappings: list[tuple[str, str, str, tuple[EJBFact, ...]]] = []
+    for implementation in implements:
+        if implementation.subject not in sessions:
+            continue
+        view_fact = views.get(implementation.target or "")
+        if view_fact is not None:
+            mappings.append(
+                (
+                    implementation.target,
+                    implementation.subject,
+                    view_fact.value or "local",
+                    (view_fact, implementation, sessions[implementation.subject]),
+                )
+            )
+        for bean_view in bean_views:
+            if bean_view.subject != implementation.subject:
+                continue
+            if bean_view.target is None or bean_view.target == implementation.target:
+                mappings.append(
+                    (
+                        implementation.target,
+                        implementation.subject,
+                        bean_view.value or "local",
+                        (bean_view, implementation, sessions[implementation.subject]),
+                    )
+                )
+    unique_mappings = _unique_ejb_mappings(mappings)
+    declaration_rows = [
+        (qualified_name, signature, Path(path), start_line, end_line)
+        for kind, qualified_name, signature, path, start_line, end_line in declarations
+        if kind == "method"
+    ]
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+    for interface_name, bean_name, view, mapping_facts in unique_mappings:
+        if owner not in {interface_name, bean_name}:
+            continue
+        counterpart = bean_name if owner == interface_name else interface_name
+        counterpart_declaration = _matching_ejb_method(
+            declaration_rows, counterpart, method_name, parameters
+        )
+        if counterpart_declaration is None:
+            unresolved.append(
+                _unresolved(
+                    f"EJB method {owner}#{method_name} was not connected because the matching Session Bean or EJB Business Interface method is unresolved."
+                )
+            )
+            continue
+        evidence_chain = tuple(_ejb_evidence_handle(fact.path, fact.start_line, fact.end_line) for fact in mapping_facts)
+        primary_fact = mapping_facts[0]
+        relationships.append(
+            ImpactRelationship(
+                "ejb_business_implementation",
+                counterpart_declaration[1],
+                primary_fact.path,
+                primary_fact.start_line,
+                primary_fact.end_line,
+                evidence_chain[0],
+                "high",
+                evidence_chain=evidence_chain,
+                business_view=view,
+            )
+        )
+        if view == "remote":
+            unresolved.append(
+                _unresolved(
+                    f"Remote EJB Business Interface {interface_name} may have consumers outside the local Repository Index."
+                )
+            )
+    return tuple(relationships), tuple(unresolved)
+
+
+def _unique_ejb_mappings(
+    mappings: Iterable[tuple[str, str, str, tuple[EJBFact, ...]]]
+) -> tuple[tuple[str, str, str, tuple[EJBFact, ...]], ...]:
+    unique: list[tuple[str, str, str, tuple[EJBFact, ...]]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for mapping in mappings:
+        key = mapping[:3]
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(mapping)
+    return tuple(unique)
+
+
+def _matching_ejb_method(
+    declarations: Iterable[tuple[str, str, Path, int, int]],
+    owner: str,
+    name: str,
+    parameters: str,
+) -> tuple[str, str, Path, int, int] | None:
+    expected = _normalize_java_parameters(parameters)
+    matches = [
+        (qualified_name, signature, path, start_line, end_line)
+        for qualified_name, signature, path, start_line, end_line in declarations
+        if qualified_name.startswith(owner + "#")
+        and signature.split("#", maxsplit=1)[1].split("(", maxsplit=1)[0] == name
+        and _normalize_java_parameters(signature.split("(", maxsplit=1)[1].removesuffix(")")) == expected
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _normalize_java_parameters(parameters: str) -> str:
+    return re.sub(r"\s+", "", parameters)
 
 
 def _spring_relationships(
@@ -809,6 +977,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
     spring_facts = _analyze_spring_files(
         {**contents_by_path, **configuration_contents}, declarations
     )
+    ejb_facts = _analyze_ejb_files(contents_by_path)
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -820,6 +989,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
         parse_failures=parse_failures,
         snapshot=snapshot,
         spring_facts=spring_facts,
+        ejb_facts=ejb_facts,
         configuration_files=configuration_files,
     )
     _write_index(result)
@@ -883,6 +1053,7 @@ def _refresh_index_if_needed(root: Path) -> None:
                 spring_facts = _analyze_spring_files(
                     {**changed_contents, **changed_configuration_contents}, declarations
                 )
+                ejb_facts = _analyze_ejb_files(changed_contents)
                 _replace_changed_source_records(
                     connection,
                     changed_paths,
@@ -891,6 +1062,7 @@ def _refresh_index_if_needed(root: Path) -> None:
                     invocations,
                     parse_failures,
                     spring_facts,
+                    ejb_facts,
                 )
             _write_metadata(connection, _snapshot(root), source_roots)
     finally:
@@ -1203,6 +1375,218 @@ def _analyze_spring_files(
         else:
             facts.extend(_spring_configuration_facts(path, source))
     return tuple(sorted(facts, key=lambda fact: (str(fact.path), fact.start_line, fact.kind, fact.subject)))
+
+
+def _analyze_ejb_files(contents_by_path: dict[Path, bytes]) -> tuple[EJBFact, ...]:
+    facts: list[EJBFact] = []
+    for path, source in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        if path.suffix.lower() != ".java":
+            continue
+        facts.extend(
+            _ejb_java_facts(path, source)
+        )
+    return tuple(
+        sorted(facts, key=lambda fact: (str(fact.path), fact.start_line, fact.kind, fact.subject, fact.target or ""))
+    )
+
+
+def _ejb_java_facts(path: Path, source: bytes) -> tuple[EJBFact, ...]:
+    parser = Parser(Language(tree_sitter_java.language()))
+    tree = parser.parse(source)
+    package_name = _package_name(tree.root_node, source)
+    imports = _java_imports(source, tree.root_node)
+    facts: list[EJBFact] = []
+    type_kinds = {
+        "class_declaration": "class",
+        "interface_declaration": "interface",
+        "enum_declaration": "enum",
+        "record_declaration": "record",
+    }
+
+    def visit(node, enclosing_types: tuple[str, ...]) -> None:
+        current_types = enclosing_types
+        if node.type in type_kinds:
+            name = _node_text(node.child_by_field_name("name"), source)
+            qualified_name = _qualified_type_name(package_name, (*enclosing_types, name))
+            current_types = (*enclosing_types, name)
+            modifiers = next(
+                (child for child in node.named_children if child.type == "modifiers"),
+                None,
+            )
+            annotations = _ejb_annotations(modifiers, source, imports)
+            declaration_line = node.start_point.row + 1
+            if any(annotation[0] in {"Local", "Remote"} for annotation in annotations):
+                for annotation_name, annotation_node, arguments in annotations:
+                    if annotation_name not in {"Local", "Remote"}:
+                        continue
+                    view = annotation_name.lower()
+                    targets = _ejb_annotation_types(arguments, package_name, imports)
+                    if type_kinds[node.type] == "interface":
+                        facts.append(
+                            EJBFact(
+                                "interface_view",
+                                qualified_name,
+                                None,
+                                view,
+                                path,
+                                annotation_node.start_point.row + 1,
+                                annotation_node.end_point.row + 1,
+                            )
+                        )
+                    elif targets:
+                        for target in targets:
+                            facts.append(
+                                EJBFact(
+                                    "bean_view",
+                                    qualified_name,
+                                    target,
+                                    view,
+                                    path,
+                                    annotation_node.start_point.row + 1,
+                                    annotation_node.end_point.row + 1,
+                                )
+                            )
+                    else:
+                        facts.append(
+                            EJBFact(
+                                "bean_view",
+                                qualified_name,
+                                None,
+                                view,
+                                path,
+                                annotation_node.start_point.row + 1,
+                                annotation_node.end_point.row + 1,
+                            )
+                        )
+            for annotation_name, annotation_node, _ in annotations:
+                if annotation_name in {"Stateless", "Stateful", "Singleton"}:
+                    facts.append(
+                        EJBFact(
+                            "session_bean",
+                            qualified_name,
+                            None,
+                            annotation_name.lower(),
+                            path,
+                            annotation_node.start_point.row + 1,
+                            annotation_node.end_point.row + 1,
+                        )
+                    )
+                elif annotation_name in {"MessageDriven", "LocalBean"}:
+                    facts.append(
+                        EJBFact(
+                            "ejb_unresolved",
+                            qualified_name,
+                            None,
+                            f"WildFly {annotation_name} behavior is not resolved in this EJB slice.",
+                            path,
+                            annotation_node.start_point.row + 1,
+                            annotation_node.end_point.row + 1,
+                        )
+                    )
+            for interface_name in _ejb_type_clause(node, "super_interfaces", source):
+                facts.append(
+                    EJBFact(
+                        "type_implements",
+                        qualified_name,
+                        _resolve_java_type(interface_name, package_name, imports),
+                        None,
+                        path,
+                        declaration_line,
+                        declaration_line,
+                    )
+                )
+            if type_kinds[node.type] == "interface":
+                for interface_name in _ejb_type_clause(node, "extends_interfaces", source):
+                    facts.append(
+                        EJBFact(
+                            "type_extends",
+                            qualified_name,
+                            _resolve_java_type(interface_name, package_name, imports),
+                            None,
+                            path,
+                            declaration_line,
+                            declaration_line,
+                        )
+                    )
+        for child in node.named_children:
+            visit(child, current_types)
+
+    visit(tree.root_node, ())
+    return tuple(facts)
+
+
+def _java_imports(source: bytes, root_node=None) -> dict[str, str]:
+    imports: dict[str, str] = {}
+    if root_node is None:
+        parser = Parser(Language(tree_sitter_java.language()))
+        root_node = parser.parse(source).root_node
+    for import_node in (
+        child for child in root_node.named_children if child.type == "import_declaration"
+    ):
+        value = _node_text(import_node, source).strip()
+        value = re.sub(r"^import\s+(?:static\s+)?", "", value).removesuffix(";").strip()
+        if value.endswith(".*"):
+            imports[value.removesuffix(".*")] = value
+            continue
+        simple_name = value.rsplit(".", 1)[-1]
+        imports[simple_name] = value
+    return imports
+
+
+def _ejb_annotations(modifiers, source: bytes, imports: dict[str, str]):
+    if modifiers is None:
+        return ()
+    annotations = []
+    for annotation in modifiers.named_children:
+        if annotation.type not in {"marker_annotation", "annotation"}:
+            continue
+        name_node = annotation.child_by_field_name("name")
+        name = _node_text(name_node, source)
+        simple_name = name.rsplit(".", 1)[-1]
+        imported = imports.get(simple_name)
+        if name.startswith(("javax.ejb.", "jakarta.ejb.")):
+            allowed = True
+        elif imported is not None:
+            allowed = imported in {f"javax.ejb.{simple_name}", f"jakarta.ejb.{simple_name}"}
+        else:
+            allowed = (
+                imports.get("javax.ejb") == "javax.ejb.*"
+                or imports.get("jakarta.ejb") == "jakarta.ejb.*"
+            )
+        if not allowed:
+            continue
+        text = _node_text(annotation, source)
+        opening = text.find("(")
+        arguments = text[opening + 1 : -1] if opening >= 0 and text.endswith(")") else ""
+        annotations.append((simple_name, annotation, arguments))
+    return tuple(annotations)
+
+
+def _ejb_annotation_types(
+    arguments: str, package_name: str, imports: dict[str, str]
+) -> tuple[str, ...]:
+    values = []
+    for value in re.findall(r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.class", arguments):
+        values.append(_resolve_java_type(value, package_name, imports))
+    return tuple(values)
+
+
+def _ejb_type_clause(node, clause_type: str, source: bytes) -> tuple[str, ...]:
+    clause = next((child for child in node.named_children if child.type == clause_type), None)
+    if clause is None:
+        return ()
+    type_list = next((child for child in clause.named_children if child.type == "type_list"), clause)
+    return tuple(_node_text(child, source) for child in type_list.named_children)
+
+
+def _resolve_java_type(value: str, package_name: str, imports: dict[str, str]) -> str:
+    value = re.sub(r"\s+", "", value).replace(".class", "")
+    value = value.split("<", 1)[0].rstrip("[]")
+    if value in imports and not imports[value].endswith(".*"):
+        return imports[value]
+    if "." in value:
+        return value
+    return f"{package_name}.{value}" if package_name else value
 
 
 def _spring_java_facts(
@@ -2131,6 +2515,7 @@ def _replace_index_contents(
     connection.execute("DELETE FROM java_invocations")
     connection.execute("DELETE FROM parse_failures")
     connection.execute("DELETE FROM spring_facts")
+    connection.execute("DELETE FROM ejb_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
     indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
     connection.executemany(
@@ -2146,11 +2531,15 @@ def _replace_index_contents(
     )
     _insert_java_facts(connection, result.declarations, result.invocations, result.parse_failures)
     _insert_spring_facts(connection, result.spring_facts)
+    _insert_ejb_facts(connection, result.ejb_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
     spring_schema_missing = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spring_facts'"
+    ).fetchone() is None
+    ejb_schema_missing = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ejb_facts'"
     ).fetchone() is None
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -2202,6 +2591,17 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         profile TEXT
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS ejb_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -2219,7 +2619,7 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         connection.execute(
             "ALTER TABLE source_files ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
         )
-    return declaration_schema_changed or spring_schema_missing
+    return declaration_schema_changed or spring_schema_missing or ejb_schema_missing
 
 
 def _write_metadata(
@@ -2250,6 +2650,7 @@ def _replace_changed_source_records(
     invocations: tuple[JavaInvocation, ...],
     parse_failures: tuple[ParseFailure, ...],
     spring_facts: tuple[SpringFact, ...],
+    ejb_facts: tuple[EJBFact, ...],
 ) -> None:
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
@@ -2257,12 +2658,14 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM java_invocations WHERE path = ?", (path,))
         connection.execute("DELETE FROM parse_failures WHERE path = ?", (path,))
         connection.execute("DELETE FROM spring_facts WHERE path = ?", (path,))
+        connection.execute("DELETE FROM ejb_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
     )
     _insert_java_facts(connection, declarations, invocations, parse_failures)
     _insert_spring_facts(connection, spring_facts)
+    _insert_ejb_facts(connection, ejb_facts)
 
 
 def _insert_java_facts(
@@ -2333,6 +2736,28 @@ def _insert_spring_facts(
                 fact.start_line,
                 fact.end_line,
                 fact.profile,
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _insert_ejb_facts(
+    connection: sqlite3.Connection, facts: Iterable[EJBFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO ejb_facts(
+        kind, subject, target, value, path, start_line, end_line
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
             )
             for fact in facts
         ),

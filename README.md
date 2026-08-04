@@ -1,6 +1,6 @@
 # ChangeScope
 
-Local-first, evidence-backed impact analysis for Java and Spring Boot repositories.
+Local-first, evidence-backed impact analysis for Java, Spring Boot, and WildFly repositories.
 
 ## The problem
 
@@ -21,7 +21,7 @@ ChangeScope is not a generic code-search, code-memory, or full semantic call-gra
 
 ## Current status
 
-The current release is a JRE-free Java and Spring/Spring Boot local-analysis slice. It is intended to answer `Class#method` impact questions inside one repository. The application service is exposed through a small CLI today; an MCP adapter is not implemented yet.
+The current release is a JRE-free Java, Spring/Spring Boot, and annotation-backed WildFly EJB local-analysis slice. It is intended to answer `Class#method` impact questions inside one repository. The application service is exposed through a small CLI today; an MCP adapter is not implemented yet.
 
 The implementation has been smoke-tested against four public Spring Boot applications: [Spring Petclinic](https://github.com/spring-projects/spring-petclinic), [Spring Petclinic REST](https://github.com/spring-petclinic/spring-petclinic-rest), [Spring Petclinic Modulith](https://github.com/spring-petclinic/spring-petclinic-modulith), and the [RealWorld Spring Boot application](https://github.com/gothinkster/spring-boot-realworld-example-app). In the current validation run, all four completed indexing with zero Java parse failures and zero file-read failures; representative MVC, REST, profile-aware, event-driven, MyBatis, Security, GraphQL, and Spring-test impact queries resolved successfully.
 
@@ -80,6 +80,18 @@ The current Spring slice can recognize and connect evidence for:
 - Spring-aware tests that explicitly load or target a changed class through supported test annotations.
 
 These findings are represented as distinct relationship kinds, including `spring_configuration_boundary`, `bean_consumer`, `property_consumer`, `property_source`, and `spring_test`. A Spring configuration boundary is class-level, indirect evidence; it must not be read as proof that Spring directly invokes the changed method.
+
+### WildFly EJB evidence
+
+The current WildFly slice can recognize and connect evidence for:
+
+- `javax.ejb` and `jakarta.ejb` `@Local` and `@Remote` business interfaces;
+- `@Stateless`, `@Stateful`, and `@Singleton` Session Beans;
+- explicit interface-to-implementation relationships in both target directions;
+- local and remote view metadata, including uncertainty about consumers outside the Repository Index; and
+- ordered Evidence Chains for the relationship facts supporting each conclusion.
+
+EJB Injection Points, inherited interfaces, and explicit `ejb-jar.xml` references are staged follow-up tickets. Message-driven beans, CDI, JNDI, and other container mechanisms remain unresolved or out of scope for the current slice.
 
 ### Profiles, reports, and evidence navigation
 
@@ -145,7 +157,7 @@ The current release analyzes one local checkout at a time. It does not yet:
 
 - traverse a Workspace Catalog or cross-repository relationship;
 - connect an HTTP/REST client to a remote handler or target repository;
-- analyze EJB, WildFly, CDI, JAX-RS, JMS, SOAP, gRPC, CORBA, or other non-Spring application boundaries;
+- analyze CDI, JAX-RS, JMS, SOAP, gRPC, CORBA, or other non-Spring application boundaries;
 - ingest OpenAPI or other external contract catalogs;
 - run the Spring Boot application or its Maven/Gradle tests as part of impact analysis; or
 - discover production state, remote source, or remote Git objects.
@@ -217,7 +229,7 @@ Run the repository test suite with:
 python -m unittest discover -s tests -v
 ```
 
-The current test suite covers repository discovery, Java structural facts, direct callers and callees, ambiguity, incremental refresh, Spring configuration, profiles, properties, YAML, XML, bounded evidence navigation, and CLI text/JSON consistency. The latest validation run completed 65 tests successfully.
+The current test suite covers repository discovery, Java structural facts, direct callers and callees, ambiguity, incremental refresh, Spring configuration, profiles, properties, YAML, XML, bounded evidence navigation, WildFly EJB contracts, and CLI text/JSON consistency. The latest validation run completed 71 tests successfully.
 
 ## Design principles
 
@@ -230,4 +242,4 @@ The current test suite covers repository discovery, Java structural facts, direc
 
 ## Direction of future work
 
-Future stages may add requirement/diff/API targets, deeper Java resolution, verified HTTP/REST cross-repository analysis, Workspace Catalog support, and additional framework or language adapters. Those capabilities are not part of the current release and should not be inferred from the current reports.
+Future stages may add EJB Injection Points, inherited EJB Business Interfaces, explicit EJB descriptors, requirement/diff/API targets, deeper Java resolution, verified HTTP/REST cross-repository analysis, Workspace Catalog support, Quarkus, and additional framework or language adapters. Those capabilities are not part of the current release and should not be inferred from the current reports.
