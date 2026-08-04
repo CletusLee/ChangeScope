@@ -963,6 +963,298 @@ class NamedConsumers {
             self.assertIn("mappedName", messages)
             self.assertIn("lookup", messages)
 
+    def test_reports_descriptor_backed_session_beans_and_business_views(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/DescriptorService.java",
+                """package example;
+public interface DescriptorService { void run(); }
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/DescriptorBean.java",
+                """package example;
+public class DescriptorBean { public void run() {} }
+""",
+            )
+            self._write(
+                repository / "src/main/resources/META-INF/ejb-jar.xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<ejb-jar xmlns="http://java.sun.com/xml/ns/javaee" version="3.1">
+  <enterprise-beans>
+    <session>
+      <ejb-name>DescriptorService</ejb-name>
+      <ejb-class>example.DescriptorBean</ejb-class>
+      <session-type>Stateless</session-type>
+      <business-local>example.DescriptorService</business-local>
+    </session>
+  </enterprise-beans>
+</ejb-jar>
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "DescriptorService#run"))
+
+            implementation = next(
+                relationship
+                for relationship in result.relationships
+                if relationship.kind == "ejb_business_implementation"
+            )
+            self.assertEqual(implementation.caller, "example.DescriptorBean#run()")
+            self.assertEqual(implementation.business_view, "local")
+            self.assertTrue(any("ejb-jar.xml" in handle for handle in implementation.evidence_chain))
+            descriptor_evidence = next(
+                handle for handle in implementation.evidence_chain if "ejb-jar.xml" in handle
+            )
+            evidence = application.execute(EvidenceRequest(repository, descriptor_evidence))
+            self.assertIn("DescriptorService", evidence.content)
+
+            bean_result = application.execute(ImpactRequest(repository, "DescriptorBean#run"))
+            self.assertTrue(
+                any(
+                    relationship.kind == "ejb_business_implementation"
+                    and relationship.caller == "example.DescriptorService#run()"
+                    for relationship in bean_result.relationships
+                )
+            )
+
+    def test_reports_descriptor_ejb_reference_injection_and_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/DescriptorReference.java",
+                """package example;
+public interface DescriptorService { void run(); }
+public class DescriptorBean { public void run() {} }
+class Consumer { private DescriptorService service; void use() { service.run(); } }
+""",
+            )
+            self._write(
+                repository / "src/main/resources/META-INF/ejb-jar.xml",
+                """<ejb-jar xmlns="http://java.sun.com/xml/ns/javaee" version="3.1">
+  <enterprise-beans>
+    <session>
+      <ejb-name>DescriptorService</ejb-name>
+      <ejb-class>example.DescriptorBean</ejb-class>
+      <session-type>Stateless</session-type>
+      <business-local>example.DescriptorService</business-local>
+      <ejb-local-ref>
+        <ejb-ref-name>ejb/service</ejb-ref-name>
+        <ejb-link>DescriptorService</ejb-link>
+        <business-local>example.DescriptorService</business-local>
+        <injection-target>
+          <injection-target-class>example.Consumer</injection-target-class>
+          <injection-target-name>service</injection-target-name>
+        </injection-target>
+      </ejb-local-ref>
+    </session>
+  </enterprise-beans>
+</ejb-jar>
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "DescriptorService#run"))
+
+            self.assertTrue(
+                any(
+                    relationship.kind == "ejb_injection"
+                    and relationship.caller == "example.Consumer#service"
+                    for relationship in result.relationships
+                )
+            )
+            dispatch = next(
+                relationship
+                for relationship in result.relationships
+                if relationship.kind == "ejb_container_dispatch"
+            )
+            self.assertEqual(dispatch.caller, "example.Consumer#use")
+            self.assertTrue(any(handle.startswith("ejb:") for handle in dispatch.evidence_chain))
+
+    def test_reports_malformed_descriptor_as_unresolved_index_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            descriptor = repository / "src/main/resources/META-INF/ejb-jar.xml"
+            self._write(descriptor, "<ejb-jar><enterprise-beans><session></ejb-jar>")
+
+            index_result = ChangeScopeApplication().execute(IndexRequest(repository))
+
+            self.assertTrue(any(fact.kind == "ejb_unresolved" for fact in index_result.ejb_facts))
+            unresolved = next(fact for fact in index_result.ejb_facts if fact.kind == "ejb_unresolved")
+            self.assertIn("Malformed EJB deployment descriptor", unresolved.value or "")
+
+    def test_reports_annotation_descriptor_conflicts_as_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/ConflictingDescriptor.java",
+                """package example;
+import javax.ejb.Local;
+import javax.ejb.Stateless;
+@Local interface Service { void run(); }
+@Stateless class ServiceBean implements Service { public void run() {} }
+""",
+            )
+            self._write(
+                repository / "src/main/resources/META-INF/ejb-jar.xml",
+                """<ejb-jar xmlns="http://java.sun.com/xml/ns/javaee" version="3.1">
+  <enterprise-beans>
+    <session>
+      <ejb-name>Service</ejb-name>
+      <ejb-class>example.ServiceBean</ejb-class>
+      <session-type>Stateful</session-type>
+      <business-remote>example.Service</business-remote>
+    </session>
+  </enterprise-beans>
+</ejb-jar>
+""",
+            )
+            index_result = ChangeScopeApplication().execute(IndexRequest(repository))
+
+            conflicts = [
+                fact.value or ""
+                for fact in index_result.ejb_facts
+                if fact.kind == "ejb_unresolved"
+            ]
+            self.assertTrue(any("Conflicting annotation and descriptor" in value for value in conflicts))
+
+    def test_does_not_resolve_an_incomplete_descriptor_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/Incomplete.java",
+                """package example;
+public interface Service { void run(); }
+public class ServiceBean { public void run() {} }
+""",
+            )
+            self._write(
+                repository / "src/main/resources/META-INF/ejb-jar.xml",
+                """<ejb-jar xmlns="http://java.sun.com/xml/ns/javaee">
+  <enterprise-beans>
+    <session>
+      <ejb-class>example.ServiceBean</ejb-class>
+      <business-local>example.Service</business-local>
+    </session>
+  </enterprise-beans>
+</ejb-jar>
+""",
+            )
+            application = ChangeScopeApplication()
+            index_result = application.execute(IndexRequest(repository))
+            self.assertFalse(
+                any(
+                    fact.kind == "session_bean" and fact.subject == "example.ServiceBean"
+                    for fact in index_result.ejb_facts
+                )
+            )
+
+            result = application.execute(ImpactRequest(repository, "Service#run"))
+
+            self.assertFalse(
+                any(
+                    relationship.kind == "ejb_business_implementation"
+                    for relationship in result.relationships
+                )
+            )
+
+    def test_does_not_resolve_a_descriptor_reference_without_an_ejb_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/Reference.java",
+                """package example;
+public interface Service { void run(); }
+public class ServiceBean { public void run() {} }
+class Consumer { private Service service; void use() { service.run(); } }
+""",
+            )
+            self._write(
+                repository / "src/main/resources/META-INF/ejb-jar.xml",
+                """<ejb-jar xmlns="http://java.sun.com/xml/ns/javaee">
+  <enterprise-beans>
+    <session>
+      <ejb-name>Service</ejb-name>
+      <ejb-class>example.ServiceBean</ejb-class>
+      <session-type>Stateless</session-type>
+      <business-local>example.Service</business-local>
+      <ejb-ref>
+        <ejb-ref-name>ejb/service</ejb-ref-name>
+        <business-local>example.Service</business-local>
+        <injection-target>
+          <injection-target-class>example.Consumer</injection-target-class>
+          <injection-target-name>service</injection-target-name>
+        </injection-target>
+      </ejb-ref>
+    </session>
+  </enterprise-beans>
+</ejb-jar>
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "Service#run"))
+
+            self.assertFalse(
+                any(
+                    relationship.kind == "ejb_injection"
+                    for relationship in result.relationships
+                )
+            )
+            self.assertTrue(any("no ejb-link" in item.message for item in result.unresolved_items))
+
+    def test_does_not_resolve_descriptor_reference_view_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/ReferenceConflict.java",
+                """package example;
+public interface Service { void run(); }
+public class ServiceBean { public void run() {} }
+class Consumer { private Service service; void use() { service.run(); } }
+""",
+            )
+            self._write(
+                repository / "src/main/resources/META-INF/ejb-jar.xml",
+                """<ejb-jar xmlns="http://java.sun.com/xml/ns/javaee">
+  <enterprise-beans>
+    <session>
+      <ejb-name>Service</ejb-name>
+      <ejb-class>example.ServiceBean</ejb-class>
+      <session-type>Stateless</session-type>
+      <business-remote>example.Service</business-remote>
+      <ejb-ref>
+        <ejb-ref-name>ejb/service</ejb-ref-name>
+        <ejb-link>Service</ejb-link>
+        <business-local>example.Service</business-local>
+        <injection-target>
+          <injection-target-class>example.Consumer</injection-target-class>
+          <injection-target-name>service</injection-target-name>
+        </injection-target>
+      </ejb-ref>
+    </session>
+  </enterprise-beans>
+</ejb-jar>
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "Service#run"))
+
+            self.assertFalse(
+                any(
+                    relationship.kind == "ejb_injection"
+                    for relationship in result.relationships
+                )
+            )
+            self.assertTrue(any("business interface conflicts" in item.message for item in result.unresolved_items))
+
     @staticmethod
     def _write(path: Path, contents: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

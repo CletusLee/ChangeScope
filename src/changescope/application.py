@@ -685,15 +685,17 @@ def _ejb_relationships(
         EJBFact(kind, subject, fact_target, value, Path(path), start_line, end_line)
         for kind, subject, fact_target, value, path, start_line, end_line in facts
     )
+    conflicting_views = _ejb_conflicting_subjects(parsed_facts, "interface_view")
+    conflicting_sessions = _ejb_conflicting_subjects(parsed_facts, "session_bean")
     views = {
         fact.subject: fact
         for fact in parsed_facts
-        if fact.kind == "interface_view"
+        if fact.kind == "interface_view" and fact.subject not in conflicting_views
     }
     sessions = {
         fact.subject: fact
         for fact in parsed_facts
-        if fact.kind == "session_bean"
+        if fact.kind == "session_bean" and fact.subject not in conflicting_sessions
     }
     implements = [
         fact for fact in parsed_facts if fact.kind == "type_implements" and fact.target
@@ -791,6 +793,11 @@ def _ejb_relationships(
         if fact.kind in {"type_implements", "type_extends"}
         and fact.subject == owner
         and fact.target
+    )
+    relevant_types.update(
+        fact.subject
+        for fact in parsed_facts
+        if fact.kind == "type_implements" and fact.target == owner
     )
     declaration_rows = [
         (qualified_name, signature, Path(path), start_line, end_line)
@@ -935,9 +942,32 @@ def _ejb_relationships(
     view_facts = {
         fact.subject: fact
         for fact in parsed_facts
-        if fact.kind == "interface_view"
+        if fact.kind == "interface_view" and fact.subject not in conflicting_views
     }
+    seen_injection_points: set[tuple[str, str | None]] = set()
     for injection in injections:
+        injection_key = (injection.subject, injection.target)
+        if injection_key in seen_injection_points:
+            continue
+        seen_injection_points.add(injection_key)
+        if (
+            injection.path.suffix.lower() == ".xml"
+            and not _ejb_descriptor_target_exists(
+                connection_data_path.parent.parent,
+                injection,
+                declarations,
+            )
+        ):
+            unresolved.append(
+                _unresolved(
+                    f"EJB descriptor injection target {injection.subject} is not present in the indexed Java source.",
+                    injection.path,
+                    injection.start_line,
+                    injection.end_line,
+                    evidence_kind="ejb",
+                )
+            )
+            continue
         matching_mappings = tuple(
             mapping
             for mapping in relevant_mappings
@@ -1154,6 +1184,49 @@ def _ejb_injection_receiver_matches(
     if normalized_receiver.startswith("this."):
         normalized_receiver = normalized_receiver[5:]
     return normalized_receiver == property_name
+
+
+def _ejb_descriptor_target_exists(
+    repository_root: Path,
+    injection: EJBFact,
+    declarations: Iterable[tuple[str, str, str, str, int, int]],
+) -> bool:
+    owner, _, member = injection.subject.partition("#")
+    if not owner or not member:
+        return False
+    class_paths = {
+        Path(path)
+        for kind, qualified_name, _signature, path, _start_line, _end_line in declarations
+        if kind == "class" and qualified_name == owner
+    }
+    if not class_paths:
+        return False
+    for class_path in class_paths:
+        try:
+            source = (repository_root / class_path).read_bytes()
+        except OSError:
+            continue
+        parser = Parser(Language(tree_sitter_java.language()))
+        tree = parser.parse(source)
+        for node in _tree_nodes(tree.root_node):
+            if node.type != "class_declaration":
+                continue
+            if _node_text(node.child_by_field_name("name"), source) != owner.rsplit(".", 1)[-1]:
+                continue
+            for descendant in _tree_nodes(node):
+                if descendant.type == "variable_declarator" and _node_text(
+                    descendant.child_by_field_name("name"), source
+                ) == member:
+                    return True
+                if descendant.type == "method_declaration":
+                    method_name = _node_text(descendant.child_by_field_name("name"), source)
+                    if method_name == member or method_name == _ejb_setter_name(member):
+                        return True
+    return False
+
+
+def _ejb_setter_name(property_name: str) -> str:
+    return "set" + (property_name[:1].upper() + property_name[1:] if property_name else "")
 
 
 def _ejb_receiver_is_shadowed(
@@ -1670,7 +1743,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
     spring_facts = _analyze_spring_files(
         {**contents_by_path, **configuration_contents}, declarations
     )
-    ejb_facts = _analyze_ejb_files(contents_by_path)
+    ejb_facts = _analyze_ejb_files({**contents_by_path, **configuration_contents})
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -1746,7 +1819,7 @@ def _refresh_index_if_needed(root: Path) -> None:
                 spring_facts = _analyze_spring_files(
                     {**changed_contents, **changed_configuration_contents}, declarations
                 )
-                ejb_facts = _analyze_ejb_files(changed_contents)
+                ejb_facts = _analyze_ejb_files({**changed_contents, **changed_configuration_contents})
                 _replace_changed_source_records(
                     connection,
                     changed_paths,
@@ -2073,14 +2146,319 @@ def _analyze_spring_files(
 def _analyze_ejb_files(contents_by_path: dict[Path, bytes]) -> tuple[EJBFact, ...]:
     facts: list[EJBFact] = []
     for path, source in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
-        if path.suffix.lower() != ".java":
-            continue
-        facts.extend(
-            _ejb_java_facts(path, source)
-        )
+        if path.suffix.lower() == ".java":
+            facts.extend(_ejb_java_facts(path, source))
+        elif path.name.lower() in {"ejb-jar.xml", "jboss-ejb3.xml"}:
+            facts.extend(_ejb_descriptor_facts(path, source))
+    facts.extend(_ejb_descriptor_conflicts(facts))
     return tuple(
         sorted(facts, key=lambda fact: (str(fact.path), fact.start_line, fact.kind, fact.subject, fact.target or ""))
     )
+
+
+def _ejb_descriptor_facts(path: Path, source: bytes) -> tuple[EJBFact, ...]:
+    text = source.decode("utf-8", errors="replace")
+    try:
+        root = ElementTree.fromstring(source)
+    except ElementTree.ParseError as error:
+        return (
+            EJBFact(
+                "ejb_unresolved",
+                "",
+                None,
+                f"Malformed EJB deployment descriptor: {error}.",
+                path,
+                1,
+                max(1, len(text.splitlines())),
+            ),
+        )
+    facts: list[EJBFact] = []
+    sessions: dict[str, tuple[str, tuple[tuple[str, str], ...]]] = {}
+    for session in (element for element in root.iter() if _xml_local_name(element.tag) == "session"):
+        ejb_name = _xml_child_text(session, "ejb-name")
+        bean_class = _xml_child_text(session, "ejb-class")
+        session_type = (_xml_child_text(session, "session-type") or "").lower()
+        session_line = _xml_descriptor_line(text, "session", ejb_name)
+        subject = bean_class or ejb_name or path.stem
+        if not ejb_name or not bean_class or not session_type:
+            incomplete_target = (
+                _xml_child_text(session, "business-local")
+                or _xml_child_text(session, "business-remote")
+                or _xml_child_text(session, "local")
+                or _xml_child_text(session, "remote")
+            )
+            facts.append(
+                EJBFact(
+                    "ejb_unresolved",
+                    subject,
+                    incomplete_target or bean_class,
+                    "EJB descriptor Session Bean is incomplete; ejb-name, ejb-class, and session-type are required.",
+                    path,
+                    session_line,
+                    session_line,
+                )
+            )
+            continue
+        if session_type not in {"stateless", "stateful", "singleton"}:
+            facts.append(
+                EJBFact(
+                    "ejb_unresolved",
+                    subject,
+                    _xml_child_text(session, "business-local")
+                    or _xml_child_text(session, "business-remote")
+                    or bean_class,
+                    f"EJB descriptor session-type {session_type!r} is not supported by this local EJB slice.",
+                    path,
+                    session_line,
+                    session_line,
+                )
+            )
+            continue
+        interface_entries: list[tuple[str, str]] = []
+        for tag, view in (
+            ("business-local", "local"),
+            ("business-remote", "remote"),
+            ("local", "local"),
+            ("remote", "remote"),
+        ):
+            interface_name = _xml_child_text(session, tag)
+            if interface_name:
+                interface_entries.append((interface_name, view))
+        if not interface_entries:
+            facts.append(
+                EJBFact(
+                    "ejb_unresolved",
+                    subject,
+                    bean_class,
+                    "EJB descriptor Session Bean does not declare a supported local or remote business interface.",
+                    path,
+                    session_line,
+                    session_line,
+                )
+            )
+        sessions[ejb_name or subject] = (bean_class, tuple(interface_entries))
+        facts.append(
+            EJBFact(
+                "session_bean",
+                bean_class,
+                None,
+                session_type,
+                path,
+                session_line,
+                session_line,
+            )
+        )
+        for interface_name, view in interface_entries:
+            interface_line = _xml_descriptor_line(text, "business-" + view, interface_name)
+            if interface_line == 1:
+                interface_line = _xml_descriptor_line(text, view, interface_name)
+            facts.append(
+                EJBFact(
+                    "interface_view",
+                    interface_name,
+                    None,
+                    view,
+                    path,
+                    interface_line,
+                    interface_line,
+                )
+            )
+            facts.append(
+                EJBFact(
+                    "type_implements",
+                    bean_class,
+                    interface_name,
+                    None,
+                    path,
+                    interface_line,
+                    interface_line,
+                )
+            )
+
+    for reference in (
+        element
+        for element in root.iter()
+        if _xml_local_name(element.tag) in {"ejb-ref", "ejb-local-ref", "ejb-remote-ref"}
+    ):
+        reference_tag = _xml_local_name(reference.tag)
+        reference_name = _xml_child_text(reference, "ejb-ref-name")
+        link = _xml_child_text(reference, "ejb-link")
+        interfaces: list[tuple[str, str]] = []
+        for tag, view in (
+            ("business-local", "local"),
+            ("business-remote", "remote"),
+            ("local", "local"),
+            ("remote", "remote"),
+        ):
+            interface_name = _xml_child_text(reference, tag)
+            if interface_name:
+                interfaces.append((interface_name, view))
+        linked_session = sessions.get(link or "")
+        if not interfaces and linked_session is not None:
+            interfaces.extend(linked_session[1])
+        reference_line = _xml_descriptor_line(text, reference_tag, reference_name or link)
+        if not link:
+            facts.append(
+                EJBFact(
+                    "ejb_unresolved",
+                    reference_name or path.stem,
+                    interfaces[0][0] if interfaces else None,
+                    "EJB descriptor reference has no ejb-link; naming indirection remains unresolved.",
+                    path,
+                    reference_line,
+                    reference_line,
+                )
+            )
+            continue
+        if linked_session is None:
+            facts.append(
+                EJBFact(
+                    "ejb_unresolved",
+                    reference_name or link,
+                    interfaces[0][0] if interfaces else None,
+                    f"EJB descriptor reference link {link} does not identify a local Session Bean.",
+                    path,
+                    reference_line,
+                    reference_line,
+                )
+            )
+            continue
+        if interfaces and any(
+            (interface_name, view) not in set(linked_session[1])
+            for interface_name, view in interfaces
+        ):
+            facts.append(
+                EJBFact(
+                    "ejb_unresolved",
+                    reference_name or link,
+                    interfaces[0][0] if interfaces else None,
+                    "EJB descriptor reference business interface conflicts with its ejb-link.",
+                    path,
+                    reference_line,
+                    reference_line,
+                )
+            )
+            continue
+        if not reference_name or not interfaces:
+            facts.append(
+                EJBFact(
+                    "ejb_unresolved",
+                    reference_name or link or path.stem,
+                    None,
+                    "EJB descriptor reference is incomplete; a reference name and business interface are required.",
+                    path,
+                    reference_line,
+                    reference_line,
+                )
+            )
+            continue
+        injection_targets = [
+            target
+            for target in reference.iter()
+            if _xml_local_name(target.tag) == "injection-target"
+        ]
+        if not injection_targets:
+            facts.append(
+                EJBFact(
+                    "ejb_unresolved",
+                    reference_name,
+                    interfaces[0][0],
+                    "EJB descriptor reference has no explicit injection target; runtime naming resolution remains unresolved.",
+                    path,
+                    reference_line,
+                    reference_line,
+                )
+            )
+            continue
+        for injection_target in injection_targets:
+            target_class = _xml_child_text(injection_target, "injection-target-class")
+            target_name = _xml_child_text(injection_target, "injection-target-name")
+            target_line = _xml_descriptor_line(text, "injection-target-name", target_name) or reference_line
+            if not target_class or not target_name:
+                facts.append(
+                    EJBFact(
+                        "ejb_unresolved",
+                        reference_name,
+                        interfaces[0][0],
+                        "EJB descriptor injection target is incomplete.",
+                        path,
+                        target_line,
+                        target_line,
+                    )
+                )
+                continue
+            for interface_name, _view in interfaces:
+                facts.append(
+                    EJBFact(
+                        "ejb_injection",
+                        f"{target_class}#{target_name}",
+                        interface_name,
+                        f"field:{target_name}",
+                        path,
+                        target_line,
+                        target_line,
+                    )
+                )
+    return tuple(facts)
+
+
+def _ejb_descriptor_conflicts(facts: Iterable[EJBFact]) -> tuple[EJBFact, ...]:
+    grouped: dict[tuple[str, str], list[EJBFact]] = {}
+    for fact in facts:
+        if fact.kind not in {"session_bean", "interface_view"}:
+            continue
+        grouped.setdefault((fact.kind, fact.subject), []).append(fact)
+    conflicts: list[EJBFact] = []
+    for (kind, subject), entries in grouped.items():
+        values = {entry.value for entry in entries}
+        if len(values) < 2:
+            continue
+        first = entries[0]
+        conflicts.append(
+            EJBFact(
+                "ejb_unresolved",
+                subject,
+                None,
+                f"Conflicting annotation and descriptor EJB {kind} evidence remains unresolved.",
+                first.path,
+                first.start_line,
+                first.end_line,
+            )
+        )
+    return tuple(conflicts)
+
+
+def _ejb_conflicting_subjects(facts: Iterable[EJBFact], kind: str) -> set[str]:
+    values_by_subject: dict[str, set[str | None]] = {}
+    for fact in facts:
+        if fact.kind == kind:
+            values_by_subject.setdefault(fact.subject, set()).add(fact.value)
+    return {
+        subject for subject, values in values_by_subject.items() if len(values) > 1
+    }
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", maxsplit=1)[-1].rsplit(":", maxsplit=1)[-1]
+
+
+def _xml_child_text(element, name: str) -> str | None:
+    for child in element:
+        if _xml_local_name(child.tag) == name:
+            value = "".join(child.itertext()).strip()
+            return value or None
+    return None
+
+
+def _xml_descriptor_line(text: str, tag: str, value: str | None = None) -> int:
+    if value:
+        pattern = re.compile(rf"<(?:(?:[A-Za-z_$][\w$.-]*):)?{re.escape(tag)}\b[^>]*>[^<]*{re.escape(value)}", re.IGNORECASE)
+        match = pattern.search(text)
+        if match:
+            return text.count("\n", 0, match.start()) + 1
+    pattern = re.compile(rf"<(?:(?:[A-Za-z_$][\w$.-]*):)?{re.escape(tag)}\b", re.IGNORECASE)
+    match = pattern.search(text)
+    return text.count("\n", 0, match.start()) + 1 if match else 1
 
 
 def _ejb_java_facts(path: Path, source: bytes) -> tuple[EJBFact, ...]:
