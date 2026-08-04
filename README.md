@@ -89,9 +89,10 @@ The current WildFly slice can recognize and connect evidence for:
 - `@Stateless`, `@Stateful`, and `@Singleton` Session Beans;
 - explicit interface-to-implementation relationships in both target directions;
 - local and remote view metadata, including uncertainty about consumers outside the Repository Index; and
+- unique `@EJB` field and setter Injection Points with explicit invocation evidence and medium-confidence container dispatch; and
 - ordered Evidence Chains for the relationship facts supporting each conclusion.
 
-EJB Injection Points and explicit `ejb-jar.xml` references are staged follow-up tickets. Inherited EJB Business Interfaces are supported with conservative structural method matching; message-driven beans, CDI, JNDI, and other container mechanisms remain unresolved or out of scope for the current slice.
+Explicit `ejb-jar.xml` references are a staged follow-up ticket. Inherited EJB Business Interfaces and injection-backed dispatch are supported with conservative structural matching; message-driven beans, CDI, JNDI naming selection, and other container mechanisms remain unresolved or out of scope for the current slice.
 
 ### Profiles, reports, and evidence navigation
 
@@ -229,7 +230,7 @@ Run the repository test suite with:
 python -m unittest discover -s tests -v
 ```
 
-The current test suite covers repository discovery, Java structural facts, direct callers and callees, ambiguity, incremental refresh, Spring configuration, profiles, properties, YAML, XML, bounded evidence navigation, WildFly EJB contracts, and CLI text/JSON consistency. The latest validation run completed 84 tests successfully.
+The current test suite covers repository discovery, Java structural facts, direct callers and callees, ambiguity, incremental refresh, Spring configuration, profiles, properties, YAML, XML, bounded evidence navigation, WildFly EJB contracts, injection-backed dispatch, and CLI text/JSON consistency. The latest validation run completed 92 tests successfully.
 
 ## Design principles
 
@@ -242,4 +243,4 @@ The current test suite covers repository discovery, Java structural facts, direc
 
 ## Direction of future work
 
-Future stages may add EJB Injection Points, explicit EJB descriptors, requirement/diff/API targets, deeper Java resolution, verified HTTP/REST cross-repository analysis, Workspace Catalog support, Quarkus, and additional framework or language adapters. Those capabilities are not part of the current release and should not be inferred from the current reports.
+Future stages may add explicit EJB descriptors, richer container naming resolution, requirement/diff/API targets, deeper Java resolution, verified HTTP/REST cross-repository analysis, Workspace Catalog support, Quarkus, and additional framework or language adapters. Those capabilities are not part of the current release and should not be inferred from the current reports.

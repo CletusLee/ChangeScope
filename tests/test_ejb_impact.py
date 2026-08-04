@@ -668,6 +668,301 @@ import javax.ejb.Stateless;
                 )
             )
 
+    def test_reports_javax_and_jakarta_field_and_setter_injection_and_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/Service.java",
+                """package example;
+import javax.ejb.Local;
+@Local interface Service { void run(); }
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/ServiceBean.java",
+                """package example;
+import javax.ejb.Stateless;
+@Stateless class ServiceBean implements Service { public void run() {} }
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/Consumers.java",
+                """package example;
+import javax.ejb.EJB;
+class JavaxConsumer {
+    @EJB private Service service;
+    void use() { service.run(); }
+}
+class JakartaConsumer {
+    private Service service;
+    @jakarta.ejb.EJB public void setService(Service service) { this.service = service; }
+    void use() { service.run(); }
+}
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "Service#run"))
+
+            injections = [
+                relationship
+                for relationship in result.relationships
+                if relationship.kind == "ejb_injection"
+            ]
+            dispatches = [
+                relationship
+                for relationship in result.relationships
+                if relationship.kind == "ejb_container_dispatch"
+            ]
+            self.assertEqual(len(injections), 2)
+            self.assertEqual(len(dispatches), 2)
+            self.assertTrue(all(relationship.confidence == "medium" for relationship in dispatches))
+            self.assertTrue(all("invocation:" in relationship.evidence_chain[1] for relationship in dispatches))
+            self.assertTrue(all(any(handle.startswith("ejb:") for handle in relationship.evidence_chain) for relationship in injections))
+
+            bean_result = application.execute(ImpactRequest(repository, "ServiceBean#run"))
+            self.assertEqual(
+                len(
+                    [
+                        relationship
+                        for relationship in bean_result.relationships
+                        if relationship.kind == "ejb_container_dispatch"
+                    ]
+                ),
+                2,
+            )
+
+    def test_keeps_multiple_ejb_candidates_unresolved_for_an_injection_point(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/Ambiguous.java",
+                """package example;
+import javax.ejb.EJB;
+import javax.ejb.Local;
+import javax.ejb.Stateless;
+@Local interface Service { void run(); }
+@Stateless class FirstServiceBean implements Service { public void run() {} }
+@Stateless class SecondServiceBean implements Service { public void run() {} }
+class Consumer { @EJB private Service service; void use() { service.run(); } }
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "Service#run"))
+
+            self.assertFalse(
+                any(
+                    relationship.kind == "ejb_container_dispatch"
+                    for relationship in result.relationships
+                )
+            )
+            self.assertTrue(
+                any("Multiple eligible Session Beans" in item.message for item in result.unresolved_items)
+            )
+
+    def test_reports_unique_container_dispatch_without_an_explicit_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/NoCall.java",
+                """package example;
+import javax.ejb.EJB;
+import javax.ejb.Local;
+import javax.ejb.Stateless;
+@Local interface Service { void run(); }
+@Stateless class ServiceBean implements Service { public void run() {} }
+class Consumer { @EJB private Service service; }
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "Service#run"))
+
+            dispatch = next(
+                relationship
+                for relationship in result.relationships
+                if relationship.kind == "ejb_container_dispatch"
+            )
+            self.assertEqual(dispatch.caller, "example.Consumer#service")
+            self.assertEqual(dispatch.confidence, "medium")
+            self.assertFalse(any(handle.startswith("invocation:") for handle in dispatch.evidence_chain))
+
+    def test_leaves_injected_calls_with_wrong_argument_count_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/Arity.java",
+                """package example;
+import javax.ejb.EJB;
+import javax.ejb.Local;
+import javax.ejb.Stateless;
+@Local interface Service { void run(String value); }
+@Stateless class ServiceBean implements Service { public void run(String value) {} }
+class Consumer { @EJB private Service service; void use() { service.run(); } }
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "Service#run"))
+
+            self.assertFalse(
+                any(
+                    relationship.kind == "ejb_container_dispatch"
+                    for relationship in result.relationships
+                )
+            )
+            self.assertTrue(any("argument count" in item.message for item in result.unresolved_items))
+
+    def test_leaves_shadowed_injected_receivers_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/Shadowed.java",
+                """package example;
+import javax.ejb.EJB;
+import javax.ejb.Local;
+import javax.ejb.Stateless;
+@Local interface Service { void run(); }
+@Stateless class ServiceBean implements Service { public void run() {} }
+class Consumer {
+    @EJB private Service service;
+    void use(Service service) { service.run(); }
+}
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "Service#run"))
+
+            self.assertFalse(
+                any(
+                    relationship.kind == "ejb_container_dispatch"
+                    for relationship in result.relationships
+                )
+            )
+            self.assertTrue(any("receiver scope" in item.message for item in result.unresolved_items))
+
+    def test_withholds_dispatch_when_the_session_bean_method_signature_is_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/Signature.java",
+                """package example;
+import javax.ejb.EJB;
+import javax.ejb.Local;
+import javax.ejb.Stateless;
+@Local interface Service { void run(String value); }
+@Stateless class ServiceBean implements Service { public void run(Integer value) {} }
+class Consumer { @EJB private Service service; }
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "Service#run"))
+
+            self.assertFalse(
+                any(
+                    relationship.kind == "ejb_container_dispatch"
+                    for relationship in result.relationships
+                )
+            )
+            self.assertTrue(any("matching Session Bean" in item.message for item in result.unresolved_items))
+
+    def test_connects_child_typed_injection_when_targeting_an_inherited_parent_method(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/InheritedInjection.java",
+                """package example;
+import javax.ejb.EJB;
+import javax.ejb.Local;
+import javax.ejb.Stateless;
+@Local interface ParentService { void run(); }
+interface ChildService extends ParentService {}
+@Stateless class ServiceBean implements ChildService { public void run() {} }
+class Consumer {
+    @EJB private ChildService child;
+    @EJB private ParentService parent;
+    void use() { child.run(); }
+    void useParent() { parent.run(); }
+}
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "ParentService#run"))
+
+            self.assertTrue(
+                any(
+                    relationship.kind == "ejb_injection"
+                    and relationship.caller == "example.Consumer#child"
+                    for relationship in result.relationships
+                )
+            )
+            dispatch = next(
+                relationship
+                for relationship in result.relationships
+                if relationship.kind == "ejb_container_dispatch"
+            )
+            self.assertEqual(dispatch.caller, "example.Consumer#use")
+            self.assertTrue(any("InheritedInjection.java" in handle for handle in dispatch.evidence_chain))
+            self.assertFalse(any("Invocation named run" in item.message for item in result.unresolved_items))
+
+            bean_result = application.execute(ImpactRequest(repository, "ServiceBean#run"))
+            self.assertEqual(
+                len(
+                    [
+                        relationship
+                        for relationship in bean_result.relationships
+                        if relationship.kind == "ejb_container_dispatch"
+                    ]
+                ),
+                2,
+            )
+
+    def test_reports_naming_based_ejb_selection_as_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/Naming.java",
+                """package example;
+import javax.ejb.EJB;
+import javax.ejb.Local;
+@Local interface Service { void run(); }
+class Consumer {
+    @EJB(beanName = "legacyService") private Service service;
+    void use() { service.run(); }
+}
+class NamedConsumers {
+    @EJB(mappedName = "legacy/mapped") private Service mapped;
+    @EJB(lookup = "java:global/legacy") private Service lookedUp;
+}
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "Service#run"))
+
+            self.assertFalse(
+                any(
+                    relationship.kind == "ejb_injection"
+                    for relationship in result.relationships
+                )
+            )
+            messages = " ".join(item.message for item in result.unresolved_items)
+            self.assertIn("beanName", messages)
+            self.assertIn("mappedName", messages)
+            self.assertIn("lookup", messages)
+
     @staticmethod
     def _write(path: Path, contents: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

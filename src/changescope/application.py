@@ -73,6 +73,7 @@ class JavaInvocation:
     start_line: int
     end_line: int
     is_test: bool
+    argument_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -530,7 +531,7 @@ def _direct_relationships(
     connection = sqlite3.connect(database_path)
     try:
         rows = connection.execute(
-            """SELECT receiver, caller, path, start_line, end_line, is_test
+            """SELECT receiver, caller, path, start_line, end_line, is_test, argument_count
             FROM java_invocations WHERE name = ? ORDER BY path, start_line""",
             (method_name,),
         ).fetchall()
@@ -543,15 +544,22 @@ def _direct_relationships(
             """SELECT qualified_name, name, signature, is_private FROM java_declarations
             WHERE kind = 'method'"""
         ).fetchall()
+        ejb_facts = tuple(
+            EJBFact(kind, subject, fact_target, value, Path(path), start_line, end_line)
+            for kind, subject, fact_target, value, path, start_line, end_line in connection.execute(
+                """SELECT kind, subject, target, value, path, start_line, end_line
+                FROM ejb_facts"""
+            ).fetchall()
+        )
     finally:
         connection.close()
     relationships: list[ImpactRelationship] = []
     unresolved_items = [
         _unresolved(
-            "Structural analysis does not resolve receiver types, overload dispatch, inheritance, reflection, dependency injection, or framework dispatch."
+            "Structural analysis does not resolve receiver types, overload dispatch, inheritance, reflection, or unsupported framework dispatch."
         )
     ]
-    for receiver, caller, path, start_line, end_line, is_test in rows:
+    for receiver, caller, path, start_line, end_line, is_test, _argument_count in rows:
         source_path = Path(path)
         relationship_kind = None
         confidence = ""
@@ -562,6 +570,13 @@ def _direct_relationships(
             relationship_kind = "possible_caller"
             confidence = "medium"
         else:
+            if caller and any(
+                _ejb_injection_receiver_matches(injection, receiver, caller)
+                and _ejb_injection_targets_owner(injection, owner, ejb_facts)
+                for injection in ejb_facts
+                if injection.kind == "ejb_injection"
+            ):
+                continue
             unresolved_items.append(
                 _unresolved(
                     f"Invocation named {method_name} was not asserted because its receiver type is unresolved.",
@@ -656,6 +671,11 @@ def _ejb_relationships(
         declarations = connection.execute(
             """SELECT kind, qualified_name, signature, path, start_line, end_line
             FROM java_declarations WHERE kind IN ('class', 'interface', 'method')"""
+        ).fetchall()
+        invocations = connection.execute(
+            """SELECT name, receiver, caller, path, start_line, end_line, argument_count
+            FROM java_invocations WHERE name = ? ORDER BY path, start_line""",
+            (method_name,),
         ).fetchall()
     finally:
         connection.close()
@@ -756,6 +776,22 @@ def _ejb_relationships(
                         )
                     )
     unique_mappings = _unique_ejb_mappings(mappings)
+    relevant_mappings = tuple(
+        mapping
+        for mapping in unique_mappings
+        if owner in {mapping[0], mapping[1]}
+        or _ejb_interface_related(mapping[0], owner, extends)
+    )
+    relevant_types = {owner}
+    relevant_types.update(mapping[0] for mapping in relevant_mappings)
+    relevant_types.update(mapping[1] for mapping in relevant_mappings)
+    relevant_types.update(
+        fact.target
+        for fact in parsed_facts
+        if fact.kind in {"type_implements", "type_extends"}
+        and fact.subject == owner
+        and fact.target
+    )
     declaration_rows = [
         (qualified_name, signature, Path(path), start_line, end_line)
         for kind, qualified_name, signature, path, start_line, end_line in declarations
@@ -763,6 +799,23 @@ def _ejb_relationships(
     ]
     relationships: list[ImpactRelationship] = []
     unresolved: list[UnresolvedItem] = []
+    seen_business_relationships: set[tuple[str, tuple[str, ...], str | None]] = set()
+    resolved_mapping_keys: set[tuple[str, str, str]] = set()
+    resolved_mapping_facts: dict[tuple[str, str, str], tuple[EJBFact, ...]] = {}
+    for fact in parsed_facts:
+        if fact.kind != "ejb_unresolved":
+            continue
+        subject_owner = fact.subject.rsplit("#", maxsplit=1)[0]
+        if fact.target in relevant_types or subject_owner in relevant_types:
+            unresolved.append(
+                _unresolved(
+                    fact.value or "EJB behavior remains unresolved.",
+                    fact.path,
+                    fact.start_line,
+                    fact.end_line,
+                    evidence_kind="ejb",
+                )
+            )
     for interface_name, bean_name, view, mapping_facts in unique_mappings:
         if owner not in {interface_name, bean_name}:
             continue
@@ -775,6 +828,18 @@ def _ejb_relationships(
             connection_data_path.parent.parent,
             target.path,
         )
+        if counterpart_declaration is None and owner == bean_name:
+            for ancestor, _ in _ejb_interface_ancestors(interface_name, extends):
+                counterpart_declaration = _matching_ejb_method(
+                    declaration_rows,
+                    ancestor,
+                    method_name,
+                    parameters,
+                    connection_data_path.parent.parent,
+                    target.path,
+                )
+                if counterpart_declaration is not None:
+                    break
         if counterpart_declaration is None:
             unresolved.append(
                 _unresolved(
@@ -822,24 +887,208 @@ def _ejb_relationships(
             _ejb_evidence_handle(fact.path, fact.start_line, fact.end_line)
             for fact in effective_mapping_facts
         )
+        mapping_key = (interface_name, bean_name, view)
+        resolved_mapping_keys.add(mapping_key)
+        resolved_mapping_facts[mapping_key] = effective_mapping_facts
         primary_fact = effective_mapping_facts[0]
+        relationship_key = (counterpart_declaration[1], evidence_chain, view)
+        if relationship_key not in seen_business_relationships:
+            relationships.append(
+                ImpactRelationship(
+                    "ejb_business_implementation",
+                    counterpart_declaration[1],
+                    primary_fact.path,
+                    primary_fact.start_line,
+                    primary_fact.end_line,
+                    evidence_chain[0],
+                    "high",
+                    evidence_chain=evidence_chain,
+                    business_view=view,
+                )
+            )
+            seen_business_relationships.add(relationship_key)
+        if view == "remote":
+            unresolved.append(
+                _unresolved(
+                    f"Remote EJB Business Interface {interface_name} may have consumers outside the local Repository Index."
+                )
+            )
+    for interface_name, bean_name, view, mapping_facts in relevant_mappings:
+        mapping_key = (interface_name, bean_name, view)
+        if mapping_key in resolved_mapping_keys:
+            continue
+        if not _ejb_interface_related(interface_name, owner, extends):
+            continue
+        counterpart_declaration = _matching_ejb_method(
+            declaration_rows,
+            bean_name,
+            method_name,
+            parameters,
+            connection_data_path.parent.parent,
+            target.path,
+        )
+        if counterpart_declaration is None:
+            continue
+        resolved_mapping_keys.add(mapping_key)
+        resolved_mapping_facts[mapping_key] = mapping_facts
+    injections = tuple(fact for fact in parsed_facts if fact.kind == "ejb_injection")
+    view_facts = {
+        fact.subject: fact
+        for fact in parsed_facts
+        if fact.kind == "interface_view"
+    }
+    for injection in injections:
+        matching_mappings = tuple(
+            mapping
+            for mapping in relevant_mappings
+            if mapping[0] == injection.target
+            and (mapping[0], mapping[1], mapping[2]) in resolved_mapping_keys
+        )
+        if not matching_mappings and injection.target not in relevant_types:
+            continue
+        candidate_beans = tuple(sorted({candidate[1] for candidate in matching_mappings}))
+        mapping = matching_mappings[0] if len(candidate_beans) == 1 else None
+        mapping_facts = (
+            resolved_mapping_facts.get((mapping[0], mapping[1], mapping[2]), mapping[3])
+            if mapping is not None
+            else (
+                view_facts[injection.target],
+            ) if injection.target in view_facts else ()
+        )
+        if not mapping_facts:
+            unresolved.append(
+                _unresolved(
+                    f"EJB Injection Point {injection.subject} does not identify a source-supported EJB Business Interface.",
+                    injection.path,
+                    injection.start_line,
+                    injection.end_line,
+                    evidence_kind="ejb",
+                )
+            )
+            continue
+        injection_handle = _ejb_evidence_handle(
+            injection.path, injection.start_line, injection.end_line
+        )
+        evidence_chain = (
+            injection_handle,
+            *tuple(
+                _ejb_evidence_handle(fact.path, fact.start_line, fact.end_line)
+                for fact in mapping_facts
+            ),
+        )
+        view = mapping[2] if mapping is not None else (mapping_facts[0].value or "local")
         relationships.append(
             ImpactRelationship(
-                "ejb_business_implementation",
-                counterpart_declaration[1],
-                primary_fact.path,
-                primary_fact.start_line,
-                primary_fact.end_line,
-                evidence_chain[0],
+                "ejb_injection",
+                injection.subject,
+                injection.path,
+                injection.start_line,
+                injection.end_line,
+                injection_handle,
                 "high",
                 evidence_chain=evidence_chain,
                 business_view=view,
             )
         )
-        if view == "remote":
+        if len(candidate_beans) > 1:
             unresolved.append(
                 _unresolved(
-                    f"Remote EJB Business Interface {interface_name} may have consumers outside the local Repository Index."
+                    f"Multiple eligible Session Beans remain for EJB Injection Point {injection.subject}; container dispatch was not selected by name similarity.",
+                    injection.path,
+                    injection.start_line,
+                    injection.end_line,
+                    evidence_kind="ejb",
+                )
+            )
+            continue
+        if not candidate_beans:
+            unresolved.append(
+                _unresolved(
+                    f"No source-supported Session Bean was found for EJB Injection Point {injection.subject}.",
+                    injection.path,
+                    injection.start_line,
+                    injection.end_line,
+                    evidence_kind="ejb",
+                )
+            )
+            continue
+        dispatch_mapping = next(
+            candidate for candidate in matching_mappings if candidate[1] == candidate_beans[0]
+        )
+        dispatch_facts = resolved_mapping_facts.get(
+            (dispatch_mapping[0], dispatch_mapping[1], dispatch_mapping[2]),
+            dispatch_mapping[3],
+        )
+        expected_argument_count = len(_split_java_parameters(parameters))
+        matched_invocations = []
+        invalid_invocations = []
+        for _name, receiver, caller, path, start_line, end_line, argument_count in invocations:
+            if not caller or not _ejb_injection_receiver_matches(injection, receiver, caller):
+                continue
+            if _ejb_receiver_is_shadowed(
+                connection_data_path.parent.parent,
+                injection,
+                Path(path),
+                caller,
+                receiver,
+                start_line,
+            ):
+                invalid_invocations.append((path, start_line, end_line, argument_count, "scope"))
+                continue
+            if argument_count != expected_argument_count:
+                invalid_invocations.append((path, start_line, end_line, argument_count, "arity"))
+                continue
+            matched_invocations.append((caller, path, start_line, end_line))
+            invocation_handle = _evidence_handle("invocation", Path(path), start_line, end_line)
+            dispatch_chain = (
+                injection_handle,
+                invocation_handle,
+                *tuple(
+                    _ejb_evidence_handle(fact.path, fact.start_line, fact.end_line)
+                    for fact in dispatch_facts
+                ),
+            )
+            relationships.append(
+                ImpactRelationship(
+                    "ejb_container_dispatch",
+                    caller,
+                    Path(path),
+                    start_line,
+                    end_line,
+                    invocation_handle,
+                    "medium",
+                    evidence_chain=dispatch_chain,
+                    business_view=dispatch_mapping[2],
+                )
+            )
+        for path, start_line, end_line, argument_count, reason in invalid_invocations:
+            expected = "unknown" if argument_count is None else str(expected_argument_count)
+            detail = (
+                "receiver scope is unresolved"
+                if reason == "scope"
+                else f"argument count does not match the indexed EJB method (expected {expected})"
+            )
+            unresolved.append(
+                _unresolved(
+                    f"Invocation through EJB Injection Point {injection.subject} was not connected because its {detail}.",
+                    Path(path),
+                    start_line,
+                    end_line,
+                    evidence_kind="invocation",
+                )
+            )
+        if not matched_invocations and not invalid_invocations:
+            relationships.append(
+                ImpactRelationship(
+                    "ejb_container_dispatch",
+                    injection.subject,
+                    injection.path,
+                    injection.start_line,
+                    injection.end_line,
+                    injection_handle,
+                    "medium",
+                    evidence_chain=evidence_chain,
+                    business_view=dispatch_mapping[2],
                 )
             )
     return tuple(relationships), tuple(unresolved)
@@ -880,6 +1129,126 @@ def _ejb_interface_ancestors(
             ancestors.append((parent, next_path))
             queue.append((parent, next_path, visited | {parent}))
     return tuple(ancestors)
+
+
+def _ejb_interface_related(
+    interface_name: str, target_name: str, extends: Iterable[EJBFact]
+) -> bool:
+    return interface_name == target_name or any(
+        ancestor == target_name
+        for ancestor, _ in _ejb_interface_ancestors(interface_name, extends)
+    )
+
+
+def _ejb_injection_receiver_matches(
+    injection: EJBFact, receiver: str | None, caller: str
+) -> bool:
+    if not receiver or not injection.value:
+        return False
+    injection_owner = injection.subject.rsplit("#", maxsplit=1)[0]
+    caller_owner = caller.rsplit("#", maxsplit=1)[0]
+    if injection_owner != caller_owner:
+        return False
+    _, _, property_name = injection.value.partition(":")
+    normalized_receiver = receiver.strip()
+    if normalized_receiver.startswith("this."):
+        normalized_receiver = normalized_receiver[5:]
+    return normalized_receiver == property_name
+
+
+def _ejb_receiver_is_shadowed(
+    repository_root: Path,
+    injection: EJBFact,
+    path: Path,
+    caller: str,
+    receiver: str | None,
+    line: int,
+) -> bool:
+    if receiver is None or receiver.strip().startswith("this.") or not injection.value:
+        return False
+    _, _, property_name = injection.value.partition(":")
+    try:
+        source = (repository_root / path).read_bytes()
+    except OSError:
+        return True
+    parser = Parser(Language(tree_sitter_java.language()))
+    tree = parser.parse(source)
+    method_name = caller.rsplit("#", maxsplit=1)[-1]
+    for node in _tree_nodes(tree.root_node):
+        if node.type != "method_declaration":
+            continue
+        if _node_text(node.child_by_field_name("name"), source) != method_name:
+            continue
+        if not (node.start_point.row + 1 <= line <= node.end_point.row + 1):
+            continue
+        parameters = node.child_by_field_name("parameters")
+        parameter_names = {
+            _node_text(parameter.child_by_field_name("name"), source)
+            for parameter in parameters.named_children
+            if parameter.child_by_field_name("name") is not None
+        } if parameters is not None else set()
+        local_names = {
+            _node_text(declarator.child_by_field_name("name"), source)
+            for descendant in _tree_nodes(node)
+            if descendant.type == "local_variable_declaration"
+            for declarator in descendant.named_children
+            if declarator.type == "variable_declarator"
+            and declarator.child_by_field_name("name") is not None
+        }
+        return property_name in parameter_names or property_name in local_names
+    return True
+
+
+def _tree_nodes(root) -> Iterable:
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(reversed(node.named_children))
+
+
+def _ejb_injection_targets_owner(
+    injection: EJBFact, owner: str, facts: Iterable[EJBFact]
+) -> bool:
+    if injection.target == owner:
+        return True
+    related_types = {
+        fact.target
+        for fact in facts
+        if fact.kind == "type_implements" and fact.subject == owner and fact.target
+    }
+    related_types.update(
+        fact.target
+        for fact in facts
+        if fact.kind == "type_extends" and fact.subject == owner and fact.target
+    )
+    if injection.target in related_types:
+        return True
+    parents_by_child: dict[str, set[str]] = {}
+    for fact in facts:
+        if fact.kind in {"type_implements", "type_extends"} and fact.subject and fact.target:
+            parents_by_child.setdefault(fact.subject, set()).add(fact.target)
+    queue = [owner]
+    visited: set[str] = set()
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        if current == injection.target:
+            return True
+        queue.extend(parents_by_child.get(current, ()))
+    queue = [injection.target] if injection.target else []
+    visited.clear()
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        if current == owner:
+            return True
+        queue.extend(parents_by_child.get(current, ()))
+    return False
 
 
 def _matching_ejb_method(
@@ -1832,6 +2201,120 @@ def _ejb_java_facts(path: Path, source: bytes) -> tuple[EJBFact, ...]:
                             declaration_line,
                         )
                     )
+        if current_types and node.type == "field_declaration":
+            owner = _qualified_type_name(package_name, current_types)
+            modifiers = next(
+                (child for child in node.named_children if child.type == "modifiers"),
+                None,
+            )
+            field_type = _node_text(node.child_by_field_name("type"), source)
+            declarators = tuple(
+                child for child in node.named_children if child.type == "variable_declarator"
+            )
+            for annotation_name, annotation_node, arguments in _ejb_annotations(
+                modifiers, source, imports
+            ):
+                if annotation_name != "EJB":
+                    continue
+                targets = _ejb_annotation_types(arguments, package_name, imports)
+                target = targets[0] if targets else _resolve_java_type(field_type, package_name, imports)
+                unsupported = _ejb_unsupported_injection_attributes(arguments)
+                for declarator in declarators:
+                    field_name = _node_text(declarator.child_by_field_name("name"), source)
+                    subject = f"{owner}#{field_name}"
+                    if unsupported:
+                        facts.append(
+                            EJBFact(
+                                "ejb_unresolved",
+                                subject,
+                                target,
+                                "EJB Injection Point uses unsupported naming attributes: "
+                                + ", ".join(unsupported),
+                                path,
+                                annotation_node.start_point.row + 1,
+                                annotation_node.end_point.row + 1,
+                            )
+                        )
+                    else:
+                        facts.append(
+                            EJBFact(
+                                "ejb_injection",
+                                subject,
+                                target,
+                                f"field:{field_name}",
+                                path,
+                                annotation_node.start_point.row + 1,
+                                annotation_node.end_point.row + 1,
+                            )
+                        )
+        if current_types and node.type == "method_declaration":
+            owner = _qualified_type_name(package_name, current_types)
+            modifiers = next(
+                (child for child in node.named_children if child.type == "modifiers"),
+                None,
+            )
+            method_name = _node_text(node.child_by_field_name("name"), source)
+            parameters_node = node.child_by_field_name("parameters")
+            parameter_nodes = (
+                tuple(parameters_node.named_children)
+                if parameters_node is not None
+                else ()
+            )
+            for annotation_name, annotation_node, arguments in _ejb_annotations(
+                modifiers, source, imports
+            ):
+                if annotation_name != "EJB":
+                    continue
+                unsupported = _ejb_unsupported_injection_attributes(arguments)
+                if not method_name.startswith("set") or len(parameter_nodes) != 1:
+                    message = "EJB Injection Point method is not a single-argument setter."
+                    if unsupported:
+                        message += " Unsupported naming attributes: " + ", ".join(unsupported) + "."
+                    facts.append(
+                        EJBFact(
+                            "ejb_unresolved",
+                            f"{owner}#{method_name}",
+                            None,
+                            message,
+                            path,
+                            annotation_node.start_point.row + 1,
+                            annotation_node.end_point.row + 1,
+                        )
+                    )
+                    continue
+                parameter_type = _node_text(parameter_nodes[0].child_by_field_name("type"), source)
+                targets = _ejb_annotation_types(arguments, package_name, imports)
+                target = targets[0] if targets else _resolve_java_type(
+                    parameter_type, package_name, imports
+                )
+                subject = f"{owner}#{method_name}"
+                if unsupported:
+                    facts.append(
+                        EJBFact(
+                            "ejb_unresolved",
+                            subject,
+                            target,
+                            "EJB Injection Point uses unsupported naming attributes: "
+                            + ", ".join(unsupported),
+                            path,
+                            annotation_node.start_point.row + 1,
+                            annotation_node.end_point.row + 1,
+                        )
+                    )
+                else:
+                    property_name = method_name[3:]
+                    property_name = property_name[:1].lower() + property_name[1:]
+                    facts.append(
+                        EJBFact(
+                            "ejb_injection",
+                            subject,
+                            target,
+                            f"setter:{property_name}",
+                            path,
+                            annotation_node.start_point.row + 1,
+                            annotation_node.end_point.row + 1,
+                        )
+                    )
         for child in node.named_children:
             visit(child, current_types)
 
@@ -1893,6 +2376,11 @@ def _ejb_annotation_types(
     for value in re.findall(r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.class", arguments):
         values.append(_resolve_java_type(value, package_name, imports))
     return tuple(values)
+
+
+def _ejb_unsupported_injection_attributes(arguments: str) -> tuple[str, ...]:
+    names = set(re.findall(r"\b([A-Za-z_$][\w$]*)\s*=", arguments))
+    return tuple(sorted(names & {"beanName", "mappedName", "lookup", "name"}))
 
 
 def _ejb_type_clause(node, clause_type: str, source: bytes) -> tuple[str, ...]:
@@ -2690,6 +3178,7 @@ def _collect_java_facts(
             name = _node_text(current.child_by_field_name("name"), source)
             receiver_node = current.child_by_field_name("object")
             receiver = _node_text(receiver_node, source) if receiver_node is not None else None
+            arguments_node = current.child_by_field_name("arguments")
             invocations.append(
                 JavaInvocation(
                     name,
@@ -2699,6 +3188,7 @@ def _collect_java_facts(
                     current.start_point.row + 1,
                     current.end_point.row + 1,
                     is_test,
+                    len(arguments_node.named_children) if arguments_node is not None else None,
                 )
             )
         if cursor.goto_first_child():
@@ -2892,7 +3382,8 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         path TEXT NOT NULL,
         start_line INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
-        is_test INTEGER NOT NULL
+        is_test INTEGER NOT NULL,
+        argument_count INTEGER
         )"""
     )
     connection.execute(
@@ -2938,12 +3429,25 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         connection.execute(
             "ALTER TABLE java_declarations ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0"
         )
+    invocation_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(java_invocations)")
+    }
+    invocation_schema_changed = "argument_count" not in invocation_columns
+    if invocation_schema_changed:
+        connection.execute(
+            "ALTER TABLE java_invocations ADD COLUMN argument_count INTEGER"
+        )
     source_file_columns = {row[1] for row in connection.execute("PRAGMA table_info(source_files)")}
     if "content_hash" not in source_file_columns:
         connection.execute(
             "ALTER TABLE source_files ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
         )
-    return declaration_schema_changed or spring_schema_missing or ejb_schema_missing
+    return (
+        declaration_schema_changed
+        or invocation_schema_changed
+        or spring_schema_missing
+        or ejb_schema_missing
+    )
 
 
 def _write_metadata(
@@ -3019,8 +3523,8 @@ def _insert_java_facts(
     )
     connection.executemany(
         """INSERT INTO java_invocations(
-        name, receiver, caller, path, start_line, end_line, is_test
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        name, receiver, caller, path, start_line, end_line, is_test, argument_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             (
                 invocation.name,
@@ -3030,6 +3534,7 @@ def _insert_java_facts(
                 invocation.start_line,
                 invocation.end_line,
                 int(invocation.is_test),
+                invocation.argument_count,
             )
             for invocation in invocations
         ),
