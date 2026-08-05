@@ -21,11 +21,15 @@ ChangeScope is not a generic code-search, code-memory, or full semantic call-gra
 
 ## Current status
 
-The current release is a JRE-free Java, Spring/Spring Boot, and annotation-backed WildFly EJB local-analysis slice. It is intended to answer `Class#method` impact questions inside one repository. The application service is exposed through a small CLI today; an MCP adapter is not implemented yet.
+The current release is a JRE-free Java, Spring/Spring Boot, and annotation- and descriptor-backed WildFly EJB local-analysis slice. It is intended to answer `Class#method` impact questions inside one repository. The application service is exposed through a small CLI today; an MCP adapter is not implemented yet.
 
 The implementation has been smoke-tested against four public Spring Boot applications: [Spring Petclinic](https://github.com/spring-projects/spring-petclinic), [Spring Petclinic REST](https://github.com/spring-petclinic/spring-petclinic-rest), [Spring Petclinic Modulith](https://github.com/spring-petclinic/spring-petclinic-modulith), and the [RealWorld Spring Boot application](https://github.com/gothinkster/spring-boot-realworld-example-app). In the current validation run, all four completed indexing with zero Java parse failures and zero file-read failures; representative MVC, REST, profile-aware, event-driven, MyBatis, Security, GraphQL, and Spring-test impact queries resolved successfully.
 
 This validates the local indexing and reporting workflow. It does not claim that the reports are complete runtime dependency graphs.
+
+The WildFly EJB path has also been smoke-tested against five public quickstarts. [`ejb-remote`](https://github.com/wildfly/quickstart/tree/main/ejb-remote) exercises remote stateless and stateful business views, including bean-side `@Remote` declarations and a remote JNDI client. [`ejb-throws-exception`](https://github.com/wildfly/quickstart/tree/main/ejb-throws-exception) exercises a local business view, field `@EJB` injection, and a multi-module EAR. [`ejb-security-context-propagation`](https://github.com/wildfly/quickstart/tree/main/ejb-security-context-propagation) exercises EJB-to-EJB remote injection and WildFly client configuration. [`helloworld-mdb`](https://github.com/wildfly/quickstart/tree/main/helloworld-mdb) and [`ejb-timer`](https://github.com/wildfly/quickstart/tree/main/ejb-timer) exercise unsupported MessageDriven and timer/no-interface boundaries; those reports retain explicit unresolved items rather than guessing container behavior. All five repositories indexed with zero Java parse failures and zero file-read failures.
+
+This matrix covers the current annotation-oriented WildFly path and its explicit unsupported boundaries. It does not claim that every EJB deployment style has been observed in a public application. Descriptor-backed `ejb-jar.xml`/`jboss-ejb3.xml` projects, setter injection, EJB-aware test injection, and legacy `javax.ejb` applications remain fixture-covered until a representative Java EE/JBoss EAP project is added. Runtime deployment success, arbitrary JNDI resolution, and cross-repository traversal remain outside the local structural analysis claim.
 
 ## What it can do today
 
@@ -232,7 +236,7 @@ Run the repository test suite with:
 python -m unittest discover -s tests -v
 ```
 
-The current test suite covers repository discovery, Java structural facts, direct callers and callees, ambiguity, incremental refresh, Spring configuration, profiles, properties, YAML, XML, bounded evidence navigation, WildFly EJB contracts, injection-backed dispatch, descriptor-backed contracts, EJB-aware tests, unsupported container behavior, and CLI text/JSON consistency. The latest validation run completed 103 tests successfully.
+The current test suite covers repository discovery, Java structural facts, direct callers and callees, ambiguity, incremental refresh, Spring configuration, profiles, properties, YAML, XML, bounded evidence navigation, WildFly EJB contracts, injection-backed dispatch, descriptor-backed contracts, EJB-aware tests, unsupported container behavior, and CLI text/JSON consistency. The latest validation run completed 103 tests successfully. The public-project smoke tests above validate repository indexing and representative report paths; they do not replace the isolated fixture matrix for descriptor conflicts, ambiguous candidates, inheritance cycles, or other conservative unresolved cases.
 
 ## Design principles
 
