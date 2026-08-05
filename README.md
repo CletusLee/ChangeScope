@@ -88,12 +88,13 @@ The current WildFly slice can recognize and connect evidence for:
 - `javax.ejb` and `jakarta.ejb` `@Local` and `@Remote` business interfaces;
 - `@Stateless`, `@Stateful`, and `@Singleton` Session Beans;
 - explicit interface-to-implementation relationships in both target directions;
-- local and remote view metadata, including uncertainty about consumers outside the Repository Index; and
+- local and remote view metadata, including uncertainty about consumers outside the Repository Index;
 - unique `@EJB` field and setter Injection Points with explicit invocation evidence and medium-confidence container dispatch;
-- descriptor-backed `ejb-jar.xml` Session Beans, business views, and explicit injection targets; and
+- descriptor-backed `ejb-jar.xml` Session Beans, business views, and explicit injection targets;
+- EJB-aware test wiring under Maven/Gradle/Eclipse test source roots, reported separately from production injection; and
 - ordered Evidence Chains for the relationship facts supporting each conclusion.
 
-Descriptor conflicts, incomplete links, and naming-based selection remain explicit unresolved items. Inherited EJB Business Interfaces and injection-backed dispatch are supported with conservative structural matching; message-driven beans, CDI, JNDI naming selection, and other container mechanisms remain unresolved or out of scope for the current slice.
+Descriptor conflicts, incomplete links, and naming-based selection remain explicit unresolved items. Inherited EJB Business Interfaces and injection-backed dispatch are supported with conservative structural matching; implicit no-interface views, Session Bean class inheritance, message-driven beans, CDI, arbitrary JNDI lookup or naming selection, and other container mechanisms remain unresolved or out of scope for the current slice.
 
 ### Profiles, reports, and evidence navigation
 
@@ -231,7 +232,7 @@ Run the repository test suite with:
 python -m unittest discover -s tests -v
 ```
 
-The current test suite covers repository discovery, Java structural facts, direct callers and callees, ambiguity, incremental refresh, Spring configuration, profiles, properties, YAML, XML, bounded evidence navigation, WildFly EJB contracts, injection-backed dispatch, descriptor-backed contracts, and CLI text/JSON consistency. The latest validation run completed 99 tests successfully.
+The current test suite covers repository discovery, Java structural facts, direct callers and callees, ambiguity, incremental refresh, Spring configuration, profiles, properties, YAML, XML, bounded evidence navigation, WildFly EJB contracts, injection-backed dispatch, descriptor-backed contracts, EJB-aware tests, unsupported container behavior, and CLI text/JSON consistency. The latest validation run completed 103 tests successfully.
 
 ## Design principles
 

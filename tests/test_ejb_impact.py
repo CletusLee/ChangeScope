@@ -1021,6 +1021,66 @@ public class DescriptorBean { public void run() {} }
                 )
             )
 
+    def test_refreshes_descriptor_context_for_changed_ejb_java_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/DescriptorService.java",
+                """package example;
+public interface DescriptorService { void run(); }
+""",
+            )
+            bean_path = repository / "src/main/java/example/DescriptorBean.java"
+            self._write(
+                bean_path,
+                """package example;
+public class DescriptorBean implements DescriptorService { public void run() {} }
+""",
+            )
+            self._write(
+                repository / "src/main/resources/META-INF/ejb-jar.xml",
+                """<ejb-jar><enterprise-beans><session>
+<ejb-name>DescriptorService</ejb-name>
+<ejb-class>example.DescriptorBean</ejb-class>
+<session-type>Stateless</session-type>
+<business-local>example.DescriptorService</business-local>
+</session></enterprise-beans></ejb-jar>
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            initial = application.execute(ImpactRequest(repository, "DescriptorBean#run"))
+            self.assertFalse(any("class inheritance" in item.message for item in initial.unresolved_items))
+
+            self._write(
+                bean_path,
+                """package example;
+import javax.ejb.Stateless;
+@Stateless public class DescriptorBean implements DescriptorService { public void run() {} }
+""",
+            )
+            annotated = application.execute(ImpactRequest(repository, "DescriptorBean#run"))
+            self.assertFalse(any("Implicit no-interface" in item.message for item in annotated.unresolved_items))
+
+            self._write(
+                repository / "src/main/java/example/DescriptorBase.java",
+                """package example;
+class DescriptorBase { public void run() {} }
+""",
+            )
+            self._write(
+                bean_path,
+                """package example;
+import javax.ejb.Stateless;
+@Stateless public class DescriptorBean extends DescriptorBase implements DescriptorService {
+    public void run() {}
+}
+""",
+            )
+            inherited = application.execute(ImpactRequest(repository, "DescriptorBean#run"))
+            self.assertTrue(any("class inheritance" in item.message for item in inherited.unresolved_items))
+
     def test_reports_descriptor_ejb_reference_injection_and_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory)
@@ -1254,6 +1314,174 @@ class Consumer { private Service service; void use() { service.run(); } }
                 )
             )
             self.assertTrue(any("business interface conflicts" in item.message for item in result.unresolved_items))
+
+    def test_reports_ejb_aware_test_wiring_at_medium_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "pom.xml",
+                """<project><build><sourceDirectory>src/main/java</sourceDirectory><testSourceDirectory>src/test/java</testSourceDirectory></build></project>
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/Service.java",
+                """package example;
+import javax.ejb.Local;
+@Local public interface Service { void run(); }
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/ServiceBean.java",
+                """package example;
+import javax.ejb.Stateless;
+@Stateless public class ServiceBean implements Service { public void run() {} }
+""",
+            )
+            self._write(
+                repository / "src/test/java/example/ServiceTest.java",
+                """package example;
+import javax.ejb.EJB;
+class ServiceTest {
+    @EJB private Service service;
+    void verifiesRun() { service.run(); }
+}
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            result = application.execute(ImpactRequest(repository, "Service#run"))
+
+            test_relationship = next(
+                relationship
+                for relationship in result.relationships
+                if relationship.kind == "ejb_test"
+            )
+            self.assertEqual(test_relationship.confidence, "medium")
+            self.assertIn("ServiceTest#service", test_relationship.caller)
+            self.assertTrue(any(handle.startswith("ejb:") for handle in test_relationship.evidence_chain))
+            self.assertTrue(
+                any(
+                    relationship.kind == "ejb_container_dispatch"
+                    and relationship.caller == "example.ServiceTest#verifiesRun"
+                    for relationship in result.relationships
+                )
+            )
+            self.assertFalse(
+                any("Implicit no-interface" in item.message for item in result.unresolved_items)
+            )
+
+    def test_reports_unsupported_ejb_container_behavior_as_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/Unsupported.java",
+                """package example;
+import javax.ejb.LocalBean;
+import javax.ejb.MessageDriven;
+import javax.ejb.Stateless;
+class BaseBean { public void run() {} }
+interface PlainContract { void run(); }
+@Stateless class InheritedBean extends BaseBean { public void run() {} }
+@Stateless class NoInterfaceBean { public void run() {} }
+@Stateless class UnannotatedContractBean implements PlainContract { public void run() {} }
+@LocalBean class LocalBeanService { public void run() {} }
+@MessageDriven class MessageBean { public void onMessage() {} }
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/JndiClient.java",
+                """package example;
+import javax.naming.InitialContext;
+class JndiClient {
+    void lookup() throws Exception { new InitialContext().lookup("java:global/service"); }
+    void lookupLink() throws Exception { new InitialContext().lookupLink("java:global/service"); }
+    void doLookup() throws Exception { InitialContext.doLookup("java:global/service"); }
+}
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/DescriptorService.java",
+                """package example;
+public interface DescriptorService { void run(); }
+""",
+            )
+            self._write(
+                repository / "src/main/java/example/DescriptorInheritedBean.java",
+                """package example;
+class DescriptorBase { public void run() {} }
+public class DescriptorInheritedBean extends DescriptorBase implements DescriptorService {
+    public void run() {}
+}
+""",
+            )
+            self._write(
+                repository / "src/main/resources/META-INF/ejb-jar.xml",
+                """<ejb-jar><enterprise-beans><session>
+<ejb-name>descriptorBean</ejb-name>
+<business-local>example.DescriptorService</business-local>
+<ejb-class>example.DescriptorInheritedBean</ejb-class>
+<session-type>Stateless</session-type>
+</session></enterprise-beans></ejb-jar>
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+
+            inherited = application.execute(ImpactRequest(repository, "InheritedBean#run"))
+            no_interface = application.execute(ImpactRequest(repository, "NoInterfaceBean#run"))
+            unannotated_contract = application.execute(
+                ImpactRequest(repository, "UnannotatedContractBean#run")
+            )
+            local_bean = application.execute(ImpactRequest(repository, "LocalBeanService#run"))
+            message = application.execute(ImpactRequest(repository, "MessageBean#onMessage"))
+            jndi = application.execute(ImpactRequest(repository, "JndiClient#lookup"))
+            jndi_link = application.execute(ImpactRequest(repository, "JndiClient#lookupLink"))
+            jndi_static = application.execute(ImpactRequest(repository, "JndiClient#doLookup"))
+            descriptor = application.execute(
+                ImpactRequest(repository, "DescriptorInheritedBean#run")
+            )
+
+            self.assertTrue(any("class inheritance" in item.message for item in inherited.unresolved_items))
+            self.assertTrue(any("no-interface" in item.message for item in no_interface.unresolved_items))
+            self.assertTrue(
+                any("no-interface" in item.message for item in unannotated_contract.unresolved_items)
+            )
+            self.assertTrue(any("LocalBean" in item.message for item in local_bean.unresolved_items))
+            self.assertTrue(any("MessageDriven" in item.message for item in message.unresolved_items))
+            self.assertTrue(any("JNDI lookup" in item.message for item in jndi.unresolved_items))
+            self.assertTrue(any("JNDI lookup" in item.message for item in jndi_link.unresolved_items))
+            self.assertTrue(any("JNDI lookup" in item.message for item in jndi_static.unresolved_items))
+            self.assertTrue(any("class inheritance" in item.message for item in descriptor.unresolved_items))
+
+    def test_cli_text_and_json_expose_the_same_ejb_relationships(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self._write(
+                repository / "src/main/java/example/Parity.java",
+                """package example;
+import javax.ejb.EJB;
+import javax.ejb.Local;
+import javax.ejb.Stateless;
+@Local interface Service { void run(); }
+@Stateless class ServiceBean implements Service { public void run() {} }
+class Consumer { @EJB private Service service; void use() { service.run(); } }
+""",
+            )
+            application = ChangeScopeApplication()
+            application.execute(IndexRequest(repository))
+            text_output = io.StringIO()
+            json_output = io.StringIO()
+            with patch("changescope.cli.Path.cwd", return_value=repository), redirect_stdout(text_output):
+                self.assertEqual(main(["impact", "Service#run", "--format", "text"]), 0)
+            with patch("changescope.cli.Path.cwd", return_value=repository), redirect_stdout(json_output):
+                self.assertEqual(main(["impact", "Service#run", "--format", "json"]), 0)
+            report = json.loads(json_output.getvalue())
+            for relationship in report["relationships"]:
+                self.assertIn(
+                    f"- {relationship['kind']} {relationship['caller']} [{relationship['confidence']}]",
+                    text_output.getvalue(),
+                )
 
     @staticmethod
     def _write(path: Path, contents: str) -> None:

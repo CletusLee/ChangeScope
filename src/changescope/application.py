@@ -677,10 +677,18 @@ def _ejb_relationships(
             FROM java_invocations WHERE name = ? ORDER BY path, start_line""",
             (method_name,),
         ).fetchall()
+        test_source_roots_row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'test_source_roots'"
+        ).fetchone()
     finally:
         connection.close()
     if not facts:
         return (), ()
+    test_source_roots = tuple(
+        Path(value)
+        for value in (test_source_roots_row[0].splitlines() if test_source_roots_row else ())
+        if value
+    )
     parsed_facts = tuple(
         EJBFact(kind, subject, fact_target, value, Path(path), start_line, end_line)
         for kind, subject, fact_target, value, path, start_line, end_line in facts
@@ -1020,6 +1028,23 @@ def _ejb_relationships(
                 business_view=view,
             )
         )
+        if any(
+            injection.path == test_root or injection.path.is_relative_to(test_root)
+            for test_root in test_source_roots
+        ):
+            relationships.append(
+                ImpactRelationship(
+                    "ejb_test",
+                    injection.subject,
+                    injection.path,
+                    injection.start_line,
+                    injection.end_line,
+                    injection_handle,
+                    "medium",
+                    evidence_chain=evidence_chain,
+                    business_view=view,
+                )
+            )
         if len(candidate_beans) > 1:
             unresolved.append(
                 _unresolved(
@@ -1819,7 +1844,17 @@ def _refresh_index_if_needed(root: Path) -> None:
                 spring_facts = _analyze_spring_files(
                     {**changed_contents, **changed_configuration_contents}, declarations
                 )
-                ejb_facts = _analyze_ejb_files({**changed_contents, **changed_configuration_contents})
+                refresh_all_ejb_facts = any(
+                    Path(path).suffix.lower() == ".java"
+                    or Path(path).name.lower() in {"ejb-jar.xml", "jboss-ejb3.xml"}
+                    for path in changed_paths
+                )
+                ejb_inputs = (
+                    {**contents_by_path, **configuration_contents}
+                    if refresh_all_ejb_facts
+                    else {**changed_contents, **changed_configuration_contents}
+                )
+                ejb_facts = _analyze_ejb_files(ejb_inputs)
                 _replace_changed_source_records(
                     connection,
                     changed_paths,
@@ -1829,6 +1864,7 @@ def _refresh_index_if_needed(root: Path) -> None:
                     parse_failures,
                     spring_facts,
                     ejb_facts,
+                    replace_all_ejb_facts=refresh_all_ejb_facts,
                 )
             _write_metadata(connection, _snapshot(root), source_roots)
     finally:
@@ -2150,10 +2186,114 @@ def _analyze_ejb_files(contents_by_path: dict[Path, bytes]) -> tuple[EJBFact, ..
             facts.extend(_ejb_java_facts(path, source))
         elif path.name.lower() in {"ejb-jar.xml", "jboss-ejb3.xml"}:
             facts.extend(_ejb_descriptor_facts(path, source))
+    facts.extend(_ejb_descriptor_inheritance_facts(contents_by_path, facts))
+    facts.extend(_ejb_implicit_no_interface_facts(facts))
     facts.extend(_ejb_descriptor_conflicts(facts))
     return tuple(
         sorted(facts, key=lambda fact: (str(fact.path), fact.start_line, fact.kind, fact.subject, fact.target or ""))
     )
+
+
+def _ejb_descriptor_inheritance_facts(
+    contents_by_path: dict[Path, bytes], facts: Iterable[EJBFact]
+) -> tuple[EJBFact, ...]:
+    descriptor_sessions = {
+        fact.subject
+        for fact in facts
+        if fact.kind == "session_bean" and fact.path.suffix.lower() == ".xml"
+    }
+    if not descriptor_sessions:
+        return ()
+    existing = {
+        (fact.subject, fact.value)
+        for fact in facts
+        if fact.kind == "ejb_unresolved"
+    }
+    inheritance: list[EJBFact] = []
+    type_kinds = {"class_declaration", "record_declaration"}
+    for path, source in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        if path.suffix.lower() != ".java":
+            continue
+        parser = Parser(Language(tree_sitter_java.language()))
+        tree = parser.parse(source)
+        package_name = _package_name(tree.root_node, source)
+
+        def visit(node, enclosing_types: tuple[str, ...]) -> None:
+            if node.type in type_kinds:
+                name = _node_text(node.child_by_field_name("name"), source)
+                qualified_name = _qualified_type_name(
+                    package_name, (*enclosing_types, name)
+                )
+                if (
+                    qualified_name in descriptor_sessions
+                    and _ejb_type_clause(node, "superclass", source)
+                    and (
+                        qualified_name,
+                        "Session Bean class inheritance is not resolved by this local EJB slice.",
+                    )
+                    not in existing
+                ):
+                    declaration_line = node.start_point.row + 1
+                    inheritance.append(
+                        EJBFact(
+                            "ejb_unresolved",
+                            qualified_name,
+                            None,
+                            "Session Bean class inheritance is not resolved by this local EJB slice.",
+                            path,
+                            declaration_line,
+                            declaration_line,
+                        )
+                    )
+                next_types = (*enclosing_types, name)
+            else:
+                next_types = enclosing_types
+            for child in node.named_children:
+                visit(child, next_types)
+
+        visit(tree.root_node, ())
+    return tuple(inheritance)
+
+
+def _ejb_implicit_no_interface_facts(facts: Iterable[EJBFact]) -> tuple[EJBFact, ...]:
+    session_facts = tuple(fact for fact in facts if fact.kind == "session_bean")
+    interface_views = {
+        fact.subject for fact in facts if fact.kind == "interface_view"
+    }
+    declared_contracts = {
+        fact.subject
+        for fact in facts
+        if fact.kind == "type_implements" and fact.target in interface_views
+    }
+    declared_contracts.update(
+        fact.target
+        for fact in facts
+        if fact.kind == "bean_view" and fact.target
+    )
+    explicit_unresolved = tuple(fact for fact in facts if fact.kind == "ejb_unresolved")
+    implicit: list[EJBFact] = []
+    for session in session_facts:
+        if session.path.suffix.lower() != ".java" or session.subject in declared_contracts:
+            continue
+        if any(
+            fact.subject == session.subject
+            and fact.value
+            and ("LocalBean" in fact.value or "no-interface" in fact.value)
+            for fact in explicit_unresolved
+        ):
+            continue
+        implicit.append(
+            EJBFact(
+                "ejb_unresolved",
+                session.subject,
+                None,
+                "Implicit no-interface EJB view is not resolved by this local EJB slice.",
+                session.path,
+                session.start_line,
+                session.end_line,
+            )
+        )
+    return tuple(implicit)
 
 
 def _ejb_descriptor_facts(path: Path, source: bytes) -> tuple[EJBFact, ...]:
@@ -2554,6 +2694,21 @@ def _ejb_java_facts(path: Path, source: bytes) -> tuple[EJBFact, ...]:
                             annotation_node.end_point.row + 1,
                         )
                     )
+            if any(
+                annotation_name in {"Stateless", "Stateful", "Singleton"}
+                for annotation_name, _annotation_node, _arguments in annotations
+            ) and _ejb_type_clause(node, "superclass", source):
+                facts.append(
+                    EJBFact(
+                        "ejb_unresolved",
+                        qualified_name,
+                        None,
+                        "Session Bean class inheritance is not resolved by this local EJB slice.",
+                        path,
+                        declaration_line,
+                        declaration_line,
+                    )
+                )
             for interface_name in _ejb_type_clause(node, "super_interfaces", source):
                 facts.append(
                     EJBFact(
@@ -2693,6 +2848,20 @@ def _ejb_java_facts(path: Path, source: bytes) -> tuple[EJBFact, ...]:
                             annotation_node.end_point.row + 1,
                         )
                     )
+        if current_types and node.type == "method_invocation":
+            invocation_name = _node_text(node.child_by_field_name("name"), source)
+            if invocation_name in {"lookup", "lookupLink", "doLookup"}:
+                facts.append(
+                    EJBFact(
+                        "ejb_unresolved",
+                        _qualified_type_name(package_name, current_types),
+                        None,
+                        "Arbitrary JNDI lookup is not resolved by this local EJB slice.",
+                        path,
+                        node.start_point.row + 1,
+                        node.end_point.row + 1,
+                    )
+                )
         for child in node.named_children:
             visit(child, current_types)
 
@@ -3857,7 +4026,10 @@ def _replace_changed_source_records(
     parse_failures: tuple[ParseFailure, ...],
     spring_facts: tuple[SpringFact, ...],
     ejb_facts: tuple[EJBFact, ...],
+    replace_all_ejb_facts: bool = False,
 ) -> None:
+    if replace_all_ejb_facts:
+        connection.execute("DELETE FROM ejb_facts")
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
