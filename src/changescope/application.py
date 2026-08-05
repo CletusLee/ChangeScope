@@ -2266,7 +2266,7 @@ def _ejb_implicit_no_interface_facts(facts: Iterable[EJBFact]) -> tuple[EJBFact,
         if fact.kind == "type_implements" and fact.target in interface_views
     }
     declared_contracts.update(
-        fact.target
+        fact.subject
         for fact in facts
         if fact.kind == "bean_view" and fact.target
     )

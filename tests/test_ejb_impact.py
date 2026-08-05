@@ -99,7 +99,7 @@ import javax.ejb.Stateless;
                 repository / "src/main/java/example/Contracts.java",
                 """package example;
 import jakarta.ejb.*;
-@Remote interface RemoteService { void run(); }
+interface RemoteService { void run(); }
 @Local interface LocalService { void run(); }
 """,
             )
@@ -107,7 +107,7 @@ import jakarta.ejb.*;
                 repository / "src/main/java/example/Beans.java",
                 """package example;
 import jakarta.ejb.*;
-@Stateful class RemoteServiceBean implements RemoteService { public void run() {} }
+@Stateful @Remote(RemoteService.class) class RemoteServiceBean implements RemoteService { public void run() {} }
 @Singleton class LocalSingleton implements LocalService { public void run() {} }
 @Stateless class LocalStateless implements LocalService { public void run() {} }
 """,
@@ -131,6 +131,9 @@ import jakarta.ejb.*;
                     "outside the local Repository Index" in item.message
                     for item in remote_result.unresolved_items
                 )
+            )
+            self.assertFalse(
+                any("Implicit no-interface" in item.message for item in remote_result.unresolved_items)
             )
             self.assertEqual(
                 len(
