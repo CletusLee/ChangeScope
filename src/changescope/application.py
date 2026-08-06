@@ -125,6 +125,18 @@ class QuarkusConfigFact:
 
 
 @dataclass(frozen=True)
+class QuarkusCDIFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    scope: str | None = None
+
+
+@dataclass(frozen=True)
 class ParseFailure:
     path: Path
     start_line: int
@@ -147,6 +159,7 @@ class IndexResult:
     configuration_files: tuple[Path, ...] = ()
     quarkus_build_facts: tuple[QuarkusBuildFact, ...] = ()
     quarkus_config_facts: tuple[QuarkusConfigFact, ...] = ()
+    quarkus_cdi_facts: tuple[QuarkusCDIFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -257,7 +270,7 @@ class ChangeScopeApplication:
 
 
 def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
-    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|quarkus_build|quarkus_config):(.+):(\d+)-(\d+)", request.evidence_handle)
+    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|quarkus_build|quarkus_config|quarkus_cdi):(.+):(\d+)-(\d+)", request.evidence_handle)
     if match is None:
         raise ValueError("Evidence handles must use kind:path:start-end form.")
     path = _validate_relative_path(Path(match.group(1)))
@@ -718,6 +731,13 @@ def _direct_relationships(
     )
     relationships.extend(qc_relationships)
     unresolved_items.extend(qc_unresolved)
+    cdi_relationships, cdi_unresolved = _quarkus_cdi_relationships(
+        connection_data_path=database_path,
+        owner=owner,
+        target=target,
+    )
+    relationships.extend(cdi_relationships)
+    unresolved_items.extend(cdi_unresolved)
     return tuple(relationships), tuple(unresolved_items)
 
 
@@ -1844,6 +1864,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
     quarkus_config_facts = _analyze_quarkus_config_files(
         {**contents_by_path, **configuration_contents}, declarations
     )
+    quarkus_cdi_facts = _analyze_quarkus_cdi_files(contents_by_path, declarations)
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -1859,6 +1880,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
         configuration_files=configuration_files,
         quarkus_build_facts=quarkus_build_facts,
         quarkus_config_facts=quarkus_config_facts,
+        quarkus_cdi_facts=quarkus_cdi_facts,
     )
     _write_index(result)
     return result
@@ -3992,6 +4014,7 @@ def _replace_index_contents(
     connection.execute("DELETE FROM ejb_facts")
     connection.execute("DELETE FROM quarkus_build_facts")
     connection.execute("DELETE FROM quarkus_config_facts")
+    connection.execute("DELETE FROM quarkus_cdi_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
     indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
     connection.executemany(
@@ -4010,6 +4033,7 @@ def _replace_index_contents(
     _insert_ejb_facts(connection, result.ejb_facts)
     _insert_quarkus_build_facts(connection, result.quarkus_build_facts)
     _insert_quarkus_config_facts(connection, result.quarkus_config_facts)
+    _insert_quarkus_cdi_facts(connection, result.quarkus_cdi_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
@@ -4024,6 +4048,9 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
     ).fetchone() is None
     quarkus_config_schema_missing = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_config_facts'"
+    ).fetchone() is None
+    quarkus_cdi_schema_missing = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_cdi_facts'"
     ).fetchone() is None
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -4112,6 +4139,18 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         is_build_time INTEGER NOT NULL DEFAULT 0
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS quarkus_cdi_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        scope TEXT
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -4144,6 +4183,7 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         or ejb_schema_missing
         or quarkus_schema_missing
         or quarkus_config_schema_missing
+        or quarkus_cdi_schema_missing
     )
 
 
@@ -4178,12 +4218,14 @@ def _replace_changed_source_records(
     ejb_facts: tuple[EJBFact, ...],
     quarkus_build_facts: tuple[QuarkusBuildFact, ...] = (),
     quarkus_config_facts: tuple[QuarkusConfigFact, ...] = (),
+    quarkus_cdi_facts: tuple[QuarkusCDIFact, ...] = (),
     replace_all_ejb_facts: bool = False,
 ) -> None:
     if replace_all_ejb_facts:
         connection.execute("DELETE FROM ejb_facts")
         connection.execute("DELETE FROM quarkus_build_facts")
         connection.execute("DELETE FROM quarkus_config_facts")
+        connection.execute("DELETE FROM quarkus_cdi_facts")
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
@@ -4193,6 +4235,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM ejb_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_build_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_config_facts WHERE path = ?", (path,))
+        connection.execute("DELETE FROM quarkus_cdi_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
@@ -4202,6 +4245,7 @@ def _replace_changed_source_records(
     _insert_ejb_facts(connection, ejb_facts)
     _insert_quarkus_build_facts(connection, quarkus_build_facts)
     _insert_quarkus_config_facts(connection, quarkus_config_facts)
+    _insert_quarkus_cdi_facts(connection, quarkus_cdi_facts)
 
 
 def _insert_java_facts(
@@ -4357,6 +4401,235 @@ def _insert_quarkus_config_facts(
             for fact in facts
         ),
     )
+
+
+def _insert_quarkus_cdi_facts(
+    connection: sqlite3.Connection, facts: Iterable[QuarkusCDIFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO quarkus_cdi_facts(
+        kind, subject, target, value, path, start_line, end_line, scope
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.scope,
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _analyze_quarkus_cdi_files(
+    contents_by_path: dict[Path, bytes],
+    declarations: tuple[JavaDeclaration, ...],
+) -> tuple[QuarkusCDIFact, ...]:
+    facts: list[QuarkusCDIFact] = []
+    for path, content in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        if path.suffix.lower() == ".java":
+            text = content.decode("utf-8", errors="replace")
+            lines = text.splitlines()
+
+            has_cdi_import = bool(
+                re.search(
+                    r"import\s+(?:jakarta|javax)\.(?:enterprise\.context|inject)\.",
+                    text,
+                )
+            )
+            if has_cdi_import:
+                for decl in declarations:
+                    if decl.kind == "class" and decl.path == path:
+                        decl_lines = lines[decl.start_line - 1 : decl.end_line]
+                        decl_text = "\n".join(decl_lines)
+                        scope_match = re.search(
+                            r"@(ApplicationScoped|RequestScoped|SessionScoped|Dependent|Singleton)",
+                            decl_text,
+                        )
+                        if scope_match:
+                            scope_name = scope_match.group(1)
+                            implements_match = re.search(
+                                r"\bimplements\s+([A-Za-z0-9_$,\s]+?)(?:\{|implements|extends)",
+                                decl_text,
+                            )
+                            interfaces = (
+                                implements_match.group(1).strip()
+                                if implements_match
+                                else None
+                            )
+                            facts.append(
+                                QuarkusCDIFact(
+                                    "cdi_bean",
+                                    decl.qualified_name,
+                                    interfaces,
+                                    scope_name,
+                                    path,
+                                    decl.start_line,
+                                    decl.end_line,
+                                    scope_name,
+                                )
+                            )
+
+                if "@Inject" in text:
+                    for line_idx, line in enumerate(lines, 1):
+                        if "@Inject" in line:
+                            field_snippet = "\n".join(lines[line_idx - 1 : line_idx + 2])
+                            field_match = re.search(
+                                r"@Inject\s+(?:[A-Za-z0-9_$.<>]+\s+)?([A-Za-z0-9_$.<>]+)\s+([A-Za-z0-9_$]+)\s*;",
+                                field_snippet,
+                            )
+                            if field_match:
+                                field_type = field_match.group(1).strip()
+                                field_name = field_match.group(2).strip()
+                                owner_decl = next(
+                                    (
+                                        d
+                                        for d in declarations
+                                        if d.path == path and d.start_line <= line_idx <= d.end_line
+                                    ),
+                                    None,
+                                )
+                                subject = owner_decl.qualified_name if owner_decl else ""
+                                facts.append(
+                                    QuarkusCDIFact(
+                                        "cdi_injection",
+                                        subject,
+                                        field_type,
+                                        field_name,
+                                        path,
+                                        line_idx,
+                                        line_idx,
+                                    )
+                                )
+    return tuple(facts)
+
+
+def _quarkus_cdi_relationships(
+    connection_data_path: Path,
+    owner: str,
+    target: ImpactTarget,
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, scope
+            FROM quarkus_cdi_facts ORDER BY path, start_line, kind, subject"""
+        ).fetchall()
+        declarations = connection.execute(
+            """SELECT kind, qualified_name, signature, path, start_line, end_line
+            FROM java_declarations"""
+        ).fetchall()
+        invocations = connection.execute(
+            """SELECT name, receiver, caller, path, start_line, end_line, argument_count
+            FROM java_invocations"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return (), ()
+    finally:
+        connection.close()
+
+    if not rows:
+        return (), ()
+
+    cdi_facts = [
+        QuarkusCDIFact(
+            kind, subject, target, value, Path(path), start_line, end_line, scope
+        )
+        for kind, subject, target, value, path, start_line, end_line, scope in rows
+    ]
+
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+
+    beans = [f for f in cdi_facts if f.kind == "cdi_bean"]
+    injections = [f for f in cdi_facts if f.kind == "cdi_injection"]
+
+    target_class = owner.rsplit(".", maxsplit=1)[-1]
+    target_full_class = owner
+
+    for inj in injections:
+        inj_type = inj.target or ""
+        inj_type_simple = inj_type.rsplit(".", maxsplit=1)[-1]
+
+        matching_beans = []
+        for b in beans:
+            b_simple = b.subject.rsplit(".", maxsplit=1)[-1]
+            if (
+                b.subject == inj_type
+                or b_simple == inj_type_simple
+                or (b.target and inj_type_simple in b.target)
+            ):
+                matching_beans.append(b)
+
+        if not matching_beans:
+            unresolved.append(
+                _unresolved(
+                    f"Quarkus CDI Injection Point '{inj.value}' of type '{inj.target}' in {inj.subject} has no matching CDI bean candidate in indexed Java source.",
+                    inj.path,
+                    inj.start_line,
+                    inj.end_line,
+                    "quarkus_cdi",
+                )
+            )
+            continue
+        elif len(matching_beans) > 1:
+            candidate_names = ", ".join(b.subject for b in matching_beans)
+            unresolved.append(
+                _unresolved(
+                    f"Quarkus CDI Injection Point '{inj.value}' of type '{inj.target}' in {inj.subject} has multiple candidate beans ({candidate_names}); ambiguous CDI injection is unresolved.",
+                    inj.path,
+                    inj.start_line,
+                    inj.end_line,
+                    "quarkus_cdi",
+                )
+            )
+            continue
+
+        selected_bean = matching_beans[0]
+        if selected_bean.subject == target_full_class or selected_bean.subject.endswith("." + target_class) or (selected_bean.target and target_class in selected_bean.target):
+            evidence_handle = f"quarkus_cdi:{inj.path.as_posix()}:{inj.start_line}-{inj.end_line}"
+            relationships.append(
+                ImpactRelationship(
+                    "quarkus_cdi_injection",
+                    selected_bean.subject,
+                    inj.path,
+                    inj.start_line,
+                    inj.end_line,
+                    evidence_handle,
+                    "high",
+                    False,
+                    None,
+                    evidence_chain=(evidence_handle,),
+                )
+            )
+
+            method_name = target.signature.split("#", maxsplit=1)[-1].partition("(")[0]
+            field_name = inj.value
+            for inv in invocations:
+                inv_name, inv_receiver, inv_caller, inv_path, inv_start, inv_end, _ = inv
+                if inv_name == method_name and inv_caller and inv_caller.startswith(inj.subject):
+                    inv_handle = f"invocation:{inv_path}:{inv_start}-{inv_end}"
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_cdi_dispatch",
+                            inv_caller,
+                            Path(inv_path),
+                            inv_start,
+                            inv_end,
+                            inv_handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=(evidence_handle, inv_handle),
+                        )
+                    )
+
+    return tuple(relationships), tuple(unresolved)
 
 
 def _is_quarkus_build_time_key(key: str) -> bool:
