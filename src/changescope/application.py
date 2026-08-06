@@ -194,6 +194,18 @@ class QuarkusTestFact:
 
 
 @dataclass(frozen=True)
+class QuarkusNativeFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    scope: str | None = None
+
+
+@dataclass(frozen=True)
 class IndexResult:
     source_roots: tuple[Path, ...]
     indexed_files: tuple[Path, ...]
@@ -213,6 +225,7 @@ class IndexResult:
     quarkus_route_facts: tuple[QuarkusRouteFact, ...] = ()
     quarkus_security_facts: tuple[QuarkusSecurityFact, ...] = ()
     quarkus_test_facts: tuple[QuarkusTestFact, ...] = ()
+    quarkus_native_facts: tuple[QuarkusNativeFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -846,6 +859,13 @@ def _direct_relationships(
     )
     relationships.extend(test_relationships)
     unresolved_items.extend(test_unresolved)
+    nat_relationships, nat_unresolved = _quarkus_native_relationships(
+        connection_data_path=database_path,
+        owner=owner,
+        target=target,
+    )
+    relationships.extend(nat_relationships)
+    unresolved_items.extend(nat_unresolved)
     return tuple(relationships), tuple(unresolved_items)
 
 
@@ -1990,6 +2010,9 @@ def _index_repository(repository_root: Path) -> IndexResult:
     quarkus_test_facts = _analyze_quarkus_test_files(
         contents_by_path, declarations
     )
+    quarkus_native_facts = _analyze_quarkus_native_files(
+        {**contents_by_path, **configuration_contents}, declarations
+    )
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -2010,6 +2033,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
         quarkus_route_facts=quarkus_route_facts,
         quarkus_security_facts=quarkus_security_facts,
         quarkus_test_facts=quarkus_test_facts,
+        quarkus_native_facts=quarkus_native_facts,
     )
     _write_index(result)
     return result
@@ -2108,6 +2132,9 @@ def _refresh_index_if_needed(root: Path) -> None:
                 quarkus_test_facts = _analyze_quarkus_test_files(
                     contents_by_path, declarations
                 )
+                quarkus_native_facts = _analyze_quarkus_native_files(
+                    {**contents_by_path, **configuration_contents}, declarations
+                )
                 _replace_changed_source_records(
                     connection,
                     changed_paths,
@@ -2121,6 +2148,7 @@ def _refresh_index_if_needed(root: Path) -> None:
                     quarkus_route_facts=quarkus_route_facts,
                     quarkus_security_facts=quarkus_security_facts,
                     quarkus_test_facts=quarkus_test_facts,
+                    quarkus_native_facts=quarkus_native_facts,
                     replace_all_ejb_facts=refresh_all_ejb_facts,
                 )
             _write_metadata(connection, _snapshot(root), source_roots)
@@ -2388,7 +2416,13 @@ def _configuration_files(
             ]
             for filename in filenames:
                 path = Path(directory) / filename
-                if path.suffix.lower() not in {".properties", ".yml", ".yaml", ".xml"}:
+                path_posix = path.as_posix()
+                is_config = (
+                    path.suffix.lower() in {".properties", ".yml", ".yaml", ".xml", ".json"}
+                    or "META-INF/services" in path_posix
+                    or "META-INF/native-image" in path_posix
+                )
+                if not is_config:
                     continue
                 relative_path = path.relative_to(root)
                 try:
@@ -4159,6 +4193,7 @@ def _replace_index_contents(
     connection.execute("DELETE FROM quarkus_rest_facts")
     connection.execute("DELETE FROM quarkus_security_facts")
     connection.execute("DELETE FROM quarkus_test_facts")
+    connection.execute("DELETE FROM quarkus_native_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
     indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
     connection.executemany(
@@ -4182,6 +4217,7 @@ def _replace_index_contents(
     _insert_quarkus_route_facts(connection, result.quarkus_route_facts)
     _insert_quarkus_security_facts(connection, result.quarkus_security_facts)
     _insert_quarkus_test_facts(connection, result.quarkus_test_facts)
+    _insert_quarkus_native_facts(connection, result.quarkus_native_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
@@ -4353,6 +4389,18 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         flavor TEXT
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS quarkus_native_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        scope TEXT
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -4427,6 +4475,7 @@ def _replace_changed_source_records(
     quarkus_route_facts: tuple[QuarkusRouteFact, ...] = (),
     quarkus_security_facts: tuple[QuarkusSecurityFact, ...] = (),
     quarkus_test_facts: tuple[QuarkusTestFact, ...] = (),
+    quarkus_native_facts: tuple[QuarkusNativeFact, ...] = (),
     replace_all_ejb_facts: bool = False,
 ) -> None:
     if replace_all_ejb_facts:
@@ -4438,6 +4487,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_route_facts")
         connection.execute("DELETE FROM quarkus_security_facts")
         connection.execute("DELETE FROM quarkus_test_facts")
+        connection.execute("DELETE FROM quarkus_native_facts")
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
@@ -4452,6 +4502,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_route_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_security_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_test_facts WHERE path = ?", (path,))
+        connection.execute("DELETE FROM quarkus_native_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
@@ -4466,6 +4517,7 @@ def _replace_changed_source_records(
     _insert_quarkus_route_facts(connection, quarkus_route_facts)
     _insert_quarkus_security_facts(connection, quarkus_security_facts)
     _insert_quarkus_test_facts(connection, quarkus_test_facts)
+    _insert_quarkus_native_facts(connection, quarkus_native_facts)
 
 
 def _insert_java_facts(
@@ -4718,6 +4770,338 @@ def _insert_quarkus_security_facts(
 def _insert_quarkus_test_facts(
     connection: sqlite3.Connection, facts: Iterable[QuarkusTestFact]
 ) -> None:
+    connection.executemany(
+        """INSERT INTO quarkus_test_facts(
+        kind, subject, target, value, path, start_line, end_line, flavor
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.flavor,
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _insert_quarkus_native_facts(
+    connection: sqlite3.Connection, facts: Iterable[QuarkusNativeFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO quarkus_native_facts(
+        kind, subject, target, value, path, start_line, end_line, scope
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.scope,
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _analyze_quarkus_native_files(
+    contents_by_path: dict[Path, bytes],
+    declarations: tuple[JavaDeclaration, ...],
+) -> tuple[QuarkusNativeFact, ...]:
+    facts: list[QuarkusNativeFact] = []
+
+    for path, content in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        path_str = path.as_posix()
+
+        if any(part in ("target", "build", ".quarkus") for part in path.parts):
+            continue
+
+        text = content.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+
+        if "META-INF/services/" in path_str:
+            spi_interface = path.name.strip()
+            for idx, line in enumerate(lines, 1):
+                clean_line = line.strip()
+                if clean_line and not clean_line.startswith("#"):
+                    facts.append(
+                        QuarkusNativeFact(
+                            "meta_inf_service",
+                            spi_interface,
+                            clean_line,
+                            json.dumps({"spi_interface": spi_interface, "provider": clean_line}),
+                            path,
+                            idx,
+                            idx,
+                            scope="spi",
+                        )
+                    )
+
+        elif "META-INF/native-image/" in path_str and path.suffix == ".json":
+            try:
+                data = json.loads(text)
+                if isinstance(data, list):
+                    for idx, entry in enumerate(data, 1):
+                        if isinstance(entry, dict) and "name" in entry:
+                            class_name = entry["name"]
+                            facts.append(
+                                QuarkusNativeFact(
+                                    "native_json_config",
+                                    class_name,
+                                    path.name,
+                                    json.dumps(entry),
+                                    path,
+                                    1,
+                                    len(lines) if lines else 1,
+                                    scope="reflection" if "reflection" in path.name else "native_json",
+                                )
+                            )
+                        elif isinstance(entry, list):
+                            for iface in entry:
+                                if isinstance(iface, str):
+                                    facts.append(
+                                        QuarkusNativeFact(
+                                            "native_json_config",
+                                            iface,
+                                            path.name,
+                                            json.dumps({"interface": iface}),
+                                            path,
+                                            1,
+                                            len(lines) if lines else 1,
+                                            scope="proxy",
+                                        )
+                                    )
+            except Exception:
+                pass
+
+        elif path.suffix.lower() == ".java":
+            for decl in declarations:
+                if decl.path != path:
+                    continue
+
+                if decl.kind in ("class", "interface"):
+                    decl_snippet = _get_class_snippet(lines, decl)
+                    full_class_text = "\n".join(lines[max(0, decl.start_line - 1) : decl.end_line])
+
+                    if "@RegisterForReflection" in decl_snippet or "@RegisterForReflection" in full_class_text:
+                        targets: list[str] = []
+                        ref_match = re.search(r'@RegisterForReflection\s*\(\s*(?:targets|classNames)\s*=\s*(?:\{([^}]+)\}|["\']([^"\']+)["\'])\s*\)', full_class_text)
+                        if ref_match:
+                            raw_t = ref_match.group(1) or ref_match.group(2) or ""
+                            for item in raw_t.split(","):
+                                clean_t = item.strip().replace(".class", "").strip('"').strip("'").strip()
+                                if clean_t:
+                                    targets.append(clean_t)
+
+                        if not targets:
+                            targets.append(decl.qualified_name)
+
+                        for tgt in targets:
+                            facts.append(
+                                QuarkusNativeFact(
+                                    "register_reflection",
+                                    tgt,
+                                    decl.qualified_name,
+                                    json.dumps({"target": tgt, "annotated_class": decl.qualified_name}),
+                                    path,
+                                    decl.start_line,
+                                    decl.end_line,
+                                    scope="reflection",
+                                )
+                            )
+
+                    if "@RegisterForProxy" in decl_snippet or "@RegisterForProxy" in full_class_text:
+                        targets: list[str] = []
+                        proxy_match = re.search(r'@RegisterForProxy\s*\(\s*targets\s*=\s*\{([^}]+)\}\s*\)', full_class_text)
+                        if proxy_match:
+                            raw_t = proxy_match.group(1)
+                            for item in raw_t.split(","):
+                                clean_t = item.strip().replace(".class", "").strip()
+                                if clean_t:
+                                    targets.append(clean_t)
+
+                        for tgt in targets:
+                            facts.append(
+                                QuarkusNativeFact(
+                                    "register_proxy",
+                                    tgt,
+                                    decl.qualified_name,
+                                    json.dumps({"target_interface": tgt, "annotated_class": decl.qualified_name}),
+                                    path,
+                                    decl.start_line,
+                                    decl.end_line,
+                                    scope="proxy",
+                                )
+                            )
+
+                elif decl.kind == "method":
+                    method_snippet = _get_method_snippet(lines, decl)
+
+                    for forname_match in re.finditer(r'\bClass\.forName\s*\(\s*["\']([^"\']+)["\']\s*\)', method_snippet):
+                        ref_class = forname_match.group(1)
+                        call_line = decl.start_line + method_snippet[:forname_match.start()].count("\n")
+                        facts.append(
+                            QuarkusNativeFact(
+                                "reflection_usage",
+                                decl.qualified_name,
+                                ref_class,
+                                json.dumps({"target_class": ref_class}),
+                                path,
+                                call_line,
+                                call_line,
+                                scope="reflection",
+                            )
+                        )
+
+    return tuple(facts)
+
+
+def _quarkus_native_relationships(
+    connection_data_path: Path,
+    owner: str,
+    target: ImpactTarget,
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        nat_rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, scope
+            FROM quarkus_native_facts ORDER BY path, start_line"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return (), ()
+    finally:
+        connection.close()
+
+    if not nat_rows:
+        return (), ()
+
+    nat_facts = [
+        QuarkusNativeFact(kind, subject, fact_target, value, Path(path), start_line, end_line, scope)
+        for kind, subject, fact_target, value, path, start_line, end_line, scope in nat_rows
+    ]
+
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+    seen_keys: set[tuple[str, str, Path, int, int]] = set()
+
+    target_sig = target.signature
+    target_class = target_sig.rsplit("#", 1)[0]
+    target_method = target_sig.split("#")[-1].split("(")[0] if "#" in target_sig else None
+    clean_target_class = target_class.rsplit(".", 1)[-1]
+
+    for nf in nat_facts:
+        if nf.kind in ("register_reflection", "native_json_config") and nf.scope == "reflection":
+            clean_sub = nf.subject.rsplit(".", 1)[-1]
+            if nf.subject == target_class or clean_sub == clean_target_class:
+                handle = f"quarkus_native:{nf.path.as_posix()}:{nf.start_line}-{nf.end_line}"
+                rel_key = ("quarkus_native_reflection", nf.subject, nf.path, nf.start_line, nf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_native_reflection",
+                            f"Native Reflection ({nf.subject}) -> {target_sig}",
+                            nf.path,
+                            nf.start_line,
+                            nf.end_line,
+                            handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=(handle,),
+                            business_view=nf.value,
+                        )
+                    )
+
+    for nf in nat_facts:
+        if nf.kind in ("register_proxy", "native_json_config") and nf.scope == "proxy":
+            clean_sub = nf.subject.rsplit(".", 1)[-1]
+            if nf.subject == target_class or clean_sub == clean_target_class:
+                handle = f"quarkus_native:{nf.path.as_posix()}:{nf.start_line}-{nf.end_line}"
+                rel_key = ("quarkus_native_proxy", nf.subject, nf.path, nf.start_line, nf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_native_proxy",
+                            f"Native Proxy ({nf.subject}) -> {target_sig}",
+                            nf.path,
+                            nf.start_line,
+                            nf.end_line,
+                            handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=(handle,),
+                            business_view=nf.value,
+                        )
+                    )
+
+    for nf in nat_facts:
+        if nf.kind == "meta_inf_service":
+            clean_sub = nf.subject.rsplit(".", 1)[-1]
+            clean_tgt = nf.target.rsplit(".", 1)[-1] if nf.target else ""
+            if nf.subject == target_class or clean_sub == clean_target_class or (nf.target and (nf.target == target_class or clean_tgt == clean_target_class)):
+                handle = f"quarkus_native:{nf.path.as_posix()}:{nf.start_line}-{nf.end_line}"
+                rel_key = ("quarkus_native_spi", nf.subject, nf.path, nf.start_line, nf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_native_spi",
+                            f"META-INF/services ({nf.subject}) -> {nf.target}",
+                            nf.path,
+                            nf.start_line,
+                            nf.end_line,
+                            handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=(handle,),
+                            business_view=nf.value,
+                        )
+                    )
+
+    for nf in nat_facts:
+        if nf.kind == "reflection_usage" and nf.target:
+            clean_tgt = nf.target.rsplit(".", 1)[-1]
+            if nf.target == target_class or clean_tgt == clean_target_class:
+                usage_handle = f"quarkus_native:{nf.path.as_posix()}:{nf.start_line}-{nf.end_line}"
+                chain = [usage_handle]
+                reg_fact = next((r for r in nat_facts if r.kind in ("register_reflection", "native_json_config") and (r.subject == target_class or r.subject.rsplit(".", 1)[-1] == clean_target_class)), None)
+                if reg_fact:
+                    reg_handle = f"quarkus_native:{reg_fact.path.as_posix()}:{reg_fact.start_line}-{reg_fact.end_line}"
+                    chain.append(reg_handle)
+
+                rel_key = ("quarkus_native_reflection_usage", nf.subject, nf.path, nf.start_line, nf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_native_reflection_usage",
+                            f"Class.forName({nf.target}) in {nf.subject} -> {target_sig}",
+                            nf.path,
+                            nf.start_line,
+                            nf.end_line,
+                            usage_handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=tuple(chain),
+                            business_view=nf.value,
+                        )
+                    )
+
+    return tuple(relationships), tuple(unresolved)
     connection.executemany(
         """INSERT INTO quarkus_test_facts(
         kind, subject, target, value, path, start_line, end_line, flavor
