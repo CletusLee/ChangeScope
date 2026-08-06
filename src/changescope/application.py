@@ -4457,6 +4457,78 @@ def _quarkus_yaml_facts(path: Path, lines: list[str]) -> list[QuarkusConfigFact]
     return facts
 
 
+def _to_kebab_case(name: str) -> str:
+    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1-\2', name)
+    return re.sub('([a-z0-9])([A-Z])', r'\1-\2', s1).lower()
+
+
+def _extract_config_mapping_methods(
+    interface_decl: JavaDeclaration,
+    lines: list[str],
+    prefix: str,
+    path: Path,
+    declarations: tuple[JavaDeclaration, ...],
+    facts: list[QuarkusConfigFact],
+) -> None:
+    interface_lines = lines[interface_decl.start_line - 1 : interface_decl.end_line]
+    interface_text = "\n".join(interface_lines)
+
+    method_matches = re.finditer(
+        r"(?P<annotations>(?:@[A-Za-z_$][\w$.]*(?:\([^)]*\))?\s*)*)"
+        r"(?P<return_type>[A-Za-z_$][\w$.]*)\s+(?P<method_name>[A-Za-z_$][\w$]*)\s*\(\s*\)\s*;",
+        interface_text,
+    )
+    for match in method_matches:
+        annotations_text = match.group("annotations") or ""
+        return_type = match.group("return_type").strip()
+        method_name = match.group("method_name").strip()
+
+        match_line = interface_decl.start_line + interface_text.count("\n", 0, match.start())
+        with_name_match = re.search(r'@WithName\s*\(\s*["\']([^"\']+)["\']\s*\)', annotations_text)
+        with_parent_name = "@WithParentName" in annotations_text
+
+        if with_name_match:
+            segment = with_name_match.group(1)
+        else:
+            segment = _to_kebab_case(method_name)
+
+        if with_parent_name:
+            key = prefix
+        else:
+            key = f"{prefix}.{segment}" if prefix else segment
+
+        nested_decl = next(
+            (d for d in declarations if d.kind == "interface" and (d.name == return_type or d.qualified_name.endswith("." + return_type))),
+            None,
+        )
+        if nested_decl is not None:
+            _extract_config_mapping_methods(nested_decl, lines, key, path, declarations, facts)
+        else:
+            subject = f"{interface_decl.qualified_name}#{method_name}"
+            facts.append(
+                QuarkusConfigFact(
+                    "quarkus_property_consumer",
+                    subject,
+                    key,
+                    None,
+                    path,
+                    match_line,
+                    match_line,
+                )
+            )
+            facts.append(
+                QuarkusConfigFact(
+                    "quarkus_property_consumer",
+                    interface_decl.qualified_name,
+                    key,
+                    None,
+                    path,
+                    match_line,
+                    match_line,
+                )
+            )
+
+
 def _quarkus_java_facts(
     path: Path, source: bytes, declarations: tuple[JavaDeclaration, ...]
 ) -> tuple[QuarkusConfigFact, ...]:
@@ -4500,6 +4572,20 @@ def _quarkus_java_facts(
                             idx,
                         )
                     )
+
+    if "@ConfigMapping" in text:
+        for decl in declarations:
+            if decl.kind == "interface" and decl.path == path:
+                decl_text = "\n".join(lines[decl.start_line - 1 : decl.end_line])
+                mapping_match = re.search(r"@ConfigMapping\s*(?:\(([^)]*)\))?", decl_text)
+                if mapping_match:
+                    args = mapping_match.group(1) or ""
+                    prefix_match = re.search(r'\bprefix\s*=\s*["\']([^"\']+)["\']', args)
+                    prefix = prefix_match.group(1) if prefix_match else ""
+                    _extract_config_mapping_methods(
+                        decl, lines, prefix, path, declarations, facts
+                    )
+
     return tuple(facts)
 
 
@@ -4532,6 +4618,14 @@ def _quarkus_config_relationships(
 
     relationships: list[ImpactRelationship] = []
     unresolved: list[UnresolvedItem] = []
+
+    parent_profiles = set()
+    for f in facts:
+        if f.kind == "quarkus_property_source" and f.subject == "quarkus.config.profile.parent" and f.value:
+            parent_profiles.add(f.value)
+
+    active_build_set = set(build_profiles) | parent_profiles
+    active_runtime_set = set(runtime_profiles or build_profiles) | parent_profiles
 
     def matching_owner(sub: str) -> bool:
         if sub == owner:
@@ -4582,16 +4676,15 @@ def _quarkus_config_relationships(
         for source in matching_sources:
             source_handle = f"quarkus_config:{source.path.as_posix()}:{source.start_line}-{source.end_line}"
             if source.is_build_time:
-                if build_profiles:
-                    applies = (source.profile is None or source.profile in build_profiles)
+                if active_build_set:
+                    applies = (source.profile is None or source.profile in active_build_set)
                     conditional = False
                 else:
                     applies = True
                     conditional = (source.profile is not None)
             else:
-                active_profs = runtime_profiles or build_profiles
-                if active_profs:
-                    applies = (source.profile is None or source.profile in active_profs)
+                if active_runtime_set:
+                    applies = (source.profile is None or source.profile in active_runtime_set)
                     conditional = False
                 else:
                     applies = True
@@ -4612,6 +4705,39 @@ def _quarkus_config_relationships(
                         evidence_chain=(consumer_handle, source_handle),
                     )
                 )
+
+                if source.value and "${" in source.value:
+                    for expr_match in re.finditer(r"\$\{([^}:]+)(?::[^}]*)?\}", source.value):
+                        ref_key = expr_match.group(1).strip()
+                        ref_sources = [s for s in source_facts if s.subject == ref_key]
+                        if not ref_sources:
+                            if re.fullmatch(r"[A-Z0-9_]+", ref_key):
+                                unresolved.append(
+                                    _unresolved(
+                                        f"Environment-variable configuration override was not resolved for {ref_key}.",
+                                        source.path,
+                                        source.start_line,
+                                        source.end_line,
+                                        "quarkus_config",
+                                    )
+                                )
+                        for ref_source in ref_sources:
+                            ref_handle = f"quarkus_config:{ref_source.path.as_posix()}:{ref_source.start_line}-{ref_source.end_line}"
+                            chain = (consumer_handle, source_handle, ref_handle)
+                            relationships.append(
+                                ImpactRelationship(
+                                    "property_source",
+                                    ref_source.subject,
+                                    ref_source.path,
+                                    ref_source.start_line,
+                                    ref_source.end_line,
+                                    ref_handle,
+                                    "medium" if conditional else "high",
+                                    conditional,
+                                    ref_source.profile,
+                                    evidence_chain=chain,
+                                )
+                            )
 
     return tuple(relationships), tuple(unresolved)
 
