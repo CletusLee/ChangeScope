@@ -150,6 +150,18 @@ class QuarkusRESTFact:
 
 
 @dataclass(frozen=True)
+class QuarkusRouteFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    flavor: str | None = None
+
+
+@dataclass(frozen=True)
 class ParseFailure:
     path: Path
     start_line: int
@@ -174,6 +186,7 @@ class IndexResult:
     quarkus_config_facts: tuple[QuarkusConfigFact, ...] = ()
     quarkus_cdi_facts: tuple[QuarkusCDIFact, ...] = ()
     quarkus_rest_facts: tuple[QuarkusRESTFact, ...] = ()
+    quarkus_route_facts: tuple[QuarkusRouteFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -760,6 +773,13 @@ def _direct_relationships(
     )
     relationships.extend(rest_relationships)
     unresolved_items.extend(rest_unresolved)
+    route_relationships, route_unresolved = _quarkus_route_relationships(
+        connection_data_path=database_path,
+        owner=owner,
+        target=target,
+    )
+    relationships.extend(route_relationships)
+    unresolved_items.extend(route_unresolved)
     return tuple(relationships), tuple(unresolved_items)
 
 
@@ -1890,6 +1910,9 @@ def _index_repository(repository_root: Path) -> IndexResult:
     quarkus_rest_facts = _analyze_quarkus_rest_files(
         contents_by_path, declarations, quarkus_build_facts, quarkus_config_facts
     )
+    quarkus_route_facts = _analyze_quarkus_route_files(
+        contents_by_path, declarations, quarkus_build_facts
+    )
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -1907,6 +1930,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
         quarkus_config_facts=quarkus_config_facts,
         quarkus_cdi_facts=quarkus_cdi_facts,
         quarkus_rest_facts=quarkus_rest_facts,
+        quarkus_route_facts=quarkus_route_facts,
     )
     _write_index(result)
     return result
@@ -1996,6 +2020,9 @@ def _refresh_index_if_needed(root: Path) -> None:
                 quarkus_build_facts = _analyze_quarkus_build_files(
                     {**contents_by_path, **configuration_contents}
                 )
+                quarkus_route_facts = _analyze_quarkus_route_files(
+                    contents_by_path, declarations, quarkus_build_facts
+                )
                 _replace_changed_source_records(
                     connection,
                     changed_paths,
@@ -2006,6 +2033,7 @@ def _refresh_index_if_needed(root: Path) -> None:
                     spring_facts,
                     ejb_facts,
                     quarkus_build_facts,
+                    quarkus_route_facts=quarkus_route_facts,
                     replace_all_ejb_facts=refresh_all_ejb_facts,
                 )
             _write_metadata(connection, _snapshot(root), source_roots)
@@ -4062,6 +4090,7 @@ def _replace_index_contents(
     _insert_quarkus_config_facts(connection, result.quarkus_config_facts)
     _insert_quarkus_cdi_facts(connection, result.quarkus_cdi_facts)
     _insert_quarkus_rest_facts(connection, result.quarkus_rest_facts)
+    _insert_quarkus_route_facts(connection, result.quarkus_route_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
@@ -4082,6 +4111,9 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
     ).fetchone() is None
     quarkus_rest_schema_missing = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_rest_facts'"
+    ).fetchone() is None
+    quarkus_route_schema_missing = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_route_facts'"
     ).fetchone() is None
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -4194,6 +4226,18 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         flavor TEXT
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS quarkus_route_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        flavor TEXT
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -4228,6 +4272,7 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         or quarkus_config_schema_missing
         or quarkus_cdi_schema_missing
         or quarkus_rest_schema_missing
+        or quarkus_route_schema_missing
     )
 
 
@@ -4264,6 +4309,7 @@ def _replace_changed_source_records(
     quarkus_config_facts: tuple[QuarkusConfigFact, ...] = (),
     quarkus_cdi_facts: tuple[QuarkusCDIFact, ...] = (),
     quarkus_rest_facts: tuple[QuarkusRESTFact, ...] = (),
+    quarkus_route_facts: tuple[QuarkusRouteFact, ...] = (),
     replace_all_ejb_facts: bool = False,
 ) -> None:
     if replace_all_ejb_facts:
@@ -4272,6 +4318,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_config_facts")
         connection.execute("DELETE FROM quarkus_cdi_facts")
         connection.execute("DELETE FROM quarkus_rest_facts")
+        connection.execute("DELETE FROM quarkus_route_facts")
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
@@ -4283,6 +4330,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_config_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_cdi_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_rest_facts WHERE path = ?", (path,))
+        connection.execute("DELETE FROM quarkus_route_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
@@ -4294,6 +4342,7 @@ def _replace_changed_source_records(
     _insert_quarkus_config_facts(connection, quarkus_config_facts)
     _insert_quarkus_cdi_facts(connection, quarkus_cdi_facts)
     _insert_quarkus_rest_facts(connection, quarkus_rest_facts)
+    _insert_quarkus_route_facts(connection, quarkus_route_facts)
 
 
 def _insert_java_facts(
@@ -4479,6 +4528,29 @@ def _insert_quarkus_rest_facts(
 ) -> None:
     connection.executemany(
         """INSERT INTO quarkus_rest_facts(
+        kind, subject, target, value, path, start_line, end_line, flavor
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.flavor,
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _insert_quarkus_route_facts(
+    connection: sqlite3.Connection, facts: Iterable[QuarkusRouteFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO quarkus_route_facts(
         kind, subject, target, value, path, start_line, end_line, flavor
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
@@ -4919,6 +4991,367 @@ def _analyze_quarkus_rest_files(
     return tuple(facts)
 
 
+def _quarkus_route_has_reactive_extension(quarkus_build_facts: Iterable[QuarkusBuildFact]) -> bool:
+    for fact in quarkus_build_facts:
+        if fact.kind != "extension":
+            continue
+        subject = (fact.subject or "").lower()
+        if subject in {
+            "quarkus-reactive-routes",
+            "quarkus-vertx-http",
+            "quarkus-rest",
+            "quarkus-resteasy-reactive",
+        }:
+            return True
+    return False
+
+
+def _route_methods_from_snippet(snippet: str) -> list[str]:
+    """Return declared route methods for a `@Route` or programmatic registration.
+
+    Accepts ``HttpMethod.GET``, ``GET`` (when nested in a methods array), and the
+    common method-name literal forms.
+    """
+    methods: list[str] = []
+    for match in re.finditer(
+        r"(?:HttpMethod\.([A-Z]+)|methods\s*=\s*\{?\s*([A-Z][A-Z_]+))",
+        snippet,
+    ):
+        token = match.group(1) or match.group(2)
+        if token and token not in methods:
+            methods.append(token)
+    return methods
+
+
+def _route_media_types(snippet: str, attribute: str) -> list[str]:
+    pattern = (
+        rf"{attribute}\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z][\w.]*)|({{\s*[^}}]+\s*}}))"
+    )
+    match = re.search(pattern, snippet)
+    if not match:
+        return []
+    raw = match.group(4) or match.group(1) or match.group(2) or match.group(3) or ""
+    parts: list[str] = []
+    for candidate in re.findall(r"\"([^\"]+)\"|'([^']+)'", raw):
+        token = candidate[0] or candidate[1]
+        if token and token not in parts:
+            parts.append(token)
+    if not parts and raw:
+        parts = [raw.strip()]
+    return parts
+
+
+def _route_order(snippet: str) -> int | None:
+    match = re.search(r"order\s*=\s*(\d+)", snippet)
+    return int(match.group(1)) if match else None
+
+
+def _route_handler_type(snippet: str) -> str:
+    match = re.search(r"type\s*=\s*Route\.HandlerType\.([A-Z]+)", snippet)
+    if match:
+        return match.group(1)
+    match = re.search(r"type\s*=\s*([A-Z]+)", snippet)
+    if match and match.group(1) in {"NORMAL", "BLOCKING", "FAILURE"}:
+        return match.group(1)
+    if re.search(r"@io\.smallrye\.common\.annotation\.Blocking\b|@Blocking\b", snippet):
+        return "BLOCKING"
+    return "NORMAL"
+
+
+def _route_path(snippet: str) -> str:
+    match = re.search(r'path\s*=\s*"([^"]+)"', snippet)
+    if match:
+        return match.group(1)
+    match = re.search(r"path\s*=\s*'([^']+)'", snippet)
+    return match.group(1) if match else ""
+
+
+def _route_regex(snippet: str) -> str:
+    match = re.search(r'regex\s*=\s*"([^"]+)"', snippet)
+    if match:
+        return match.group(1)
+    return re.search(r"regex\s*=\s*'([^']+)'", snippet).group(1) if re.search(r"regex\s*=\s*'([^']+)'", snippet) else ""
+
+
+def _route_annotations_on_target(snippet: str, *, multi: bool = False) -> list[str]:
+    """Return each literal `@Route(...)` annotation block appearing directly above the method.
+
+    ``multi=True`` accepts repeatable annotations stacked above the method.
+    """
+    if multi:
+        annotations: list[str] = []
+        position = 0
+        while True:
+            match = re.search(r"@Route\s*\((.*?)\)", snippet[position:], re.DOTALL)
+            if match is None:
+                break
+            annotations.append(match.group(1))
+            position += match.end()
+        return annotations
+    match = re.search(r"@Route\s*\((.*?)\)", snippet, re.DOTALL)
+    return [match.group(1)] if match else []
+
+
+def _analyze_quarkus_route_files(
+    contents_by_path: dict[Path, bytes],
+    declarations: tuple[JavaDeclaration, ...],
+    quarkus_build_facts: tuple[QuarkusBuildFact, ...] = (),
+) -> tuple[QuarkusRouteFact, ...]:
+    facts: list[QuarkusRouteFact] = []
+    build_present = _quarkus_route_has_reactive_extension(quarkus_build_facts)
+    for path, content in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        if path.suffix.lower() != ".java":
+            continue
+        text = content.decode("utf-8", errors="replace")
+        has_route_import = bool(
+            re.search(r"import\s+(?:io\.quarkus\.vertx\.web\.Route\b|io\.quarkus\.vertx\.web\.RouteBase\b)", text)
+        )
+        has_router_import = bool(
+            re.search(r"import\s+(?:io\.vertx\.ext\.web\.Router\b|io\.vertx\.mutiny\.ext\.web\.Router\b)", text)
+        )
+        if not (has_route_import or has_router_import):
+            continue
+        lines = text.splitlines()
+        file_flavor = "quarkus_reactive_routes" if build_present or has_route_import else "unknown"
+        for decl in declarations:
+            if decl.path != path:
+                continue
+            if decl.kind == "class":
+                class_snippet = "\n".join(lines[max(0, decl.start_line - 8): decl.end_line])
+                base_match = re.search(
+                    r"@RouteBase\s*\(([^)]*)\)", class_snippet, re.DOTALL
+                )
+                if base_match:
+                    base_args = base_match.group(1)
+                    base_path = _route_path(base_args)
+                    base_produces = _route_media_types(base_args, "produces")
+                    facts.append(
+                        QuarkusRouteFact(
+                            "route_base",
+                            decl.qualified_name,
+                            base_path,
+                            json.dumps({"produces": base_produces}),
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            flavor=file_flavor,
+                        )
+                    )
+                # Programmatic Vert.x router registration: a method that takes
+                # `Router router` and uses literal paths/handler references.
+                for method in declarations:
+                    if method.path != path or method.kind not in {"method", "constructor"}:
+                        continue
+                    if method.start_line < decl.start_line or method.end_line > decl.end_line:
+                        continue
+                    if method.name == decl.name:
+                        continue
+                    method_text = "\n".join(lines[max(0, method.start_line - 3): method.end_line])
+                    if "Router" not in method_text:
+                        continue
+                    if not re.search(r"@Observes\b", method_text):
+                        continue
+                    any_literal_registration = False
+                    for route_match in re.finditer(
+                        r"router\s*\.\s*(get|post|put|delete|patch|head|options)\s*\(\s*(?:\"([^\"]+)\"|'([^']+)')\s*\)\s*\.\s*handler\s*\(\s*([^)]+)\)",
+                        method_text,
+                    ):
+                        verb = route_match.group(1).upper()
+                        path_value = route_match.group(2) or route_match.group(3) or ""
+                        handler_ref = (route_match.group(4) or "").strip()
+                        if not path_value:
+                            continue
+                        any_literal_registration = True
+                        if handler_ref.startswith("this::"):
+                            handler_ref = handler_ref[len("this::"):]
+                        if "::" in handler_ref or handler_ref.endswith("::") or handler_ref.startswith("::"):
+                            facts.append(
+                                QuarkusRouteFact(
+                                    "router_unresolved",
+                                    f"{decl.qualified_name}#{method.name}",
+                                    path_value,
+                                    "Router handler method reference cannot be tied to a local symbol.",
+                                    path,
+                                    method.start_line,
+                                    method.end_line,
+                                    flavor=file_flavor,
+                                )
+                            )
+                            continue
+                        if "." in handler_ref:
+                            facts.append(
+                                QuarkusRouteFact(
+                                    "router_unresolved",
+                                    f"{decl.qualified_name}#{method.name}",
+                                    path_value,
+                                    "Router handler reference is not a direct owning-class method.",
+                                    path,
+                                    method.start_line,
+                                    method.end_line,
+                                    flavor=file_flavor,
+                                )
+                            )
+                            continue
+                        handler_method = next(
+                            (
+                                m for m in declarations
+                                if m.path == path
+                                and m.kind == "method"
+                                and m.name == handler_ref
+                                and m.start_line >= decl.start_line
+                                and m.end_line <= decl.end_line
+                            ),
+                            None,
+                        )
+                        if handler_method is None:
+                            facts.append(
+                                QuarkusRouteFact(
+                                    "router_unresolved",
+                                    f"{decl.qualified_name}#{method.name}",
+                                    path_value,
+                                    "Router handler reference does not resolve to a local method declaration.",
+                                    path,
+                                    method.start_line,
+                                    method.end_line,
+                                    flavor=file_flavor,
+                                )
+                            )
+                            continue
+                        meta = {
+                            "path": path_value,
+                            "methods": [verb],
+                            "handler_type": "NORMAL",
+                            "produces": [],
+                            "consumes": [],
+                            "order": None,
+                            "build_profile_conditions": _extract_build_profile_conditions(method_text),
+                            "source": "router_registration",
+                        }
+                        facts.append(
+                            QuarkusRouteFact(
+                                "route_method",
+                                handler_method.qualified_name,
+                                f"{verb} {path_value}",
+                                json.dumps(meta),
+                                path,
+                                handler_method.start_line,
+                                handler_method.end_line,
+                                flavor=file_flavor,
+                            )
+                        )
+                    if not any_literal_registration and re.search(
+                        r"router\s*\.\s*(get|post|put|delete|patch|head|options)\s*\(", method_text
+                    ):
+                        # Try to find any handler references even with non-literal paths
+                        handler_subjects: list[str] = [f"{decl.qualified_name}#{method.name}"]
+                        for handler_match in re.finditer(
+                            r"router\s*\.\s*(?:get|post|put|delete|patch|head|options)\s*\([^)]*\)\s*\.\s*handler\s*\(\s*(this::)?([A-Za-z_$][\w$]*)\s*\)",
+                            method_text,
+                        ):
+                            this_prefix = handler_match.group(1) or ""
+                            handler_name = handler_match.group(2)
+                            if this_prefix:
+                                handler_method = next(
+                                    (
+                                        m for m in declarations
+                                        if m.path == path
+                                        and m.kind == "method"
+                                        and m.name == handler_name
+                                        and m.start_line >= decl.start_line
+                                        and m.end_line <= decl.end_line
+                                    ),
+                                    None,
+                                )
+                                if handler_method is not None:
+                                    handler_subjects.append(handler_method.qualified_name)
+                        for subject in handler_subjects:
+                            facts.append(
+                                QuarkusRouteFact(
+                                    "router_unresolved",
+                                    subject,
+                                    None,
+                                    "Programmatic router registration uses a dynamic, lambda, or method-reference handler that was not asserted.",
+                                    path,
+                                    method.start_line,
+                                    method.end_line,
+                                    flavor=file_flavor,
+                                )
+                            )
+                continue
+            if decl.kind != "method":
+                continue
+            method_snippet = "\n".join(lines[max(0, decl.start_line - 8): decl.end_line])
+            class_decl = next(
+                (
+                    c for c in declarations
+                    if c.path == path and c.kind == "class"
+                    and c.start_line <= decl.start_line <= c.end_line
+                ),
+                None,
+            )
+            base_path = ""
+            base_produces: list[str] = []
+            if class_decl is not None:
+                class_snippet = "\n".join(lines[max(0, class_decl.start_line - 8): class_decl.end_line])
+                base_match = re.search(r"@RouteBase\s*\(([^)]*)\)", class_snippet, re.DOTALL)
+                if base_match:
+                    base_path = _route_path(base_match.group(1))
+                    base_produces = _route_media_types(base_match.group(1), "produces")
+            route_blocks = _route_annotations_on_target(method_snippet, multi=True)
+            if not route_blocks:
+                continue
+            for args in route_blocks:
+                regex_value = _route_regex(args)
+                if regex_value:
+                    facts.append(
+                        QuarkusRouteFact(
+                            "route_unresolved",
+                            decl.qualified_name,
+                            regex_value,
+                            "Reactive Route regex path was not asserted as a static route.",
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            flavor=file_flavor,
+                        )
+                    )
+                    continue
+                path_value = _route_path(args)
+                if not path_value:
+                    path_value = _route_path(method_snippet) or decl.name
+                methods_list = _route_methods_from_snippet(args)
+                if not methods_list:
+                    methods_list = ["GET"]
+                produces = _route_media_types(args, "produces") or list(base_produces)
+                consumes = _route_media_types(args, "consumes")
+                handler_type = _route_handler_type(method_snippet + "\n" + args)
+                order_value = _route_order(args)
+                full_path = (("/" + base_path.strip("/") + "/" + path_value.lstrip("/")) if base_path else path_value).replace("//", "/")
+                meta = {
+                    "path": full_path,
+                    "methods": methods_list,
+                    "handler_type": handler_type,
+                    "produces": produces,
+                    "consumes": consumes,
+                    "order": order_value,
+                    "build_profile_conditions": _extract_build_profile_conditions(method_snippet),
+                    "source": "annotation",
+                }
+                facts.append(
+                    QuarkusRouteFact(
+                        "route_method",
+                        decl.qualified_name,
+                        f"{'/'.join(methods_list)} {full_path}".strip(),
+                        json.dumps(meta),
+                        path,
+                        decl.start_line,
+                        decl.end_line,
+                        flavor=file_flavor,
+                    )
+                )
+    return tuple(facts)
+
+
 def _quarkus_rest_relationships(
     connection_data_path: Path,
     owner: str,
@@ -5212,6 +5645,238 @@ def _quarkus_rest_relationships(
                                 business_view=json.dumps(business_data),
                             )
                         )
+
+    return tuple(relationships), tuple(unresolved)
+
+
+def _quarkus_route_relationships(
+    connection_data_path: Path,
+    owner: str,
+    target: ImpactTarget,
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, flavor
+            FROM quarkus_route_facts ORDER BY path, start_line"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return (), ()
+    finally:
+        connection.close()
+
+    if not rows:
+        return (), ()
+
+    facts = [
+        QuarkusRouteFact(
+            kind, subject, fact_target, value, Path(path), start_line, end_line, flavor
+        )
+        for kind, subject, fact_target, value, path, start_line, end_line, flavor in rows
+    ]
+
+    target_class, _, target_method = target.signature.partition("#")
+    target_method_name = target_method.split("(", maxsplit=1)[0]
+
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+    seen: set[tuple[str, Path, int, int, str]] = set()
+
+    for fact in facts:
+        if fact.kind == "route_base":
+            continue
+        fact_class, _, fact_method = fact.subject.partition("#")
+        if fact_method:
+            if fact_class != target_class or fact_method != target_method_name:
+                continue
+        elif fact_class != target_class:
+            continue
+        if fact.kind == "route_unresolved":
+            unresolved.append(
+                UnresolvedItem(
+                    fact.value or "Reactive Route could not be proven.",
+                    fact.path,
+                    fact.start_line,
+                    fact.end_line,
+                    evidence_handle=f"quarkus_route:{fact.path.as_posix()}:{fact.start_line}-{fact.end_line}",
+                )
+            )
+            continue
+        if fact.kind != "route_method":
+            continue
+        meta = json.loads(fact.value or "{}")
+        flavor = fact.flavor or "unknown"
+        confidence = "high" if flavor != "unknown" else "medium"
+        caller = fact.target or (f"{'/'.join(meta.get('methods', []))} {meta.get('path', '')}".strip())
+        handle = f"quarkus_route:{fact.path.as_posix()}:{fact.start_line}-{fact.end_line}"
+        chain = (handle,)
+        business_data = {
+            "flavor": flavor,
+            "route": caller,
+            "methods": meta.get("methods", []),
+            "path": meta.get("path"),
+            "handler_type": meta.get("handler_type"),
+            "produces": meta.get("produces", []),
+            "consumes": meta.get("consumes", []),
+            "order": meta.get("order"),
+            "source": meta.get("source"),
+        }
+        if meta.get("build_profile_conditions"):
+            business_data["build_profile_conditions"] = meta.get("build_profile_conditions")
+        key = ("quarkus_http_route", caller, fact.path, fact.start_line, fact.end_line, handle)
+        if key in seen:
+            continue
+        seen.add(key)
+        relationships.append(
+            ImpactRelationship(
+                "quarkus_http_route",
+                caller,
+                fact.path,
+                fact.start_line,
+                fact.end_line,
+                handle,
+                confidence,
+                False,
+                None,
+                evidence_chain=chain,
+                business_view=json.dumps(business_data),
+            )
+        )
+
+    for fact in facts:
+        if fact.kind != "router_unresolved":
+            continue
+        fact_class, _, fact_method = fact.subject.partition("#")
+        if fact_method:
+            if fact_class != target_class or fact_method != target_method_name:
+                continue
+        elif fact_class != target_class:
+            continue
+        unresolved.append(
+            UnresolvedItem(
+                fact.value or "Programmatic router registration remained unresolved.",
+                fact.path,
+                fact.start_line,
+                fact.end_line,
+                evidence_handle=f"quarkus_route:{fact.path.as_posix()}:{fact.start_line}-{fact.end_line}",
+            )
+        )
+
+    return tuple(relationships), tuple(unresolved)
+
+
+def _quarkus_cdi_relationships(
+    connection_data_path: Path,
+    owner: str,
+    target: ImpactTarget,
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, flavor
+            FROM quarkus_route_facts ORDER BY path, start_line"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return (), ()
+    finally:
+        connection.close()
+
+    if not rows:
+        return (), ()
+
+    facts = [
+        QuarkusRouteFact(
+            kind, subject, fact_target, value, Path(path), start_line, end_line, flavor
+        )
+        for kind, subject, fact_target, value, path, start_line, end_line, flavor in rows
+    ]
+
+    target_class, _, target_method = target.signature.partition("#")
+    target_method_name = target_method.split("(", maxsplit=1)[0]
+
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+    seen: set[tuple[str, Path, int, int, str]] = set()
+
+    for fact in facts:
+        if fact.kind == "route_base":
+            continue
+        fact_class, _, fact_method = fact.subject.partition("#")
+        if fact_method:
+            if fact_class != target_class or fact_method != target_method_name:
+                continue
+        elif fact_class != target_class:
+            continue
+        if fact.kind == "route_unresolved":
+            unresolved.append(
+                UnresolvedItem(
+                    fact.value or "Reactive Route could not be proven.",
+                    fact.path,
+                    fact.start_line,
+                    fact.end_line,
+                    evidence_handle=f"quarkus_route:{fact.path.as_posix()}:{fact.start_line}-{fact.end_line}",
+                )
+            )
+            continue
+        if fact.kind != "route_method":
+            continue
+        meta = json.loads(fact.value or "{}")
+        flavor = fact.flavor or "unknown"
+        confidence = "high" if flavor != "unknown" else "medium"
+        caller = fact.target or (f"{'/'.join(meta.get('methods', []))} {meta.get('path', '')}".strip())
+        handle = f"quarkus_route:{fact.path.as_posix()}:{fact.start_line}-{fact.end_line}"
+        chain = (handle,)
+        business_data = {
+            "flavor": flavor,
+            "route": caller,
+            "methods": meta.get("methods", []),
+            "path": meta.get("path"),
+            "handler_type": meta.get("handler_type"),
+            "produces": meta.get("produces", []),
+            "consumes": meta.get("consumes", []),
+            "order": meta.get("order"),
+            "source": meta.get("source"),
+        }
+        if meta.get("build_profile_conditions"):
+            business_data["build_profile_conditions"] = meta.get("build_profile_conditions")
+        key = ("quarkus_http_route", caller, fact.path, fact.start_line, fact.end_line, handle)
+        if key in seen:
+            continue
+        seen.add(key)
+        relationships.append(
+            ImpactRelationship(
+                "quarkus_http_route",
+                caller,
+                fact.path,
+                fact.start_line,
+                fact.end_line,
+                handle,
+                confidence,
+                False,
+                None,
+                evidence_chain=chain,
+                business_view=json.dumps(business_data),
+            )
+        )
+
+    for fact in facts:
+        if fact.kind != "router_unresolved":
+            continue
+        fact_class, _, fact_method = fact.subject.partition("#")
+        if fact_method:
+            if fact_class != target_class or fact_method != target_method_name:
+                continue
+        elif fact_class != target_class:
+            continue
+        unresolved.append(
+            UnresolvedItem(
+                fact.value or "Programmatic router registration remained unresolved.",
+                fact.path,
+                fact.start_line,
+                fact.end_line,
+                evidence_handle=f"quarkus_route:{fact.path.as_posix()}:{fact.start_line}-{fact.end_line}",
+            )
+        )
 
     return tuple(relationships), tuple(unresolved)
 
