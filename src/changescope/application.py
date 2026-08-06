@@ -735,6 +735,7 @@ def _direct_relationships(
         connection_data_path=database_path,
         owner=owner,
         target=target,
+        build_profiles=build_profiles,
     )
     relationships.extend(cdi_relationships)
     unresolved_items.extend(cdi_unresolved)
@@ -4438,24 +4439,36 @@ def _analyze_quarkus_cdi_files(
 
             has_cdi_import = bool(
                 re.search(
-                    r"import\s+(?:jakarta|javax)\.(?:enterprise\.context|inject)\.",
+                    r"import\s+(?:jakarta|javax|io\.quarkus\.arc)\.",
                     text,
                 )
-            )
+            ) or "@Inject" in text or "@Produces" in text or "@ApplicationScoped" in text
+
             if has_cdi_import:
                 for decl in declarations:
                     if decl.kind == "class" and decl.path == path:
-                        decl_lines = lines[decl.start_line - 1 : decl.end_line]
-                        decl_text = "\n".join(decl_lines)
+                        decl_snippet = "\n".join(lines[max(0, decl.start_line - 6) : decl.end_line])
                         scope_match = re.search(
                             r"@(ApplicationScoped|RequestScoped|SessionScoped|Dependent|Singleton)",
-                            decl_text,
+                            decl_snippet,
                         )
+                        named_match = re.search(r'@Named\s*(?:\(\s*["\']([^"\']+)["\']\s*\))?', decl_snippet)
+                        named_val = named_match.group(1) if (named_match and named_match.group(1)) else (decl.name if named_match else None)
+
+                        ifBuild_match = re.search(r'@IfBuildProfile\s*\(\s*["\']([^"\']+)["\']\s*\)', decl_snippet)
+                        unlessBuild_match = re.search(r'@UnlessBuildProfile\s*\(\s*["\']([^"\']+)["\']\s*\)', decl_snippet)
+                        cond = []
+                        if ifBuild_match:
+                            cond.append(f"if:{ifBuild_match.group(1)}")
+                        if unlessBuild_match:
+                            cond.append(f"unless:{unlessBuild_match.group(1)}")
+                        cond_val = ";".join(cond) if cond else None
+
                         if scope_match:
                             scope_name = scope_match.group(1)
                             implements_match = re.search(
                                 r"\bimplements\s+([A-Za-z0-9_$,\s]+?)(?:\{|implements|extends)",
-                                decl_text,
+                                decl_snippet,
                             )
                             interfaces = (
                                 implements_match.group(1).strip()
@@ -4467,21 +4480,75 @@ def _analyze_quarkus_cdi_files(
                                     "cdi_bean",
                                     decl.qualified_name,
                                     interfaces,
-                                    scope_name,
+                                    named_val,
                                     path,
                                     decl.start_line,
                                     decl.end_line,
-                                    scope_name,
+                                    scope=cond_val or scope_name,
                                 )
                             )
 
+                        # Check constructor injection (single constructor or @Inject constructor)
+                        constructors = [d for d in declarations if d.kind == "constructor" and d.path == path and d.start_line >= decl.start_line and d.end_line <= decl.end_line]
+                        for c in constructors:
+                            c_line = lines[c.start_line - 1]
+                            param_match = re.search(r"\(([^)]+)\)", c_line)
+                            if param_match:
+                                params = param_match.group(1).split(",")
+                                for p in params:
+                                    p_tokens = p.strip().split()
+                                    if len(p_tokens) >= 2:
+                                        p_type = p_tokens[-2]
+                                        p_name = p_tokens[-1]
+                                        facts.append(
+                                            QuarkusCDIFact(
+                                                "cdi_injection",
+                                                c.qualified_name,
+                                                p_type,
+                                                p_name,
+                                                path,
+                                                c.start_line,
+                                                c.start_line,
+                                            )
+                                        )
+
+                # Check @Produces methods
+                if "@Produces" in text:
+                    for decl in declarations:
+                        if decl.kind == "method" and decl.path == path:
+                            method_snippet = "\n".join(lines[max(0, decl.start_line - 6) : decl.end_line])
+                            if "@Produces" in method_snippet:
+                                ret_match = re.search(
+                                    r'([A-Za-z0-9_$.<>]+)\s+' + re.escape(decl.name) + r'\s*\(',
+                                    method_snippet,
+                                )
+                                return_type = ret_match.group(1).strip() if (ret_match and ret_match.group(1) not in {"public", "protected", "private", "static", "final", "synchronized"}) else decl.name
+                                named_match = re.search(r'@Named\s*(?:\(\s*["\']([^"\']+)["\']\s*\))?', method_snippet)
+                                named_val = named_match.group(1) if (named_match and named_match.group(1)) else None
+                                facts.append(
+                                    QuarkusCDIFact(
+                                        "cdi_producer",
+                                        decl.qualified_name,
+                                        return_type,
+                                        named_val,
+                                        path,
+                                        decl.start_line,
+                                        decl.end_line,
+                                    )
+                                )
+
+                # Check @Inject fields / initializers
                 if "@Inject" in text:
                     for line_idx, line in enumerate(lines, 1):
                         if "@Inject" in line:
-                            field_snippet = "\n".join(lines[line_idx - 1 : line_idx + 2])
+                            field_snippet = "\n".join(lines[max(0, line_idx - 1) : min(len(lines), line_idx + 4)])
+                            named_match = re.search(r'@Named\s*(?:\(\s*["\']([^"\']+)["\']\s*\))?', field_snippet)
+                            named_val = named_match.group(1) if (named_match and named_match.group(1)) else None
+
                             field_match = re.search(
-                                r"@Inject\s+(?:[A-Za-z0-9_$.<>]+\s+)?([A-Za-z0-9_$.<>]+)\s+([A-Za-z0-9_$]+)\s*;",
+                                r"@Inject\s+(?:@[A-Za-z0-9_$.()'\"-]+\s+)*([A-Za-z0-9_$.<>]+)\s+([A-Za-z0-9_$]+)\s*;",
                                 field_snippet,
+                                re.DOTALL,
                             )
                             if field_match:
                                 field_type = field_match.group(1).strip()
@@ -4504,8 +4571,33 @@ def _analyze_quarkus_cdi_files(
                                         path,
                                         line_idx,
                                         line_idx,
+                                        scope=named_val,
                                     )
                                 )
+
+                # Check dynamic CDI patterns (Instance<T>, Provider<T>, CDI.current())
+                for line_idx, line in enumerate(lines, 1):
+                    if re.search(r"\b(?:Instance|Provider)<|CDI\.current\(\)", line):
+                        owner_decl = next(
+                            (
+                                d
+                                for d in declarations
+                                if d.path == path and d.start_line <= line_idx <= d.end_line
+                            ),
+                            None,
+                        )
+                        subject = owner_decl.qualified_name if owner_decl else ""
+                        facts.append(
+                            QuarkusCDIFact(
+                                "cdi_dynamic",
+                                subject,
+                                "dynamic",
+                                line.strip(),
+                                path,
+                                line_idx,
+                                line_idx,
+                            )
+                        )
     return tuple(facts)
 
 
@@ -4513,6 +4605,7 @@ def _quarkus_cdi_relationships(
     connection_data_path: Path,
     owner: str,
     target: ImpactTarget,
+    build_profiles: tuple[str, ...] = (),
 ) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
     connection = sqlite3.connect(connection_data_path)
     try:
@@ -4547,26 +4640,77 @@ def _quarkus_cdi_relationships(
     unresolved: list[UnresolvedItem] = []
 
     beans = [f for f in cdi_facts if f.kind == "cdi_bean"]
+    producers = [f for f in cdi_facts if f.kind == "cdi_producer"]
     injections = [f for f in cdi_facts if f.kind == "cdi_injection"]
+    dynamics = [f for f in cdi_facts if f.kind == "cdi_dynamic"]
+
+    def matching_owner(sub: str) -> bool:
+        if sub == owner:
+            return True
+        if sub.rsplit("#", maxsplit=1)[0] == owner:
+            return True
+        return sub.rsplit(".", maxsplit=1)[-1] == owner.rsplit(".", maxsplit=1)[-1]
+
+    for dyn in dynamics:
+        if matching_owner(dyn.subject):
+            unresolved.append(
+                _unresolved(
+                    f"Dynamic CDI pattern ({dyn.value}) in {dyn.subject} is unresolved.",
+                    dyn.path,
+                    dyn.start_line,
+                    dyn.end_line,
+                    "quarkus_cdi",
+                )
+            )
 
     target_class = owner.rsplit(".", maxsplit=1)[-1]
     target_full_class = owner
+    target_sig = target.signature.split("(")[0]
 
     for inj in injections:
         inj_type = inj.target or ""
         inj_type_simple = inj_type.rsplit(".", maxsplit=1)[-1]
+        inj_named = inj.scope  # @Named qualifier if present
 
-        matching_beans = []
+        matching_candidates = []
+
+        # Match class beans
         for b in beans:
+            # Check profile conditions
+            if b.scope:
+                if "if:" in b.scope:
+                    if_prof = b.scope.split("if:", 1)[1].split(";")[0]
+                    if build_profiles and if_prof not in build_profiles:
+                        continue
+                if "unless:" in b.scope:
+                    unless_prof = b.scope.split("unless:", 1)[1].split(";")[0]
+                    if build_profiles and unless_prof in build_profiles:
+                        continue
+
             b_simple = b.subject.rsplit(".", maxsplit=1)[-1]
-            if (
+            type_matches = (
                 b.subject == inj_type
                 or b_simple == inj_type_simple
                 or (b.target and inj_type_simple in b.target)
-            ):
-                matching_beans.append(b)
+            )
+            if not type_matches:
+                continue
 
-        if not matching_beans:
+            # Check @Named qualifier match
+            if inj_named and b.value and inj_named != b.value:
+                continue
+            matching_candidates.append(("bean", b))
+
+        # Match producer methods
+        for p in producers:
+            p_ret = p.target or ""
+            p_ret_simple = p_ret.rsplit(".", maxsplit=1)[-1]
+            if inj_type_simple == p_ret_simple or inj_type == p_ret:
+                if inj_named and p.value and inj_named != p.value:
+                    continue
+                matching_candidates.append(("producer", p))
+
+        if not matching_candidates:
             unresolved.append(
                 _unresolved(
                     f"Quarkus CDI Injection Point '{inj.value}' of type '{inj.target}' in {inj.subject} has no matching CDI bean candidate in indexed Java source.",
@@ -4577,8 +4721,8 @@ def _quarkus_cdi_relationships(
                 )
             )
             continue
-        elif len(matching_beans) > 1:
-            candidate_names = ", ".join(b.subject for b in matching_beans)
+        elif len(matching_candidates) > 1:
+            candidate_names = ", ".join(item[1].subject for item in matching_candidates)
             unresolved.append(
                 _unresolved(
                     f"Quarkus CDI Injection Point '{inj.value}' of type '{inj.target}' in {inj.subject} has multiple candidate beans ({candidate_names}); ambiguous CDI injection is unresolved.",
@@ -4590,44 +4734,83 @@ def _quarkus_cdi_relationships(
             )
             continue
 
-        selected_bean = matching_beans[0]
-        if selected_bean.subject == target_full_class or selected_bean.subject.endswith("." + target_class) or (selected_bean.target and target_class in selected_bean.target):
-            evidence_handle = f"quarkus_cdi:{inj.path.as_posix()}:{inj.start_line}-{inj.end_line}"
-            relationships.append(
-                ImpactRelationship(
-                    "quarkus_cdi_injection",
-                    selected_bean.subject,
-                    inj.path,
-                    inj.start_line,
-                    inj.end_line,
-                    evidence_handle,
-                    "high",
-                    False,
-                    None,
-                    evidence_chain=(evidence_handle,),
-                )
-            )
-
-            method_name = target.signature.split("#", maxsplit=1)[-1].partition("(")[0]
-            field_name = inj.value
-            for inv in invocations:
-                inv_name, inv_receiver, inv_caller, inv_path, inv_start, inv_end, _ = inv
-                if inv_name == method_name and inv_caller and inv_caller.startswith(inj.subject):
-                    inv_handle = f"invocation:{inv_path}:{inv_start}-{inv_end}"
-                    relationships.append(
-                        ImpactRelationship(
-                            "quarkus_cdi_dispatch",
-                            inv_caller,
-                            Path(inv_path),
-                            inv_start,
-                            inv_end,
-                            inv_handle,
-                            "high",
-                            False,
-                            None,
-                            evidence_chain=(evidence_handle, inv_handle),
-                        )
+        cand_kind, selected_item = matching_candidates[0]
+        inj_owner = inj.subject.split("#")[0]
+        if cand_kind == "bean":
+            selected_bean = selected_item
+            if selected_bean.subject == target_full_class or selected_bean.subject.endswith("." + target_class) or (selected_bean.target and target_class in selected_bean.target):
+                evidence_handle = f"quarkus_cdi:{inj.path.as_posix()}:{inj.start_line}-{inj.end_line}"
+                relationships.append(
+                    ImpactRelationship(
+                        "quarkus_cdi_injection",
+                        selected_bean.subject,
+                        inj.path,
+                        inj.start_line,
+                        inj.end_line,
+                        evidence_handle,
+                        "high",
+                        False,
+                        None,
+                        evidence_chain=(evidence_handle,),
                     )
+                )
+
+                method_name = target.signature.split("#", maxsplit=1)[-1].partition("(")[0]
+                for inv in invocations:
+                    inv_name, inv_receiver, inv_caller, inv_path, inv_start, inv_end, _ = inv
+                    if inv_name == method_name and inv_caller and inv_caller.startswith(inj_owner):
+                        inv_handle = f"invocation:{inv_path}:{inv_start}-{inv_end}"
+                        relationships.append(
+                            ImpactRelationship(
+                                "quarkus_cdi_dispatch",
+                                inv_caller,
+                                Path(inv_path),
+                                inv_start,
+                                inv_end,
+                                inv_handle,
+                                "high",
+                                False,
+                                None,
+                                evidence_chain=(evidence_handle, inv_handle),
+                            )
+                        )
+        elif cand_kind == "producer":
+            selected_producer = selected_item
+            if selected_producer.subject == target_sig or selected_producer.subject.startswith(owner):
+                evidence_handle = f"quarkus_cdi:{inj.path.as_posix()}:{inj.start_line}-{inj.end_line}"
+                relationships.append(
+                    ImpactRelationship(
+                        "quarkus_cdi_injection",
+                        selected_producer.subject,
+                        inj.path,
+                        inj.start_line,
+                        inj.end_line,
+                        evidence_handle,
+                        "high",
+                        False,
+                        None,
+                        evidence_chain=(evidence_handle,),
+                    )
+                )
+
+                for inv in invocations:
+                    inv_name, inv_receiver, inv_caller, inv_path, inv_start, inv_end, _ = inv
+                    if inv_caller and inv_caller.startswith(inj_owner):
+                        inv_handle = f"invocation:{inv_path}:{inv_start}-{inv_end}"
+                        relationships.append(
+                            ImpactRelationship(
+                                "quarkus_cdi_dispatch",
+                                inv_caller,
+                                Path(inv_path),
+                                inv_start,
+                                inv_end,
+                                inv_handle,
+                                "high",
+                                False,
+                                None,
+                                evidence_chain=(evidence_handle, inv_handle),
+                            )
+                        )
 
     return tuple(relationships), tuple(unresolved)
 
