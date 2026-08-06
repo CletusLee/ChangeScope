@@ -182,6 +182,18 @@ class QuarkusSecurityFact:
 
 
 @dataclass(frozen=True)
+class QuarkusTestFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    flavor: str | None = None
+
+
+@dataclass(frozen=True)
 class IndexResult:
     source_roots: tuple[Path, ...]
     indexed_files: tuple[Path, ...]
@@ -200,6 +212,7 @@ class IndexResult:
     quarkus_rest_facts: tuple[QuarkusRESTFact, ...] = ()
     quarkus_route_facts: tuple[QuarkusRouteFact, ...] = ()
     quarkus_security_facts: tuple[QuarkusSecurityFact, ...] = ()
+    quarkus_test_facts: tuple[QuarkusTestFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -826,6 +839,13 @@ def _direct_relationships(
     )
     relationships.extend(sec_relationships)
     unresolved_items.extend(sec_unresolved)
+    test_relationships, test_unresolved = _quarkus_test_relationships(
+        connection_data_path=database_path,
+        owner=owner,
+        target=target,
+    )
+    relationships.extend(test_relationships)
+    unresolved_items.extend(test_unresolved)
     return tuple(relationships), tuple(unresolved_items)
 
 
@@ -1967,6 +1987,9 @@ def _index_repository(repository_root: Path) -> IndexResult:
     quarkus_security_facts = _analyze_quarkus_security_files(
         contents_by_path, declarations, quarkus_config_facts
     )
+    quarkus_test_facts = _analyze_quarkus_test_files(
+        contents_by_path, declarations
+    )
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -1986,6 +2009,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
         quarkus_rest_facts=quarkus_rest_facts,
         quarkus_route_facts=quarkus_route_facts,
         quarkus_security_facts=quarkus_security_facts,
+        quarkus_test_facts=quarkus_test_facts,
     )
     _write_index(result)
     return result
@@ -2081,6 +2105,9 @@ def _refresh_index_if_needed(root: Path) -> None:
                 quarkus_security_facts = _analyze_quarkus_security_files(
                     contents_by_path, declarations
                 )
+                quarkus_test_facts = _analyze_quarkus_test_files(
+                    contents_by_path, declarations
+                )
                 _replace_changed_source_records(
                     connection,
                     changed_paths,
@@ -2093,6 +2120,7 @@ def _refresh_index_if_needed(root: Path) -> None:
                     quarkus_build_facts,
                     quarkus_route_facts=quarkus_route_facts,
                     quarkus_security_facts=quarkus_security_facts,
+                    quarkus_test_facts=quarkus_test_facts,
                     replace_all_ejb_facts=refresh_all_ejb_facts,
                 )
             _write_metadata(connection, _snapshot(root), source_roots)
@@ -4130,6 +4158,7 @@ def _replace_index_contents(
     connection.execute("DELETE FROM quarkus_cdi_facts")
     connection.execute("DELETE FROM quarkus_rest_facts")
     connection.execute("DELETE FROM quarkus_security_facts")
+    connection.execute("DELETE FROM quarkus_test_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
     indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
     connection.executemany(
@@ -4152,6 +4181,7 @@ def _replace_index_contents(
     _insert_quarkus_rest_facts(connection, result.quarkus_rest_facts)
     _insert_quarkus_route_facts(connection, result.quarkus_route_facts)
     _insert_quarkus_security_facts(connection, result.quarkus_security_facts)
+    _insert_quarkus_test_facts(connection, result.quarkus_test_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
@@ -4311,6 +4341,18 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         policy TEXT
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS quarkus_test_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        flavor TEXT
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -4384,6 +4426,7 @@ def _replace_changed_source_records(
     quarkus_rest_facts: tuple[QuarkusRESTFact, ...] = (),
     quarkus_route_facts: tuple[QuarkusRouteFact, ...] = (),
     quarkus_security_facts: tuple[QuarkusSecurityFact, ...] = (),
+    quarkus_test_facts: tuple[QuarkusTestFact, ...] = (),
     replace_all_ejb_facts: bool = False,
 ) -> None:
     if replace_all_ejb_facts:
@@ -4394,6 +4437,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_rest_facts")
         connection.execute("DELETE FROM quarkus_route_facts")
         connection.execute("DELETE FROM quarkus_security_facts")
+        connection.execute("DELETE FROM quarkus_test_facts")
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
@@ -4407,6 +4451,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_rest_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_route_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_security_facts WHERE path = ?", (path,))
+        connection.execute("DELETE FROM quarkus_test_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
@@ -4420,6 +4465,7 @@ def _replace_changed_source_records(
     _insert_quarkus_rest_facts(connection, quarkus_rest_facts)
     _insert_quarkus_route_facts(connection, quarkus_route_facts)
     _insert_quarkus_security_facts(connection, quarkus_security_facts)
+    _insert_quarkus_test_facts(connection, quarkus_test_facts)
 
 
 def _insert_java_facts(
@@ -4667,6 +4713,320 @@ def _insert_quarkus_security_facts(
             for fact in facts
         ),
     )
+
+
+def _insert_quarkus_test_facts(
+    connection: sqlite3.Connection, facts: Iterable[QuarkusTestFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO quarkus_test_facts(
+        kind, subject, target, value, path, start_line, end_line, flavor
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.flavor,
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _analyze_quarkus_test_files(
+    contents_by_path: dict[Path, bytes],
+    declarations: tuple[JavaDeclaration, ...],
+) -> tuple[QuarkusTestFact, ...]:
+    facts: list[QuarkusTestFact] = []
+
+    for path, content in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        if path.suffix.lower() == ".java":
+            text = content.decode("utf-8", errors="replace")
+            lines = text.splitlines()
+
+            if "QuarkusMock." in text:
+                for decl in declarations:
+                    if decl.path == path:
+                        facts.append(
+                            QuarkusTestFact(
+                                "test_unresolved",
+                                decl.qualified_name,
+                                "dynamic_mock",
+                                "Dynamic mock installation via QuarkusMock at runtime.",
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                flavor=None,
+                            )
+                        )
+
+            for decl in declarations:
+                if decl.path != path:
+                    continue
+
+                if decl.kind in ("class", "interface"):
+                    decl_snippet = _get_class_snippet(lines, decl)
+
+                    flavor = None
+                    if "@QuarkusTest" in decl_snippet:
+                        flavor = "quarkus_test"
+                    elif "@QuarkusIntegrationTest" in decl_snippet:
+                        flavor = "quarkus_integration_test"
+                    elif "@QuarkusComponentTest" in decl_snippet:
+                        flavor = "quarkus_component_test"
+                    elif "@NativeImageTest" in decl_snippet:
+                        flavor = "quarkus_native_test"
+
+                    if flavor:
+                        facts.append(
+                            QuarkusTestFact(
+                                "test_class",
+                                decl.qualified_name,
+                                None,
+                                None,
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                flavor=flavor,
+                            )
+                        )
+
+                    ep_match = re.search(r'@TestHTTPEndpoint\s*\(\s*(?:value\s*=\s*)?([A-Za-z0-9_$.]+)(?:\.class)?\s*\)', decl_snippet)
+                    if ep_match:
+                        res_name = ep_match.group(1).replace(".class", "").strip()
+                        facts.append(
+                            QuarkusTestFact(
+                                "test_http_endpoint",
+                                decl.qualified_name,
+                                res_name,
+                                json.dumps({"target_resource": res_name}),
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                flavor=flavor,
+                            )
+                        )
+
+                    prof_match = re.search(r'@TestProfile\s*\(\s*(?:value\s*=\s*)?([A-Za-z0-9_$.]+)(?:\.class)?\s*\)', decl_snippet)
+                    if prof_match:
+                        prof_name = prof_match.group(1).replace(".class", "").strip()
+                        facts.append(
+                            QuarkusTestFact(
+                                "test_profile",
+                                decl.qualified_name,
+                                prof_name,
+                                json.dumps({"test_profile": prof_name}),
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                flavor=flavor,
+                            )
+                        )
+
+                    full_class_text = "\n".join(lines[max(0, decl.start_line - 1) : decl.end_line])
+                    for f_match in re.finditer(r'(@InjectMock|@InjectSpy)[\s\n]+(?:private|protected|public)?[\s\n]*([A-Za-z0-9_$.<>]+)[\s\n]+([A-Za-z0-9_$]+)\s*;', full_class_text):
+                        annot = f_match.group(1).strip("@")
+                        fieldType = f_match.group(2).strip()
+                        field_line = decl.start_line + full_class_text[:f_match.start()].count("\n")
+                        facts.append(
+                            QuarkusTestFact(
+                                "inject_mock" if annot == "InjectMock" else "inject_spy",
+                                decl.qualified_name,
+                                fieldType,
+                                json.dumps({"annotation": annot, "field_type": fieldType}),
+                                path,
+                                field_line,
+                                field_line,
+                                flavor=flavor,
+                            )
+                        )
+
+                    for http_res_match in re.finditer(r'@TestHTTPResource\s*\(\s*["\']([^"\']+)["\']\s*\)', full_class_text):
+                        res_path = http_res_match.group(1)
+                        field_line = decl.start_line + full_class_text[:http_res_match.start()].count("\n")
+                        facts.append(
+                            QuarkusTestFact(
+                                "test_http_resource",
+                                decl.qualified_name,
+                                res_path,
+                                json.dumps({"path": res_path}),
+                                path,
+                                field_line,
+                                field_line,
+                                flavor=flavor,
+                            )
+                        )
+
+                elif decl.kind == "method":
+                    method_snippet = _get_method_snippet(lines, decl)
+
+                    for ra_match in re.finditer(r'\b(given\(\)\.)?(get|post|put|delete|patch|head|options)\s*\(\s*["\']([^"\']+)["\']\s*\)', method_snippet):
+                        http_method = ra_match.group(2).upper()
+                        target_path = ra_match.group(3)
+                        call_line = decl.start_line + method_snippet[:ra_match.start()].count("\n")
+                        facts.append(
+                            QuarkusTestFact(
+                                "rest_assured_call",
+                                decl.qualified_name,
+                                target_path,
+                                json.dumps({"method": http_method, "path": target_path}),
+                                path,
+                                call_line,
+                                call_line,
+                                flavor=None,
+                            )
+                        )
+
+    return tuple(facts)
+
+
+def _quarkus_test_relationships(
+    connection_data_path: Path,
+    owner: str,
+    target: ImpactTarget,
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        test_rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, flavor
+            FROM quarkus_test_facts ORDER BY path, start_line"""
+        ).fetchall()
+        rest_rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line FROM quarkus_rest_facts"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return (), ()
+    finally:
+        connection.close()
+
+    if not test_rows:
+        return (), ()
+
+    test_facts = [
+        QuarkusTestFact(kind, subject, fact_target, value, Path(path), start_line, end_line, flavor)
+        for kind, subject, fact_target, value, path, start_line, end_line, flavor in test_rows
+    ]
+
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+    seen_keys: set[tuple[str, str, Path, int, int]] = set()
+
+    target_sig = target.signature
+    target_class = target_sig.rsplit("#", 1)[0]
+    target_method = target_sig.split("#")[-1].split("(")[0] if "#" in target_sig else None
+    clean_target_class = target_class.rsplit(".", 1)[-1]
+
+    def matches_target(f_subject: str) -> bool:
+        if f_subject == target_sig or f_subject == owner:
+            return True
+        f_c, _, f_m = f_subject.partition("#")
+        clean_fm = f_m.split("(")[0] if f_m else ""
+        clean_fc = f_c.rsplit(".", 1)[-1]
+        if f_c == target_class or clean_fc == clean_target_class:
+            if not target_method or not clean_fm or clean_fm == target_method:
+                return True
+        return False
+
+    for tf in test_facts:
+        if tf.kind == "test_unresolved" and matches_target(tf.subject):
+            unresolved.append(
+                UnresolvedItem(
+                    tf.value or f"Dynamic test mock installation on {tf.subject}",
+                    path=tf.path,
+                    start_line=tf.start_line,
+                    end_line=tf.end_line,
+                    evidence_handle=f"quarkus_test:{tf.path.as_posix()}:{tf.start_line}-{tf.end_line}",
+                )
+            )
+
+    class_flavors: dict[str, str] = {}
+    for tf in test_facts:
+        if tf.kind == "test_class" and tf.flavor:
+            class_flavors[tf.subject] = tf.flavor
+            class_flavors[tf.subject.rsplit(".", 1)[-1]] = tf.flavor
+
+    def get_confidence(test_cls: str, explicit_flavor: str | None = None) -> str:
+        flv = explicit_flavor or class_flavors.get(test_cls) or class_flavors.get(test_cls.rsplit(".", 1)[-1])
+        if flv in ("quarkus_integration_test", "quarkus_native_test"):
+            return "medium"
+        return "high"
+
+    for tf in test_facts:
+        if tf.kind in ("inject_mock", "inject_spy") and tf.target:
+            clean_tgt = tf.target.rsplit(".", 1)[-1]
+            if tf.target == target_class or clean_tgt == clean_target_class:
+                conf = get_confidence(tf.subject, tf.flavor)
+                handle = f"quarkus_test:{tf.path.as_posix()}:{tf.start_line}-{tf.end_line}"
+                rel_key = ("quarkus_test_mock", tf.subject, tf.path, tf.start_line, tf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_test_mock",
+                            f"{tf.subject} -> {target_sig}",
+                            tf.path,
+                            tf.start_line,
+                            tf.end_line,
+                            handle,
+                            conf,
+                            True,
+                            None,
+                            evidence_chain=(handle,),
+                            business_view=tf.value,
+                        )
+                    )
+
+    matching_endpoints = [r for r in rest_rows if r[0] == "rest_endpoint" and matches_target(r[1])]
+    for ep in matching_endpoints:
+        ep_meta = json.loads(ep[3]) if ep[3] else {}
+        ep_path = ep_meta.get("method_path", "")
+        ep_class = ep[1].rsplit("#", 1)[0]
+        ep_class_clean = ep_class.rsplit(".", 1)[-1]
+        ep_class_facts = [r for r in rest_rows if r[0] == "rest_resource" and r[1] == ep_class]
+        ep_class_path = ep_class_facts[0][2] if ep_class_facts else ""
+        full_route = "/" + "/".join(p.strip("/") for p in (ep_class_path, ep_path) if p.strip("/"))
+
+        for tf in test_facts:
+            matched = False
+            if tf.kind == "test_http_endpoint" and tf.target:
+                clean_tf_tgt = tf.target.rsplit(".", 1)[-1]
+                if tf.target == ep_class or clean_tf_tgt == ep_class_clean:
+                    matched = True
+            elif tf.kind == "test_http_resource" and tf.target:
+                if full_route.startswith(tf.target.rstrip("*").rstrip("/")) or tf.target == full_route:
+                    matched = True
+            elif tf.kind == "rest_assured_call" and tf.target:
+                if full_route.startswith(tf.target.rstrip("*").rstrip("/")) or tf.target == full_route:
+                    matched = True
+
+            if matched:
+                conf = get_confidence(tf.subject, tf.flavor)
+                handle = f"quarkus_test:{tf.path.as_posix()}:{tf.start_line}-{tf.end_line}"
+                rel_key = ("quarkus_test_endpoint", tf.subject, tf.path, tf.start_line, tf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_test_endpoint",
+                            f"{tf.subject} -> {full_route}",
+                            tf.path,
+                            tf.start_line,
+                            tf.end_line,
+                            handle,
+                            conf,
+                            True,
+                            None,
+                            evidence_chain=(handle,),
+                            business_view=tf.value,
+                        )
+                    )
+
+    return tuple(relationships), tuple(unresolved)
 
 
 def _extract_security_annotations(snippet: str) -> dict[str, Any] | None:
