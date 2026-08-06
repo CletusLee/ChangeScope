@@ -5032,6 +5032,84 @@ def _analyze_quarkus_rest_files(
                             )
                         )
 
+                    if "RestClientBuilder" in method_snippet:
+                        builder_uri_match = re.search(r'\.(?:baseUri|baseUrl)\s*\(\s*(?:URI\.create\s*\(\s*)?["\']([^"\']+)["\']\s*\)?\s*\)', method_snippet)
+                        builder_target_match = re.search(r'\.build\s*\(\s*([A-Za-z0-9_$]+)\.class\s*\)', method_snippet)
+                        if builder_uri_match and builder_target_match:
+                            base_uri_val = builder_uri_match.group(1).strip()
+                            target_iface_val = builder_target_match.group(1).strip()
+                            prog_meta = {
+                                "base_uri": base_uri_val,
+                                "target_interface": target_iface_val,
+                                "builder": "RestClientBuilder",
+                            }
+                            facts.append(
+                                QuarkusRESTFact(
+                                    "programmatic_rest_client",
+                                    decl.qualified_name,
+                                    target_iface_val,
+                                    json.dumps(prog_meta),
+                                    path,
+                                    decl.start_line,
+                                    decl.end_line,
+                                    flavor=file_client_flavor,
+                                )
+                            )
+                        else:
+                            facts.append(
+                                QuarkusRESTFact(
+                                    "programmatic_client_unresolved",
+                                    decl.qualified_name,
+                                    "builder_unresolved",
+                                    "Programmatic RestClientBuilder uses dynamic base URI, dynamic builder flow, or unasserted interface target.",
+                                    path,
+                                    decl.start_line,
+                                    decl.end_line,
+                                    flavor=file_client_flavor,
+                                )
+                            )
+
+                    if "WebClient" in text or "WebClient" in method_snippet:
+                        for wc_match in re.finditer(
+                            r'\b(?:webClient|client|wc)\s*\.\s*(get|post|put|delete|patch|getAbs|postAbs|request)\s*\(\s*(?:HttpMethod\.([A-Z]+)\s*,\s*)?(?:["\']([^"\']+)["\']|([A-Za-z0-9_$.]+))',
+                            method_snippet,
+                        ):
+                            verb = (wc_match.group(1) or wc_match.group(2) or "GET").upper()
+                            if verb in {"GETABS", "POSTABS"}:
+                                verb = verb[:-3]
+                            path_or_url = wc_match.group(3) or wc_match.group(4) or ""
+                            if path_or_url and not path_or_url.startswith("HttpMethod."):
+                                if path_or_url.startswith("/") or path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+                                    wc_meta = {
+                                        "http_method": verb,
+                                        "path": path_or_url,
+                                    }
+                                    facts.append(
+                                        QuarkusRESTFact(
+                                            "vertx_webclient_call",
+                                            decl.qualified_name,
+                                            f"{verb} {path_or_url}",
+                                            json.dumps(wc_meta),
+                                            path,
+                                            decl.start_line,
+                                            decl.end_line,
+                                            flavor="quarkus_vertx_webclient",
+                                        )
+                                    )
+                                else:
+                                    facts.append(
+                                        QuarkusRESTFact(
+                                            "programmatic_client_unresolved",
+                                            decl.qualified_name,
+                                            "webclient_unresolved",
+                                            "Vert.x WebClient call uses dynamic path, redirect, or provider mutation.",
+                                            path,
+                                            decl.start_line,
+                                            decl.end_line,
+                                            flavor="quarkus_vertx_webclient",
+                                        )
+                                    )
+
                     if http_match:
                         http_method = http_match.group(1)
                         meta = {
@@ -5767,6 +5845,70 @@ def _quarkus_rest_relationships(
         cdi_facts_rows = []
         config_facts_rows = []
 
+    prog_client_facts = [f for f in rest_facts if f.kind == "programmatic_rest_client"]
+    webclient_facts = [f for f in rest_facts if f.kind == "vertx_webclient_call"]
+    prog_unresolved_facts = [f for f in rest_facts if f.kind == "programmatic_client_unresolved"]
+
+    for f in prog_unresolved_facts:
+        if matches_target(f.subject):
+            unresolved.append(
+                UnresolvedItem(
+                    f.value or f"Unresolved programmatic client element on {f.subject}",
+                    path=f.path,
+                    start_line=f.start_line,
+                    end_line=f.end_line,
+                    evidence_handle=f"quarkus_rest:{f.path.as_posix()}:{f.start_line}-{f.end_line}",
+                )
+            )
+
+    for pc in prog_client_facts:
+        if matches_target(pc.subject) or matches_target(pc.target):
+            pc_meta = json.loads(pc.value) if pc.value else {}
+            iface_target = pc_meta.get("target_interface", pc.target)
+            pc_handle = f"quarkus_rest:{pc.path.as_posix()}:{pc.start_line}-{pc.end_line}"
+            rel_key_pc = ("quarkus_programmatic_client", f"RestClientBuilder -> {iface_target}", pc.path, pc.start_line, pc.end_line, pc_handle)
+            if rel_key_pc not in seen_rel_keys:
+                seen_rel_keys.add(rel_key_pc)
+                relationships.append(
+                    ImpactRelationship(
+                        "quarkus_rest_contract",
+                        f"RestClientBuilder -> {iface_target}",
+                        pc.path,
+                        pc.start_line,
+                        pc.end_line,
+                        pc_handle,
+                        "high",
+                        False,
+                        None,
+                        evidence_chain=(pc_handle,),
+                        business_view=json.dumps(pc_meta),
+                    )
+                )
+
+    for wc in webclient_facts:
+        if matches_target(wc.subject) or matches_target(wc.target):
+            wc_meta = json.loads(wc.value) if wc.value else {}
+            route_str = f"{wc_meta.get('http_method', 'GET')} {wc_meta.get('path', '')}"
+            wc_handle = f"quarkus_rest:{wc.path.as_posix()}:{wc.start_line}-{wc.end_line}"
+            rel_key_wc = ("quarkus_vertx_webclient", route_str, wc.path, wc.start_line, wc.end_line, wc_handle)
+            if rel_key_wc not in seen_rel_keys:
+                seen_rel_keys.add(rel_key_wc)
+                relationships.append(
+                    ImpactRelationship(
+                        "quarkus_http_route",
+                        route_str,
+                        wc.path,
+                        wc.start_line,
+                        wc.end_line,
+                        wc_handle,
+                        "high",
+                        False,
+                        None,
+                        evidence_chain=(wc_handle,),
+                        business_view=json.dumps(wc_meta),
+                    )
+                )
+
     for cm in client_method_facts:
         if matches_target(cm.subject) or matches_target(cm.target):
             cm_meta = json.loads(cm.value) if cm.value else {}
@@ -5784,6 +5926,43 @@ def _quarkus_rest_relationships(
             full_path = "/" + "/".join(p.strip("/") for p in parts if p.strip("/"))
             if not full_path or full_path == "//":
                 full_path = "/"
+
+            # Check negative rule: If client has same path as server resource, check shared interface or proven local mapping
+            matching_server_impls = [
+                impl for impl_list in impls_by_interface.values() for impl in impl_list
+                if impl.subject == iface_fqcn or iface_short in json.loads(impl.value).get("implements", [])
+            ]
+            has_shared_interface = len(matching_server_impls) > 0
+
+            candidate_keys = [
+                f"{iface_fqcn}/mp-rest/url",
+                f"{iface_fqcn}/mp-rest/uri",
+                f"{iface_short}/mp-rest/url",
+                f"{iface_short}/mp-rest/uri",
+            ]
+            if config_key:
+                candidate_keys.extend([
+                    f'quarkus.rest-client."{config_key}".url',
+                    f'quarkus.rest-client.{config_key}.url',
+                    f'quarkus.rest-client."{config_key}".uri',
+                    f'quarkus.rest-client.{config_key}.uri',
+                    f'{config_key}/mp-rest/url',
+                    f'{config_key}/mp-rest/uri',
+                ])
+            proven_config_matches = [row for row in config_facts_rows if row[0] in candidate_keys]
+            has_proven_mapping = len(proven_config_matches) > 0
+
+            if not has_shared_interface and not has_proven_mapping:
+                # Same path/name alone without contract identity or proven mapping: report UnresolvedItem
+                unresolved.append(
+                    UnresolvedItem(
+                        f"Identical path '{full_path}' or name '{iface_short}' without shared interface contract identity or proven local mapping cannot establish a local client/server relationship.",
+                        path=cm.path,
+                        start_line=cm.start_line,
+                        end_line=cm.end_line,
+                        evidence_handle=f"quarkus_rest:{cm.path.as_posix()}:{cm.start_line}-{cm.end_line}",
+                    )
+                )
 
             route_identity = f"{http_method} {full_path}"
             flavor = cm.flavor or (iface_fact.flavor if iface_fact else None) or "quarkus_rest_client"
@@ -5852,22 +6031,6 @@ def _quarkus_rest_relationships(
                             business_view=json.dumps(business_data),
                         )
                     )
-
-            candidate_keys = [
-                f"{iface_fqcn}/mp-rest/url",
-                f"{iface_fqcn}/mp-rest/uri",
-                f"{iface_short}/mp-rest/url",
-                f"{iface_short}/mp-rest/uri",
-            ]
-            if config_key:
-                candidate_keys.extend([
-                    f'quarkus.rest-client."{config_key}".url',
-                    f'quarkus.rest-client.{config_key}.url',
-                    f'quarkus.rest-client."{config_key}".uri',
-                    f'quarkus.rest-client.{config_key}.uri',
-                    f'{config_key}/mp-rest/url',
-                    f'{config_key}/mp-rest/uri',
-                ])
 
             for cand_key in candidate_keys:
                 cfg_matches = [row for row in config_facts_rows if row[0] == cand_key]
