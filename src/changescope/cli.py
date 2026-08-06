@@ -32,6 +32,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
         "--profile", dest="profiles", action="append", default=[],
         help="select an active Spring profile; repeat for multiple profiles",
     )
+    impact_command.add_argument(
+        "--build-profile", dest="build_profiles", action="append", default=[],
+        help="select a Quarkus build profile; repeat for multiple profiles",
+    )
+    impact_command.add_argument(
+        "--runtime-profile", dest="runtime_profiles", action="append", default=[],
+        help="select a Quarkus runtime profile; repeat for multiple profiles",
+    )
     evidence_command = subcommands.add_parser("evidence", help="retrieve bounded source evidence")
     evidence_command.add_argument("evidence_handle")
     evidence_command.add_argument("--context-lines", type=int, default=2)
@@ -53,7 +61,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 0
     if parsed.command == "impact":
         result = ChangeScopeApplication().execute(
-            ImpactRequest(Path.cwd(), parsed.target, tuple(parsed.profiles))
+            ImpactRequest(
+                Path.cwd(),
+                parsed.target,
+                tuple(parsed.profiles),
+                tuple(parsed.build_profiles),
+                tuple(parsed.runtime_profiles),
+            )
         )
         _render_impact_result(result, parsed.format)
         return 0 if result.outcome == "resolved" else 2

@@ -112,6 +112,19 @@ class QuarkusBuildFact:
 
 
 @dataclass(frozen=True)
+class QuarkusConfigFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    profile: str | None = None
+    is_build_time: bool = False
+
+
+@dataclass(frozen=True)
 class ParseFailure:
     path: Path
     start_line: int
@@ -133,6 +146,7 @@ class IndexResult:
     ejb_facts: tuple[EJBFact, ...] = ()
     configuration_files: tuple[Path, ...] = ()
     quarkus_build_facts: tuple[QuarkusBuildFact, ...] = ()
+    quarkus_config_facts: tuple[QuarkusConfigFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +159,8 @@ class ImpactRequest:
     repository_root: Path
     target: str
     profiles: tuple[str, ...] = ()
+    build_profiles: tuple[str, ...] = ()
+    runtime_profiles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -241,7 +257,7 @@ class ChangeScopeApplication:
 
 
 def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
-    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|quarkus_build):(.+):(\d+)-(\d+)", request.evidence_handle)
+    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|quarkus_build|quarkus_config):(.+):(\d+)-(\d+)", request.evidence_handle)
     if match is None:
         raise ValueError("Evidence handles must use kind:path:start-end form.")
     path = _validate_relative_path(Path(match.group(1)))
@@ -392,7 +408,7 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
     if len(candidates) > 1:
         return ImpactResult("ambiguous", request.target, None, candidates, (), (), (), snapshot)
     relationships, unresolved_items = _direct_relationships(
-        database_path, candidates[0], request.profiles
+        database_path, candidates[0], request.profiles, request.build_profiles, request.runtime_profiles
     )
     assumptions = [
         "Structural analysis asserts only explicit invocation syntax tied to the resolved target.",
@@ -405,6 +421,25 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
         assumptions.append(
             "No Spring profile was selected; profile-specific configuration remains conditional."
         )
+
+    if request.build_profiles or request.runtime_profiles:
+        parts = []
+        if request.build_profiles:
+            parts.append("Quarkus build profiles: " + ", ".join(request.build_profiles))
+        if request.runtime_profiles:
+            parts.append("Quarkus runtime profiles: " + ", ".join(request.runtime_profiles))
+        assumptions.append(". ".join(parts) + ".")
+    else:
+        conn = sqlite3.connect(database_path)
+        try:
+            config_count = conn.execute("SELECT COUNT(*) FROM quarkus_config_facts").fetchone()[0]
+        except sqlite3.OperationalError:
+            config_count = 0
+        finally:
+            conn.close()
+        if config_count > 0:
+            assumptions.append("No Quarkus profile was selected; profile-specific configuration remains conditional.")
+
     quarkus_assumptions, quarkus_unresolved = _quarkus_build_impact_evidence(
         database_path, candidates[0].path
     )
@@ -546,7 +581,11 @@ def _unresolved(
 
 
 def _direct_relationships(
-    database_path: Path, target: ImpactTarget, profiles: tuple[str, ...] = ()
+    database_path: Path,
+    target: ImpactTarget,
+    profiles: tuple[str, ...] = (),
+    build_profiles: tuple[str, ...] = (),
+    runtime_profiles: tuple[str, ...] = (),
 ) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
     owner, method_name = target.signature.split("#", maxsplit=1)
     method_name = method_name.split("(", maxsplit=1)[0]
@@ -671,6 +710,14 @@ def _direct_relationships(
     )
     relationships.extend(ejb_relationships)
     unresolved_items.extend(ejb_unresolved)
+    qc_relationships, qc_unresolved = _quarkus_config_relationships(
+        connection_data_path=database_path,
+        owner=owner,
+        build_profiles=build_profiles,
+        runtime_profiles=runtime_profiles,
+    )
+    relationships.extend(qc_relationships)
+    unresolved_items.extend(qc_unresolved)
     return tuple(relationships), tuple(unresolved_items)
 
 
@@ -1794,6 +1841,9 @@ def _index_repository(repository_root: Path) -> IndexResult:
     quarkus_build_facts = _analyze_quarkus_build_files(
         {**contents_by_path, **configuration_contents}
     )
+    quarkus_config_facts = _analyze_quarkus_config_files(
+        {**contents_by_path, **configuration_contents}, declarations
+    )
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -1808,9 +1858,23 @@ def _index_repository(repository_root: Path) -> IndexResult:
         ejb_facts=ejb_facts,
         configuration_files=configuration_files,
         quarkus_build_facts=quarkus_build_facts,
+        quarkus_config_facts=quarkus_config_facts,
     )
     _write_index(result)
     return result
+
+
+def _analyze_quarkus_config_files(
+    contents_by_path: dict[Path, bytes],
+    declarations: tuple[JavaDeclaration, ...],
+) -> tuple[QuarkusConfigFact, ...]:
+    facts: list[QuarkusConfigFact] = []
+    for path, content in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        if path.suffix.lower() == ".java":
+            facts.extend(_quarkus_java_facts(path, content, declarations))
+        elif path.suffix.lower() in {".properties", ".yml", ".yaml"}:
+            facts.extend(_quarkus_configuration_facts(path, content))
+    return tuple(facts)
 
 
 def _refresh_index_if_needed(root: Path) -> None:
@@ -3927,6 +3991,7 @@ def _replace_index_contents(
     connection.execute("DELETE FROM spring_facts")
     connection.execute("DELETE FROM ejb_facts")
     connection.execute("DELETE FROM quarkus_build_facts")
+    connection.execute("DELETE FROM quarkus_config_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
     indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
     connection.executemany(
@@ -3944,6 +4009,7 @@ def _replace_index_contents(
     _insert_spring_facts(connection, result.spring_facts)
     _insert_ejb_facts(connection, result.ejb_facts)
     _insert_quarkus_build_facts(connection, result.quarkus_build_facts)
+    _insert_quarkus_config_facts(connection, result.quarkus_config_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
@@ -3955,6 +4021,9 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
     ).fetchone() is None
     quarkus_schema_missing = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_build_facts'"
+    ).fetchone() is None
+    quarkus_config_schema_missing = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_config_facts'"
     ).fetchone() is None
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -4030,6 +4099,19 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         profile TEXT
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS quarkus_config_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        profile TEXT,
+        is_build_time INTEGER NOT NULL DEFAULT 0
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -4061,6 +4143,7 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         or spring_schema_missing
         or ejb_schema_missing
         or quarkus_schema_missing
+        or quarkus_config_schema_missing
     )
 
 
@@ -4094,11 +4177,13 @@ def _replace_changed_source_records(
     spring_facts: tuple[SpringFact, ...],
     ejb_facts: tuple[EJBFact, ...],
     quarkus_build_facts: tuple[QuarkusBuildFact, ...] = (),
+    quarkus_config_facts: tuple[QuarkusConfigFact, ...] = (),
     replace_all_ejb_facts: bool = False,
 ) -> None:
     if replace_all_ejb_facts:
         connection.execute("DELETE FROM ejb_facts")
         connection.execute("DELETE FROM quarkus_build_facts")
+        connection.execute("DELETE FROM quarkus_config_facts")
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
@@ -4107,6 +4192,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM spring_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM ejb_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_build_facts WHERE path = ?", (path,))
+        connection.execute("DELETE FROM quarkus_config_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
@@ -4115,6 +4201,7 @@ def _replace_changed_source_records(
     _insert_spring_facts(connection, spring_facts)
     _insert_ejb_facts(connection, ejb_facts)
     _insert_quarkus_build_facts(connection, quarkus_build_facts)
+    _insert_quarkus_config_facts(connection, quarkus_config_facts)
 
 
 def _insert_java_facts(
@@ -4246,6 +4333,287 @@ def _insert_quarkus_build_facts(
             for fact in facts
         ),
     )
+
+
+def _insert_quarkus_config_facts(
+    connection: sqlite3.Connection, facts: Iterable[QuarkusConfigFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO quarkus_config_facts(
+        kind, subject, target, value, path, start_line, end_line, profile, is_build_time
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.profile,
+                int(fact.is_build_time),
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _is_quarkus_build_time_key(key: str) -> bool:
+    if not key.startswith("quarkus."):
+        return False
+    build_prefixes = (
+        "quarkus.package.",
+        "quarkus.native.",
+        "quarkus.datasource.db-kind",
+        "quarkus.hibernate-orm.database.generation",
+        "quarkus.index-dependency.",
+        "quarkus.banner.",
+    )
+    return any(key.startswith(p) for p in build_prefixes)
+
+
+def _quarkus_configuration_facts(path: Path, source: bytes) -> tuple[QuarkusConfigFact, ...]:
+    text = source.decode("utf-8", errors="replace")
+    suffix = path.suffix.lower()
+    if suffix == ".properties":
+        return tuple(_quarkus_properties_facts(path, text.splitlines()))
+    if suffix in {".yml", ".yaml"}:
+        return tuple(_quarkus_yaml_facts(path, text.splitlines()))
+    return ()
+
+
+def _quarkus_properties_facts(path: Path, lines: list[str]) -> list[QuarkusConfigFact]:
+    file_profile = _spring_file_profile(path)
+    facts: list[QuarkusConfigFact] = []
+    for line_number, line in enumerate(lines, 1):
+        line_str = line.strip()
+        if not line_str or line_str.startswith("#") or line_str.startswith("!"):
+            continue
+        match = re.match(r"^\s*(?:%([^.]+)\.)?([^#!\s][^:=\s]*)\s*[:=]\s*(.*?)\s*$", line)
+        if match:
+            inline_profile = match.group(1)
+            key = match.group(2).strip()
+            value = match.group(3).strip()
+            profile = inline_profile or file_profile
+            is_build_time = _is_quarkus_build_time_key(key)
+            facts.append(
+                QuarkusConfigFact(
+                    "quarkus_property_source",
+                    key,
+                    None,
+                    value,
+                    path,
+                    line_number,
+                    line_number,
+                    profile=profile,
+                    is_build_time=is_build_time,
+                )
+            )
+    return facts
+
+
+def _quarkus_yaml_facts(path: Path, lines: list[str]) -> list[QuarkusConfigFact]:
+    file_profile = _spring_file_profile(path)
+    document_profile = file_profile
+    facts: list[QuarkusConfigFact] = []
+    parents: list[tuple[int, str]] = []
+    for line_number, line in enumerate(lines, 1):
+        if line.strip() == "---":
+            parents.clear()
+            document_profile = file_profile
+            continue
+        if not line.strip() or line.lstrip().startswith("#") or line.lstrip().startswith("-"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        match = re.match(r"\s*([^:#]+):(?:\s*(.*?))?\s*$", line)
+        if not match:
+            continue
+        key, value = match.group(1).strip(), (match.group(2) or "").strip()
+        while parents and parents[-1][0] >= indent:
+            parents.pop()
+        if key.startswith("%") and not parents:
+            document_profile = key.lstrip("%").strip("'\"")
+            continue
+        full_key = ".".join([parent[1] for parent in parents] + [key])
+        if value:
+            value = value.strip("'\"")
+            is_build_time = _is_quarkus_build_time_key(full_key)
+            facts.append(
+                QuarkusConfigFact(
+                    "quarkus_property_source",
+                    full_key,
+                    None,
+                    value,
+                    path,
+                    line_number,
+                    line_number,
+                    profile=document_profile,
+                    is_build_time=is_build_time,
+                )
+            )
+        else:
+            parents.append((indent, key))
+    return facts
+
+
+def _quarkus_java_facts(
+    path: Path, source: bytes, declarations: tuple[JavaDeclaration, ...]
+) -> tuple[QuarkusConfigFact, ...]:
+    text = source.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    facts: list[QuarkusConfigFact] = []
+    for idx, line in enumerate(lines, 1):
+        if "@ConfigProperty" in line:
+            matches = re.finditer(r"@ConfigProperty\s*(?:\(([^)]*)\))?", line)
+            for m in matches:
+                args = m.group(1) or ""
+                name_match = re.search(r'\bname\s*=\s*["\']([^"\']+)["\']', args)
+                if not name_match:
+                    name_match = re.search(r'^\s*["\']([^"\']+)["\']', args)
+                key_name = name_match.group(1) if name_match else ""
+                default_match = re.search(r'\bdefaultValue\s*=\s*["\']([^"\']+)["\']', args)
+                default_val = default_match.group(1) if default_match else None
+
+                owner_decl = next(
+                    (d for d in declarations if d.path == path and d.start_line <= idx <= d.end_line),
+                    None,
+                )
+                subject = owner_decl.qualified_name if owner_decl else ""
+                is_optional = "Optional" in line
+                meta = []
+                if default_val is not None:
+                    meta.append(f"default:{default_val}")
+                if is_optional:
+                    meta.append("optional")
+                value_meta = ";".join(meta) if meta else None
+
+                if key_name:
+                    facts.append(
+                        QuarkusConfigFact(
+                            "quarkus_property_consumer",
+                            subject,
+                            key_name,
+                            value_meta,
+                            path,
+                            idx,
+                            idx,
+                        )
+                    )
+    return tuple(facts)
+
+
+def _quarkus_config_relationships(
+    connection_data_path: Path,
+    owner: str,
+    build_profiles: tuple[str, ...],
+    runtime_profiles: tuple[str, ...],
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, profile, is_build_time
+            FROM quarkus_config_facts ORDER BY path, start_line, kind, subject"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return (), ()
+    finally:
+        connection.close()
+
+    if not rows:
+        return (), ()
+
+    facts = [
+        QuarkusConfigFact(
+            kind, subject, target, value, Path(path), start_line, end_line, profile, bool(is_build_time)
+        )
+        for kind, subject, target, value, path, start_line, end_line, profile, is_build_time in rows
+    ]
+
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+
+    def matching_owner(sub: str) -> bool:
+        if sub == owner:
+            return True
+        if sub.rsplit("#", maxsplit=1)[0] == owner:
+            return True
+        return sub.rsplit(".", maxsplit=1)[-1] == owner.rsplit(".", maxsplit=1)[-1]
+
+    consumer_facts = [
+        f for f in facts
+        if f.kind == "quarkus_property_consumer" and matching_owner(f.subject)
+    ]
+    source_facts = [f for f in facts if f.kind == "quarkus_property_source"]
+
+    for consumer in consumer_facts:
+        if not consumer.target:
+            continue
+        consumer_handle = f"quarkus_config:{consumer.path.as_posix()}:{consumer.start_line}-{consumer.end_line}"
+        matching_sources = [s for s in source_facts if s.subject == consumer.target]
+
+        if not matching_sources:
+            if not consumer.value or ("optional" not in consumer.value and "default:" not in consumer.value):
+                unresolved.append(
+                    _unresolved(
+                        f"Quarkus config property '{consumer.target}' consumed by {consumer.subject} has no matching local property source.",
+                        consumer.path,
+                        consumer.start_line,
+                        consumer.end_line,
+                        "quarkus_config",
+                    )
+                )
+
+        relationships.append(
+            ImpactRelationship(
+                "property_consumer",
+                consumer.target,
+                consumer.path,
+                consumer.start_line,
+                consumer.end_line,
+                consumer_handle,
+                "high",
+                False,
+                None,
+                evidence_chain=(consumer_handle,),
+            )
+        )
+
+        for source in matching_sources:
+            source_handle = f"quarkus_config:{source.path.as_posix()}:{source.start_line}-{source.end_line}"
+            if source.is_build_time:
+                if build_profiles:
+                    applies = (source.profile is None or source.profile in build_profiles)
+                    conditional = False
+                else:
+                    applies = True
+                    conditional = (source.profile is not None)
+            else:
+                active_profs = runtime_profiles or build_profiles
+                if active_profs:
+                    applies = (source.profile is None or source.profile in active_profs)
+                    conditional = False
+                else:
+                    applies = True
+                    conditional = (source.profile is not None)
+
+            if applies:
+                relationships.append(
+                    ImpactRelationship(
+                        "property_source",
+                        source.subject,
+                        source.path,
+                        source.start_line,
+                        source.end_line,
+                        source_handle,
+                        "medium" if conditional else "high",
+                        conditional,
+                        source.profile,
+                        evidence_chain=(consumer_handle, source_handle),
+                    )
+                )
+
+    return tuple(relationships), tuple(unresolved)
 
 
 def _analyze_quarkus_build_files(
