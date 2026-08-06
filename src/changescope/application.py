@@ -863,6 +863,8 @@ def _direct_relationships(
         connection_data_path=database_path,
         owner=owner,
         target=target,
+        build_profiles=build_profiles,
+        runtime_profiles=runtime_profiles,
     )
     relationships.extend(nat_relationships)
     unresolved_items.extend(nat_unresolved)
@@ -4969,7 +4971,232 @@ def _quarkus_native_relationships(
     connection_data_path: Path,
     owner: str,
     target: ImpactTarget,
+    build_profiles: tuple[str, ...] = (),
+    runtime_profiles: tuple[str, ...] = (),
 ) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        nat_rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, scope
+            FROM quarkus_native_facts ORDER BY path, start_line"""
+        ).fetchall()
+        rest_rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line FROM quarkus_rest_facts"""
+        ).fetchall()
+        config_rows = connection.execute(
+            """SELECT subject, target, value, path, start_line, end_line, profile FROM quarkus_config_facts"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return (), ()
+    finally:
+        connection.close()
+
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+    seen_keys: set[tuple[str, str, Path, int, int]] = set()
+
+    target_sig = target.signature
+    target_class = target_sig.rsplit("#", 1)[0]
+    target_method = target_sig.split("#")[-1].split("(")[0] if "#" in target_sig else None
+    clean_target_class = target_class.rsplit(".", 1)[-1]
+
+    nat_facts = [
+        QuarkusNativeFact(kind, subject, fact_target, value, Path(path), start_line, end_line, scope)
+        for kind, subject, fact_target, value, path, start_line, end_line, scope in nat_rows
+    ]
+
+    for nf in nat_facts:
+        if nf.kind in ("register_reflection", "native_json_config") and nf.scope == "reflection":
+            clean_sub = nf.subject.rsplit(".", 1)[-1]
+            if nf.subject == target_class or clean_sub == clean_target_class:
+                handle = f"quarkus_native:{nf.path.as_posix()}:{nf.start_line}-{nf.end_line}"
+                rel_key = ("quarkus_native_reflection", nf.subject, nf.path, nf.start_line, nf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_native_reflection",
+                            f"Native Reflection ({nf.subject}) -> {target_sig}",
+                            nf.path,
+                            nf.start_line,
+                            nf.end_line,
+                            handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=(handle,),
+                            business_view=nf.value,
+                        )
+                    )
+
+    for nf in nat_facts:
+        if nf.kind in ("register_proxy", "native_json_config") and nf.scope == "proxy":
+            clean_sub = nf.subject.rsplit(".", 1)[-1]
+            if nf.subject == target_class or clean_sub == clean_target_class:
+                handle = f"quarkus_native:{nf.path.as_posix()}:{nf.start_line}-{nf.end_line}"
+                rel_key = ("quarkus_native_proxy", nf.subject, nf.path, nf.start_line, nf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_native_proxy",
+                            f"Native Proxy ({nf.subject}) -> {target_sig}",
+                            nf.path,
+                            nf.start_line,
+                            nf.end_line,
+                            handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=(handle,),
+                            business_view=nf.value,
+                        )
+                    )
+
+    for nf in nat_facts:
+        if nf.kind == "meta_inf_service":
+            clean_sub = nf.subject.rsplit(".", 1)[-1]
+            clean_tgt = nf.target.rsplit(".", 1)[-1] if nf.target else ""
+            if nf.subject == target_class or clean_sub == clean_target_class or (nf.target and (nf.target == target_class or clean_tgt == clean_target_class)):
+                handle = f"quarkus_native:{nf.path.as_posix()}:{nf.start_line}-{nf.end_line}"
+                rel_key = ("quarkus_native_spi", nf.subject, nf.path, nf.start_line, nf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_native_spi",
+                            f"META-INF/services ({nf.subject}) -> {nf.target}",
+                            nf.path,
+                            nf.start_line,
+                            nf.end_line,
+                            handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=(handle,),
+                            business_view=nf.value,
+                        )
+                    )
+
+    for nf in nat_facts:
+        if nf.kind == "reflection_usage" and nf.target:
+            clean_tgt = nf.target.rsplit(".", 1)[-1]
+            if nf.target == target_class or clean_tgt == clean_target_class:
+                usage_handle = f"quarkus_native:{nf.path.as_posix()}:{nf.start_line}-{nf.end_line}"
+                chain = [usage_handle]
+                reg_fact = next((r for r in nat_facts if r.kind in ("register_reflection", "native_json_config") and (r.subject == target_class or r.subject.rsplit(".", 1)[-1] == clean_target_class)), None)
+                if reg_fact:
+                    reg_handle = f"quarkus_native:{reg_fact.path.as_posix()}:{reg_fact.start_line}-{reg_fact.end_line}"
+                    chain.append(reg_handle)
+
+                rel_key = ("quarkus_native_reflection_usage", nf.subject, nf.path, nf.start_line, nf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_native_reflection_usage",
+                            f"Class.forName({nf.target}) in {nf.subject} -> {target_sig}",
+                            nf.path,
+                            nf.start_line,
+                            nf.end_line,
+                            usage_handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=tuple(chain),
+                            business_view=nf.value,
+                        )
+                    )
+
+    dto_types_found: set[str] = set()
+    target_rest_handles: list[tuple[str, Path, int, int]] = []
+
+    for r_kind, r_subj, r_tgt, r_val, r_path, r_sl, r_el in rest_rows:
+        if r_kind in ("rest_endpoint", "rest_client_method", "rest_client_interface") and (r_subj == target_sig or r_subj.partition("#")[0] == target_class or r_subj.partition("#")[0].rsplit(".", 1)[-1] == clean_target_class):
+            rest_h = f"quarkus_rest:{Path(r_path).as_posix()}:{r_sl}-{r_el}"
+            target_rest_handles.append((rest_h, Path(r_path), r_sl, r_el))
+            if r_val:
+                try:
+                    meta = json.loads(r_val)
+                    if isinstance(meta, dict) and "dto_types" in meta:
+                        for dt in meta["dto_types"]:
+                            dto_types_found.add(dt)
+                except Exception:
+                    pass
+
+    if not dto_types_found and "#" in target_sig:
+        ret_part = target_sig.split("#")[-1]
+        m_dto = re.search(r'([A-Za-z0-9_$]+DTO)', ret_part)
+        if m_dto:
+            dto_types_found.add(m_dto.group(1))
+
+    for dto_name in sorted(dto_types_found):
+        reg_fact = next((r for r in nat_facts if r.kind in ("register_reflection", "native_json_config") and (r.subject == dto_name or r.subject.rsplit(".", 1)[-1] == dto_name)), None)
+        if reg_fact:
+            reg_h = f"quarkus_native:{reg_fact.path.as_posix()}:{reg_fact.start_line}-{reg_fact.end_line}"
+            chain = []
+            if target_rest_handles:
+                chain.append(target_rest_handles[0][0])
+            chain.append(reg_h)
+
+            rel_key = ("quarkus_native_dto", dto_name, reg_fact.path, reg_fact.start_line, reg_fact.end_line)
+            if rel_key not in seen_keys:
+                seen_keys.add(rel_key)
+                relationships.append(
+                    ImpactRelationship(
+                        "quarkus_native_dto",
+                        f"REST DTO Native Reflection ({dto_name}) -> {target_sig}",
+                        reg_fact.path,
+                        reg_fact.start_line,
+                        reg_fact.end_line,
+                        reg_h,
+                        "high",
+                        False,
+                        None,
+                        evidence_chain=tuple(chain),
+                        business_view=json.dumps({"dto_type": dto_name, "disclaimer": "GraalVM/Mandrel compilation was not executed; complete closed-world reachability was not reconstructed."}),
+                    )
+                )
+        else:
+            unresolved.append(
+                UnresolvedItem(
+                    f"DTO type '{dto_name}' used in REST contract signature lacks explicit @RegisterForReflection or native-image reflection metadata.",
+                    path=target_rest_handles[0][1] if target_rest_handles else None,
+                    start_line=target_rest_handles[0][2] if target_rest_handles else 1,
+                    end_line=target_rest_handles[0][3] if target_rest_handles else 1,
+                    evidence_handle=target_rest_handles[0][0] if target_rest_handles else f"quarkus_native:unresolved:{dto_name}",
+                )
+            )
+
+    has_native_config = "native" in build_profiles or "native" in runtime_profiles
+    for c_subj, c_tgt, c_val, c_path, c_sl, c_el, c_prof in config_rows:
+        if c_subj == "quarkus.package.type" and c_val == "native":
+            has_native_config = True
+
+    if has_native_config:
+        for c_subj, c_tgt, c_val, c_path, c_sl, c_el, c_prof in config_rows:
+            if c_subj in ("quarkus.package.type", "quarkus.native.additional-build-args") or c_subj.startswith("quarkus.native."):
+                cfg_h = f"quarkus_config:{Path(c_path).as_posix()}:{c_sl}-{c_el}"
+                rel_key = ("quarkus_native_config", c_subj, Path(c_path), c_sl, c_el)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_native_config",
+                            f"Native Build Config ({c_subj}={c_val}) -> {target_sig}",
+                            Path(c_path),
+                            c_sl,
+                            c_el,
+                            cfg_h,
+                            "high",
+                            False,
+                            c_prof,
+                            evidence_chain=(cfg_h,),
+                            business_view=json.dumps({"key": c_subj, "value": c_val, "profile": c_prof}),
+                        )
+                    )
+
+    return tuple(relationships), tuple(unresolved)
     connection = sqlite3.connect(connection_data_path)
     try:
         nat_rows = connection.execute(
@@ -6105,7 +6332,7 @@ def _analyze_quarkus_rest_files(
                         if not streaming:
                             streaming = "stream"
 
-                    ret_type_match = re.search(r'(?:public|protected|private)\s+(?:<[^>]+>\s+)?([A-Za-z0-9_$.<>]+)\s+' + re.escape(decl.name) + r'\b', method_snippet)
+                    ret_type_match = re.search(r'(?:(?:public|protected|private)\s+)?(?:<[^>]+>\s+)?([A-Za-z0-9_$.<>]+)\s+' + re.escape(decl.name) + r'\b', method_snippet)
                     return_type_val = ret_type_match.group(1).strip() if ret_type_match else "void"
 
                     parent_class = next(
@@ -6122,6 +6349,27 @@ def _analyze_quarkus_rest_files(
                         if "@RegisterRestClient" in parent_snippet:
                             is_client_method = True
 
+                    dto_types: list[str] = []
+                    def add_dto_type(t_name: str) -> None:
+                        raw_t = re.sub(r'^(Uni|Multi|CompletionStage|Publisher|Single|Observable|Flux|Mono|Response|List|Set|Collection)<', '', t_name).rstrip('>')
+                        clean_t = raw_t.rsplit('.', 1)[-1].strip()
+                        if clean_t and clean_t not in ('void', 'int', 'long', 'boolean', 'double', 'float', 'byte', 'short', 'char', 'String', 'Response', 'Object', 'Uni', 'Multi'):
+                            if clean_t not in dto_types:
+                                dto_types.append(clean_t)
+
+                    if return_type_val:
+                        add_dto_type(return_type_val)
+
+                    sig_params_match = re.search(re.escape(decl.name) + r'\s*\(([^)]*)\)', method_snippet)
+                    if sig_params_match:
+                        raw_params = sig_params_match.group(1)
+                        for param_decl in raw_params.split(','):
+                            param_tokens = param_decl.strip().split()
+                            if param_tokens:
+                                type_idx = -2 if len(param_tokens) >= 2 else -1
+                                p_type = param_tokens[type_idx]
+                                add_dto_type(p_type)
+
                     if is_client_method and http_match:
                         http_method = http_match.group(1)
                         client_method_meta = {
@@ -6131,6 +6379,7 @@ def _analyze_quarkus_rest_files(
                             "consumes": consumes_val,
                             "parameters": params,
                             "return_type": return_type_val,
+                            "dto_types": dto_types,
                             "interface": parent_class.qualified_name if parent_class else "",
                         }
                         facts.append(
@@ -6238,6 +6487,7 @@ def _analyze_quarkus_rest_files(
                             "build_profile_conditions": prof_conds,
                             "has_servlet_context": has_servlet_ctx,
                             "return_type": return_type_val,
+                            "dto_types": dto_types,
                         }
                         facts.append(
                             QuarkusRESTFact(
