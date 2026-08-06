@@ -4679,16 +4679,17 @@ def _analyze_quarkus_cdi_files(
                                     )
                                 )
 
-                # Check @Inject fields / initializers
-                if "@Inject" in text:
+                # Check @Inject / @RestClient fields / initializers
+                if "@Inject" in text or "@RestClient" in text:
                     for line_idx, line in enumerate(lines, 1):
-                        if "@Inject" in line:
+                        if "@Inject" in line or "@RestClient" in line:
                             field_snippet = "\n".join(lines[max(0, line_idx - 1) : min(len(lines), line_idx + 4)])
                             named_match = re.search(r'@Named\s*(?:\(\s*["\']([^"\']+)["\']\s*\))?', field_snippet)
                             named_val = named_match.group(1) if (named_match and named_match.group(1)) else None
+                            is_rest_client_inj = "@RestClient" in field_snippet
 
                             field_match = re.search(
-                                r"@Inject\s+(?:@[A-Za-z0-9_$.()'\"-]+\s+)*([A-Za-z0-9_$.<>]+)\s+([A-Za-z0-9_$]+)\s*;",
+                                r"(?:@Inject\s+|@RestClient\s+)+(?:@[A-Za-z0-9_$.()'\"-]+\s+)*([A-Za-z0-9_$.<>]+)\s+([A-Za-z0-9_$]+)\s*;",
                                 field_snippet,
                                 re.DOTALL,
                             )
@@ -4713,7 +4714,7 @@ def _analyze_quarkus_cdi_files(
                                         path,
                                         line_idx,
                                         line_idx,
-                                        scope=named_val,
+                                        scope="RestClient" if is_rest_client_inj else named_val,
                                     )
                                 )
 
@@ -4793,13 +4794,18 @@ def _analyze_quarkus_rest_files(
     facts: list[QuarkusRESTFact] = []
 
     build_flavor = "unknown"
+    build_client_flavor = "unknown"
     for bf in quarkus_build_facts:
         if bf.kind == "extension":
-            if "resteasy-reactive" in bf.subject or "quarkus-rest" in bf.subject:
+            subj = (bf.subject or "").lower()
+            if "resteasy-reactive" in subj or "quarkus-rest" in subj:
                 build_flavor = "quarkus_rest"
-                break
-            elif "resteasy" in bf.subject:
+            elif "resteasy" in subj:
                 build_flavor = "resteasy_classic"
+            if "quarkus-rest-client" in subj or "quarkus-rest" in subj:
+                build_client_flavor = "quarkus_rest_client"
+            elif "resteasy-client" in subj or "resteasy" in subj:
+                build_client_flavor = "quarkus_resteasy_client"
 
     for path, content in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
         if path.suffix.lower() == ".java":
@@ -4811,6 +4817,14 @@ def _analyze_quarkus_rest_files(
                 file_flavor = "quarkus_rest"
             elif "org.jboss.resteasy.annotations" in text:
                 file_flavor = "resteasy_classic"
+
+            file_client_flavor = build_client_flavor
+            if "io.quarkus.rest.client" in text:
+                file_client_flavor = "quarkus_rest_client"
+            elif "org.jboss.resteasy.client" in text or "io.quarkus.resteasy.client" in text:
+                file_client_flavor = "quarkus_resteasy_client"
+            elif file_client_flavor == "unknown":
+                file_client_flavor = "quarkus_rest_client"
 
             for decl in declarations:
                 if decl.path != path:
@@ -4885,6 +4899,46 @@ def _analyze_quarkus_rest_files(
                             )
                         )
 
+                    is_rest_client = "@RegisterRestClient" in decl_snippet
+                    if is_rest_client:
+                        config_key_match = re.search(r'@RegisterRestClient\s*\([^)]*configKey\s*=\s*["\']([^"\']+)["\']', decl_snippet)
+                        config_key_val = config_key_match.group(1).strip() if config_key_match else None
+                        base_uri_match = re.search(r'@RegisterRestClient\s*\([^)]*baseUri\s*=\s*["\']([^"\']+)["\']', decl_snippet)
+                        base_uri_val = base_uri_match.group(1).strip() if base_uri_match else None
+
+                        client_meta = {
+                            "kind": decl.kind,
+                            "config_key": config_key_val,
+                            "base_uri": base_uri_val,
+                            "class_path": class_path_val,
+                            "build_profile_conditions": prof_conds,
+                        }
+                        facts.append(
+                            QuarkusRESTFact(
+                                "rest_client_interface",
+                                decl.qualified_name,
+                                config_key_val or class_path_val or "",
+                                json.dumps(client_meta),
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                flavor=file_client_flavor,
+                            )
+                        )
+                        if "@RegisterProvider" in decl_snippet or "ClientBuilder" in decl_snippet:
+                            facts.append(
+                                QuarkusRESTFact(
+                                    "rest_client_unresolved",
+                                    decl.qualified_name,
+                                    "filter_provider",
+                                    "Dynamic REST client filter or provider registered via @RegisterProvider or ClientBuilder cannot be statically validated.",
+                                    path,
+                                    decl.start_line,
+                                    decl.end_line,
+                                    flavor=file_client_flavor,
+                                )
+                            )
+
                 elif decl.kind == "method":
                     method_snippet = _get_method_snippet(lines, decl)
                     http_match = re.search(r'@(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b', method_snippet)
@@ -4939,6 +4993,44 @@ def _analyze_quarkus_rest_files(
 
                     ret_type_match = re.search(r'(?:public|protected|private)\s+(?:<[^>]+>\s+)?([A-Za-z0-9_$.<>]+)\s+' + re.escape(decl.name) + r'\b', method_snippet)
                     return_type_val = ret_type_match.group(1).strip() if ret_type_match else "void"
+
+                    parent_class = next(
+                        (
+                            c for c in declarations
+                            if c.path == path and c.kind in ("class", "interface")
+                            and c.start_line <= decl.start_line <= c.end_line
+                        ),
+                        None,
+                    )
+                    is_client_method = False
+                    if parent_class is not None:
+                        parent_snippet = _get_class_snippet(lines, parent_class)
+                        if "@RegisterRestClient" in parent_snippet:
+                            is_client_method = True
+
+                    if is_client_method and http_match:
+                        http_method = http_match.group(1)
+                        client_method_meta = {
+                            "http_method": http_method,
+                            "method_path": method_path_val,
+                            "produces": produces_val,
+                            "consumes": consumes_val,
+                            "parameters": params,
+                            "return_type": return_type_val,
+                            "interface": parent_class.qualified_name if parent_class else "",
+                        }
+                        facts.append(
+                            QuarkusRESTFact(
+                                "rest_client_method",
+                                decl.qualified_name,
+                                parent_class.qualified_name if parent_class else "",
+                                json.dumps(client_method_meta),
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                flavor=file_client_flavor,
+                            )
+                        )
 
                     if http_match:
                         http_method = http_match.group(1)
@@ -5643,6 +5735,161 @@ def _quarkus_rest_relationships(
                                 None,
                                 evidence_chain=tuple(chain),
                                 business_view=json.dumps(business_data),
+                            )
+                        )
+
+    client_iface_facts = [f for f in rest_facts if f.kind == "rest_client_interface"]
+    client_method_facts = [f for f in rest_facts if f.kind == "rest_client_method"]
+    client_unresolved_facts = [f for f in rest_facts if f.kind == "rest_client_unresolved"]
+
+    for f in client_unresolved_facts:
+        if matches_target(f.subject):
+            unresolved.append(
+                UnresolvedItem(
+                    f.value or f"Dynamic REST client element on {f.subject}",
+                    path=f.path,
+                    start_line=f.start_line,
+                    end_line=f.end_line,
+                    evidence_handle=f"quarkus_rest:{f.path.as_posix()}:{f.start_line}-{f.end_line}",
+                )
+            )
+
+    try:
+        connection_sub = sqlite3.connect(connection_data_path)
+        cdi_facts_rows = connection_sub.execute(
+            """SELECT subject, target, value, path, start_line, end_line, scope FROM quarkus_cdi_facts"""
+        ).fetchall()
+        config_facts_rows = connection_sub.execute(
+            """SELECT subject, value, path, start_line, end_line, profile FROM quarkus_config_facts WHERE kind = 'quarkus_property_source'"""
+        ).fetchall()
+        connection_sub.close()
+    except sqlite3.OperationalError:
+        cdi_facts_rows = []
+        config_facts_rows = []
+
+    for cm in client_method_facts:
+        if matches_target(cm.subject) or matches_target(cm.target):
+            cm_meta = json.loads(cm.value) if cm.value else {}
+            http_method = cm_meta.get("http_method", "GET")
+            method_path = cm_meta.get("method_path", "")
+            iface_fqcn = cm.target
+            iface_short = iface_fqcn.rsplit(".", 1)[-1] if iface_fqcn else ""
+
+            iface_fact = next((f for f in client_iface_facts if f.subject == iface_fqcn or f.subject.rsplit(".", 1)[-1] == iface_short), None)
+            iface_path = iface_fact.target if iface_fact and iface_fact.target else ""
+            iface_meta = json.loads(iface_fact.value) if iface_fact and iface_fact.value else {}
+            config_key = iface_meta.get("config_key")
+
+            parts = [p for p in (iface_path, method_path) if p]
+            full_path = "/" + "/".join(p.strip("/") for p in parts if p.strip("/"))
+            if not full_path or full_path == "//":
+                full_path = "/"
+
+            route_identity = f"{http_method} {full_path}"
+            flavor = cm.flavor or (iface_fact.flavor if iface_fact else None) or "quarkus_rest_client"
+            confidence = "high"
+
+            cm_handle = f"quarkus_rest:{cm.path.as_posix()}:{cm.start_line}-{cm.end_line}"
+            chain = [cm_handle]
+            if iface_fact:
+                iface_handle = f"quarkus_rest:{iface_fact.path.as_posix()}:{iface_fact.start_line}-{iface_fact.end_line}"
+                if iface_handle not in chain:
+                    chain.append(iface_handle)
+
+            business_data = {
+                "flavor": flavor,
+                "route": route_identity,
+                "http_method": http_method,
+                "produces": cm_meta.get("produces"),
+                "consumes": cm_meta.get("consumes"),
+                "parameters": cm_meta.get("parameters", []),
+                "client_interface": iface_fqcn,
+            }
+
+            rel_key = ("quarkus_rest_contract", route_identity, cm.path, cm.start_line, cm.end_line, cm_handle)
+            if rel_key not in seen_rel_keys:
+                seen_rel_keys.add(rel_key)
+                relationships.append(
+                    ImpactRelationship(
+                        "quarkus_rest_contract",
+                        route_identity,
+                        cm.path,
+                        cm.start_line,
+                        cm.end_line,
+                        cm_handle,
+                        confidence,
+                        False,
+                        None,
+                        evidence_chain=tuple(chain),
+                        business_view=json.dumps(business_data),
+                    )
+                )
+
+            matching_cdi_injections = [
+                row for row in cdi_facts_rows
+                if row[1] == iface_fqcn or row[1] == iface_short or (row[1] and row[1].endswith("." + iface_short))
+            ]
+
+            for subj, tgt, val, cdi_p, cdi_sl, cdi_el, scope in matching_cdi_injections:
+                cdi_path = Path(cdi_p)
+                cdi_handle = f"quarkus_cdi:{cdi_path.as_posix()}:{cdi_sl}-{cdi_el}"
+                inj_chain = (*chain, cdi_handle)
+                rel_key_inj = ("quarkus_cdi_injection", route_identity, cdi_path, cdi_sl, cdi_el, cdi_handle)
+                if rel_key_inj not in seen_rel_keys:
+                    seen_rel_keys.add(rel_key_inj)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_cdi_injection",
+                            route_identity,
+                            cdi_path,
+                            cdi_sl,
+                            cdi_el,
+                            cdi_handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=inj_chain,
+                            business_view=json.dumps(business_data),
+                        )
+                    )
+
+            candidate_keys = [
+                f"{iface_fqcn}/mp-rest/url",
+                f"{iface_fqcn}/mp-rest/uri",
+                f"{iface_short}/mp-rest/url",
+                f"{iface_short}/mp-rest/uri",
+            ]
+            if config_key:
+                candidate_keys.extend([
+                    f'quarkus.rest-client."{config_key}".url',
+                    f'quarkus.rest-client.{config_key}.url',
+                    f'quarkus.rest-client."{config_key}".uri',
+                    f'quarkus.rest-client.{config_key}.uri',
+                    f'{config_key}/mp-rest/url',
+                    f'{config_key}/mp-rest/uri',
+                ])
+
+            for cand_key in candidate_keys:
+                cfg_matches = [row for row in config_facts_rows if row[0] == cand_key]
+                for cfg_sub, cfg_val, cfg_p, cfg_sl, cfg_el, cfg_prof in cfg_matches:
+                    cfg_path = Path(cfg_p)
+                    cfg_handle = f"quarkus_config:{cfg_path.as_posix()}:{cfg_sl}-{cfg_el}"
+                    cfg_chain = (*chain, cfg_handle)
+                    rel_key_cfg = ("quarkus_config", cand_key, cfg_path, cfg_sl, cfg_el, cfg_handle)
+                    if rel_key_cfg not in seen_rel_keys:
+                        seen_rel_keys.add(rel_key_cfg)
+                        relationships.append(
+                            ImpactRelationship(
+                                "quarkus_config",
+                                cand_key,
+                                cfg_path,
+                                cfg_sl,
+                                cfg_el,
+                                cfg_handle,
+                                "high",
+                                False,
+                                cfg_prof,
+                                evidence_chain=cfg_chain,
                             )
                         )
 
