@@ -1,3 +1,6 @@
 .changescope/
 __pycache__/
 *.py[cod]
+.venv/
+.validation/
+*.egg-info/
