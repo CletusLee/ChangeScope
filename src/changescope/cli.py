@@ -90,6 +90,7 @@ def _render_index_result(result: IndexResult, output_format: str) -> None:
     print(f"Java declarations: {report['declaration_count']}")
     print(f"Explicit invocation evidence: {report['invocation_count']}")
     print(f"Spring Configuration Evidence: {report['spring_configuration_evidence_count']}")
+    print(f"Quarkus Build Evidence: {report['quarkus_build_evidence_count']}")
     print("Included Java files:")
     for path in report["indexed_files"]:
         print(f"- {path}")
@@ -119,6 +120,7 @@ def _index_report(result: IndexResult) -> dict[str, object]:
         "declaration_count": len(result.declarations),
         "invocation_count": len(result.invocations),
         "spring_configuration_evidence_count": len(result.spring_facts),
+        "quarkus_build_evidence_count": len(result.quarkus_build_facts),
         "parse_failures": [
             {
                 "path": _report_path(failure.path),

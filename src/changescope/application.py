@@ -100,6 +100,18 @@ class EJBFact:
 
 
 @dataclass(frozen=True)
+class QuarkusBuildFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    profile: str | None = None
+
+
+@dataclass(frozen=True)
 class ParseFailure:
     path: Path
     start_line: int
@@ -120,6 +132,7 @@ class IndexResult:
     spring_facts: tuple[SpringFact, ...] = ()
     ejb_facts: tuple[EJBFact, ...] = ()
     configuration_files: tuple[Path, ...] = ()
+    quarkus_build_facts: tuple[QuarkusBuildFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -228,7 +241,7 @@ class ChangeScopeApplication:
 
 
 def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
-    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb):(.+):(\d+)-(\d+)", request.evidence_handle)
+    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|quarkus_build):(.+):(\d+)-(\d+)", request.evidence_handle)
     if match is None:
         raise ValueError("Evidence handles must use kind:path:start-end form.")
     path = _validate_relative_path(Path(match.group(1)))
@@ -392,6 +405,11 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
         assumptions.append(
             "No Spring profile was selected; profile-specific configuration remains conditional."
         )
+    quarkus_assumptions, quarkus_unresolved = _quarkus_build_impact_evidence(
+        database_path, candidates[0].path
+    )
+    assumptions.extend(quarkus_assumptions)
+    unresolved_items = (*unresolved_items, *quarkus_unresolved)
     return ImpactResult(
         "resolved",
         request.target,
@@ -506,6 +524,10 @@ def _spring_evidence_handle(path: Path, start_line: int, end_line: int) -> str:
 
 def _ejb_evidence_handle(path: Path, start_line: int, end_line: int) -> str:
     return _evidence_handle("ejb", path, start_line, end_line)
+
+
+def _quarkus_build_evidence_handle(path: Path, start_line: int, end_line: int) -> str:
+    return _evidence_handle("quarkus_build", path, start_line, end_line)
 
 
 def _unresolved(
@@ -1769,6 +1791,9 @@ def _index_repository(repository_root: Path) -> IndexResult:
         {**contents_by_path, **configuration_contents}, declarations
     )
     ejb_facts = _analyze_ejb_files({**contents_by_path, **configuration_contents})
+    quarkus_build_facts = _analyze_quarkus_build_files(
+        {**contents_by_path, **configuration_contents}
+    )
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -1782,6 +1807,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
         spring_facts=spring_facts,
         ejb_facts=ejb_facts,
         configuration_files=configuration_files,
+        quarkus_build_facts=quarkus_build_facts,
     )
     _write_index(result)
     return result
@@ -1855,6 +1881,9 @@ def _refresh_index_if_needed(root: Path) -> None:
                     else {**changed_contents, **changed_configuration_contents}
                 )
                 ejb_facts = _analyze_ejb_files(ejb_inputs)
+                quarkus_build_facts = _analyze_quarkus_build_files(
+                    {**contents_by_path, **configuration_contents}
+                )
                 _replace_changed_source_records(
                     connection,
                     changed_paths,
@@ -1864,6 +1893,7 @@ def _refresh_index_if_needed(root: Path) -> None:
                     parse_failures,
                     spring_facts,
                     ejb_facts,
+                    quarkus_build_facts,
                     replace_all_ejb_facts=refresh_all_ejb_facts,
                 )
             _write_metadata(connection, _snapshot(root), source_roots)
@@ -2155,6 +2185,25 @@ def _configuration_files(
             indexed[relative_path] = path.read_bytes()
         except OSError:
             read_failures.add(relative_path)
+
+    for directory, directories, filenames in os.walk(root):
+        directories[:] = [
+            name for name in directories if name not in EXCLUDED_DIRECTORY_NAMES
+        ]
+        for filename in filenames:
+            if filename in {
+                "pom.xml",
+                "build.gradle",
+                "build.gradle.kts",
+                "settings.gradle",
+                "settings.gradle.kts",
+            }:
+                path = Path(directory) / filename
+                relative_path = path.relative_to(root)
+                try:
+                    indexed[relative_path] = path.read_bytes()
+                except OSError:
+                    read_failures.add(relative_path)
     return (
         tuple(sorted(indexed, key=str)),
         tuple(sorted(read_failures, key=str)),
@@ -3877,6 +3926,7 @@ def _replace_index_contents(
     connection.execute("DELETE FROM parse_failures")
     connection.execute("DELETE FROM spring_facts")
     connection.execute("DELETE FROM ejb_facts")
+    connection.execute("DELETE FROM quarkus_build_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
     indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
     connection.executemany(
@@ -3893,6 +3943,7 @@ def _replace_index_contents(
     _insert_java_facts(connection, result.declarations, result.invocations, result.parse_failures)
     _insert_spring_facts(connection, result.spring_facts)
     _insert_ejb_facts(connection, result.ejb_facts)
+    _insert_quarkus_build_facts(connection, result.quarkus_build_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
@@ -3901,6 +3952,9 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
     ).fetchone() is None
     ejb_schema_missing = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ejb_facts'"
+    ).fetchone() is None
+    quarkus_schema_missing = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_build_facts'"
     ).fetchone() is None
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -3964,6 +4018,18 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         end_line INTEGER NOT NULL
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS quarkus_build_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        profile TEXT
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -3994,6 +4060,7 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         or invocation_schema_changed
         or spring_schema_missing
         or ejb_schema_missing
+        or quarkus_schema_missing
     )
 
 
@@ -4026,10 +4093,12 @@ def _replace_changed_source_records(
     parse_failures: tuple[ParseFailure, ...],
     spring_facts: tuple[SpringFact, ...],
     ejb_facts: tuple[EJBFact, ...],
+    quarkus_build_facts: tuple[QuarkusBuildFact, ...] = (),
     replace_all_ejb_facts: bool = False,
 ) -> None:
     if replace_all_ejb_facts:
         connection.execute("DELETE FROM ejb_facts")
+        connection.execute("DELETE FROM quarkus_build_facts")
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
@@ -4037,6 +4106,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM parse_failures WHERE path = ?", (path,))
         connection.execute("DELETE FROM spring_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM ejb_facts WHERE path = ?", (path,))
+        connection.execute("DELETE FROM quarkus_build_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
@@ -4044,6 +4114,7 @@ def _replace_changed_source_records(
     _insert_java_facts(connection, declarations, invocations, parse_failures)
     _insert_spring_facts(connection, spring_facts)
     _insert_ejb_facts(connection, ejb_facts)
+    _insert_quarkus_build_facts(connection, quarkus_build_facts)
 
 
 def _insert_java_facts(
@@ -4152,3 +4223,339 @@ def _file_content_hash(path: Path) -> str:
         return _content_hash(path.read_bytes())
     except OSError:
         return ""
+
+
+def _insert_quarkus_build_facts(
+    connection: sqlite3.Connection, facts: Iterable[QuarkusBuildFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO quarkus_build_facts(
+        kind, subject, target, value, path, start_line, end_line, profile
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.profile,
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _analyze_quarkus_build_files(
+    contents_by_path: dict[Path, bytes]
+) -> tuple[QuarkusBuildFact, ...]:
+    facts: list[QuarkusBuildFact] = []
+    build_files = {
+        path: content
+        for path, content in contents_by_path.items()
+        if path.name in {"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"}
+    }
+    for path, content in sorted(build_files.items(), key=lambda item: str(item[0])):
+        text = content.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        if path.name == "pom.xml":
+            facts.extend(_parse_maven_quarkus_facts(path, text, lines))
+        elif path.name in {"build.gradle", "build.gradle.kts"}:
+            facts.extend(_parse_gradle_quarkus_facts(path, text, lines))
+        elif path.name in {"settings.gradle", "settings.gradle.kts"}:
+            facts.extend(_parse_gradle_settings_facts(path, text, lines))
+    return tuple(
+        sorted(
+            facts,
+            key=lambda f: (str(f.path), f.start_line, f.kind, f.subject, f.target or ""),
+        )
+    )
+
+
+def _parse_maven_quarkus_facts(
+    path: Path, text: str, lines: list[str]
+) -> list[QuarkusBuildFact]:
+    facts: list[QuarkusBuildFact] = []
+
+    for idx, line in enumerate(lines, 1):
+        for match in re.finditer(r"<module>\s*([^<]+)\s*</module>", line):
+            facts.append(
+                QuarkusBuildFact(
+                    "module",
+                    match.group(1).strip(),
+                    str(path.parent.as_posix()),
+                    "maven",
+                    path,
+                    idx,
+                    idx,
+                )
+            )
+
+    bom_match = re.search(r"<(?:[A-Za-z_$][\w$.-]*:)?artifactId>\s*(quarkus-(?:platform-)?bom|quarkus-universe-bom)\s*</", text)
+    if bom_match:
+        start_line = text.count("\n", 0, bom_match.start()) + 1
+        facts.append(
+            QuarkusBuildFact(
+                "platform",
+                "io.quarkus:quarkus-bom",
+                "platform",
+                bom_match.group(1),
+                path,
+                start_line,
+                start_line,
+            )
+        )
+
+    plugin_match = re.search(r"<(?:[A-Za-z_$][\w$.-]*:)?artifactId>\s*quarkus-maven-plugin\s*</", text)
+    if plugin_match:
+        start_line = text.count("\n", 0, plugin_match.start()) + 1
+        facts.append(
+            QuarkusBuildFact(
+                "plugin",
+                "io.quarkus:quarkus-maven-plugin",
+                "quarkus",
+                "maven",
+                path,
+                start_line,
+                start_line,
+            )
+        )
+
+    dep_blocks = re.finditer(
+        r"<(?:[A-Za-z_$][\w$.-]*:)?dependency\b[^>]*>(.*?)</(?:[A-Za-z_$][\w$.-]*:)?dependency>",
+        text,
+        re.DOTALL,
+    )
+    for dep in dep_blocks:
+        dep_text = dep.group(1)
+        group_match = re.search(r"<(?:[A-Za-z_$][\w$.-]*:)?groupId>\s*([^<]+)\s*</", dep_text)
+        art_match = re.search(r"<(?:[A-Za-z_$][\w$.-]*:)?artifactId>\s*([^<]+)\s*</", dep_text)
+        group_id = group_match.group(1).strip() if group_match else ""
+        artifact_id = art_match.group(1).strip() if art_match else ""
+        if group_id.startswith("io.quarkus") or artifact_id.startswith("quarkus-"):
+            if artifact_id in {"quarkus-bom", "quarkus-universe-bom", "quarkus-maven-plugin"}:
+                continue
+            start_line = text.count("\n", 0, dep.start()) + 1
+            end_line = text.count("\n", 0, dep.end()) + 1
+            ext_status = _quarkus_extension_status(artifact_id)
+            facts.append(
+                QuarkusBuildFact(
+                    "extension",
+                    artifact_id,
+                    group_id or "io.quarkus",
+                    ext_status,
+                    path,
+                    start_line,
+                    end_line,
+                )
+            )
+
+    profile_blocks = re.finditer(
+        r"<(?:[A-Za-z_$][\w$.-]*:)?profile\b[^>]*>(.*?)</(?:[A-Za-z_$][\w$.-]*:)?profile>",
+        text,
+        re.DOTALL,
+    )
+    for prof in profile_blocks:
+        prof_text = prof.group(1)
+        id_match = re.search(r"<(?:[A-Za-z_$][\w$.-]*:)?id>\s*([^<]+)\s*</", prof_text)
+        prof_id = id_match.group(1).strip() if id_match else ""
+        if prof_id == "native" or "quarkus.package.type" in prof_text or "native-image" in prof_text:
+            start_line = text.count("\n", 0, prof.start()) + 1
+            end_line = text.count("\n", 0, prof.end()) + 1
+            facts.append(
+                QuarkusBuildFact(
+                    "profile",
+                    prof_id or "native",
+                    "profile",
+                    "native",
+                    path,
+                    start_line,
+                    end_line,
+                    profile=prof_id or "native",
+                )
+            )
+
+    return facts
+
+
+def _parse_gradle_quarkus_facts(
+    path: Path, text: str, lines: list[str]
+) -> list[QuarkusBuildFact]:
+    facts: list[QuarkusBuildFact] = []
+
+    for idx, line in enumerate(lines, 1):
+        if re.search(r"\b(?:id|apply\s+plugin:)\s*[\"']io\.quarkus", line) or re.search(r"\bid\s*\(\s*[\"']io\.quarkus", line):
+            facts.append(
+                QuarkusBuildFact(
+                    "plugin",
+                    "io.quarkus",
+                    "quarkus",
+                    "gradle",
+                    path,
+                    idx,
+                    idx,
+                )
+            )
+
+    bom_match = re.search(r"[\"']io\.quarkus:(quarkus-(?:platform-)?bom):[^\"']+[\"']", text)
+    if bom_match:
+        start_line = text.count("\n", 0, bom_match.start()) + 1
+        facts.append(
+            QuarkusBuildFact(
+                "platform",
+                "io.quarkus:quarkus-bom",
+                "platform",
+                bom_match.group(1),
+                path,
+                start_line,
+                start_line,
+            )
+        )
+
+    for idx, line in enumerate(lines, 1):
+        for match in re.finditer(r"[\"'](?:io\.quarkus:)?(quarkus-[\w-]+)(?::[^\"']*)?[\"']", line):
+            artifact_id = match.group(1)
+            if artifact_id in {"quarkus-bom", "quarkus-universe-bom", "quarkus-gradle-plugin"}:
+                continue
+            ext_status = _quarkus_extension_status(artifact_id)
+            facts.append(
+                QuarkusBuildFact(
+                    "extension",
+                    artifact_id,
+                    "io.quarkus",
+                    ext_status,
+                    path,
+                    idx,
+                    idx,
+                )
+            )
+
+    for idx, line in enumerate(lines, 1):
+        if "quarkusBuild" in line or ("native" in line.lower() and "quarkus" in text.lower()):
+            if "quarkus.package.type" in line or "native" in line:
+                facts.append(
+                    QuarkusBuildFact(
+                        "profile",
+                        "native",
+                        "profile",
+                        "native",
+                        path,
+                        idx,
+                        idx,
+                        profile="native",
+                    )
+                )
+
+    return facts
+
+
+def _parse_gradle_settings_facts(
+    path: Path, text: str, lines: list[str]
+) -> list[QuarkusBuildFact]:
+    facts: list[QuarkusBuildFact] = []
+    for idx, line in enumerate(lines, 1):
+        for match in re.finditer(r"\binclude\s*(?:\(\s*)?[\"']:?([^\"']+)[\"']", line):
+            facts.append(
+                QuarkusBuildFact(
+                    "module",
+                    match.group(1).replace(":", "/"),
+                    str(path.parent.as_posix()),
+                    "gradle",
+                    path,
+                    idx,
+                    idx,
+                )
+            )
+    return facts
+
+
+def _quarkus_extension_status(artifact_id: str) -> str:
+    legacy_extensions = {
+        "quarkus-resteasy",
+        "quarkus-docker",
+        "quarkus-smallrye-metrics",
+        "quarkus-resteasy-jsonb",
+        "quarkus-resteasy-jackson",
+    }
+    return "legacy" if artifact_id in legacy_extensions else "current"
+
+
+def _quarkus_build_impact_evidence(
+    database_path: Path, target_path: Path
+) -> tuple[list[str], list[UnresolvedItem]]:
+    connection = sqlite3.connect(database_path)
+    try:
+        rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, profile
+            FROM quarkus_build_facts ORDER BY path, start_line"""
+        ).fetchall()
+    finally:
+        connection.close()
+
+    if not rows:
+        return [], []
+
+    facts = [
+        QuarkusBuildFact(
+            kind, subject, target, value, Path(path), start_line, end_line, profile
+        )
+        for kind, subject, target, value, path, start_line, end_line, profile in rows
+    ]
+
+    target_posix = target_path.as_posix()
+    build_facts_by_file: dict[Path, list[QuarkusBuildFact]] = {}
+    for fact in facts:
+        build_facts_by_file.setdefault(fact.path, []).append(fact)
+
+    best_build_file: Path | None = None
+    best_match_len = -1
+
+    for build_file in build_facts_by_file:
+        build_dir = build_file.parent.as_posix()
+        if build_dir == "." or target_posix.startswith(build_dir + "/"):
+            match_len = len(build_dir)
+            if match_len > best_match_len:
+                best_match_len = match_len
+                best_build_file = build_file
+
+    if best_build_file is None and build_facts_by_file:
+        best_build_file = sorted(build_facts_by_file.keys(), key=lambda p: str(p))[0]
+
+    module_facts = build_facts_by_file.get(best_build_file, []) if best_build_file else []
+    module_dir = best_build_file.parent.as_posix() if best_build_file else "."
+    extensions = [f for f in module_facts if f.kind == "extension"]
+    plugins = [f for f in module_facts if f.kind == "plugin"]
+    platforms = [f for f in module_facts if f.kind == "platform"]
+
+    assumptions: list[str] = []
+    unresolved: list[UnresolvedItem] = []
+
+    if extensions or plugins:
+        ext_desc = ", ".join(
+            f"{f.subject} [{f.value}]" if f.value else f.subject for f in extensions
+        )
+        plugin_desc = plugins[0].subject if plugins else "Quarkus build"
+        assumptions.append(
+            f"Quarkus module '{module_dir}' detected via {best_build_file.as_posix()} "
+            f"({plugin_desc}; extensions: {ext_desc or 'none'})."
+        )
+    elif platforms or any(f.kind == "module" for f in facts):
+        ref_fact = module_facts[0] if module_facts else facts[0]
+        unresolved.append(
+            _unresolved(
+                f"Quarkus module capability for '{module_dir}' is inherited or unmapped; framework flavor is unconfirmed.",
+                ref_fact.path,
+                ref_fact.start_line,
+                ref_fact.end_line,
+                "quarkus_build",
+            )
+        )
+    elif facts:
+        ext_desc = ", ".join(f.subject for f in facts if f.kind == "extension")
+        assumptions.append(
+            f"Quarkus build evidence detected across repository (extensions: {ext_desc or 'none'})."
+        )
+
+    return assumptions, unresolved
