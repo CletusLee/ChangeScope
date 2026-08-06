@@ -170,6 +170,18 @@ class ParseFailure:
 
 
 @dataclass(frozen=True)
+class QuarkusSecurityFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    policy: str | None = None
+
+
+@dataclass(frozen=True)
 class IndexResult:
     source_roots: tuple[Path, ...]
     indexed_files: tuple[Path, ...]
@@ -187,6 +199,7 @@ class IndexResult:
     quarkus_cdi_facts: tuple[QuarkusCDIFact, ...] = ()
     quarkus_rest_facts: tuple[QuarkusRESTFact, ...] = ()
     quarkus_route_facts: tuple[QuarkusRouteFact, ...] = ()
+    quarkus_security_facts: tuple[QuarkusSecurityFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -417,9 +430,29 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
     _refresh_index_if_needed(root)
     target_parts = request.target.split("#")
     if len(target_parts) != 2 or not all(target_parts):
+        connection = sqlite3.connect(database_path)
+        try:
+            class_rows = connection.execute(
+                """SELECT qualified_name, path, start_line, end_line
+                FROM java_declarations WHERE kind IN ('class', 'interface') AND (name = ? OR qualified_name = ?)
+                ORDER BY path, start_line""",
+                (request.target, request.target),
+            ).fetchall()
+            if class_rows:
+                q_name, c_path, c_sl, c_el = class_rows[0]
+                cand = _impact_target(q_name, c_path, c_sl, c_el)
+                snapshot = _read_index_snapshot(connection, root)
+                relationships, unresolved_items = _direct_relationships(
+                    database_path, cand, request.profiles, request.build_profiles, request.runtime_profiles
+                )
+                return ImpactResult(
+                    "resolved", request.target, cand, (), relationships, (), unresolved_items, snapshot
+                )
+        finally:
+            connection.close()
         return ImpactResult(
             "invalid_target", request.target, None, (), (), (),
-            (_unresolved("Use the target form Class#method."),), _read_index_snapshot(database_path, root),
+            (_unresolved("Use the target form Class#method or a valid Class target."),), _read_index_snapshot(database_path, root),
         )
     class_name, method_name = target_parts
     connection = sqlite3.connect(database_path)
@@ -627,8 +660,12 @@ def _direct_relationships(
     build_profiles: tuple[str, ...] = (),
     runtime_profiles: tuple[str, ...] = (),
 ) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
-    owner, method_name = target.signature.split("#", maxsplit=1)
-    method_name = method_name.split("(", maxsplit=1)[0]
+    if "#" in target.signature:
+        owner, method_with_parameters = target.signature.split("#", maxsplit=1)
+        method_name, _, _ = method_with_parameters.partition("(")
+    else:
+        owner = target.signature
+        method_name = ""
     connection = sqlite3.connect(database_path)
     try:
         rows = connection.execute(
@@ -780,6 +817,15 @@ def _direct_relationships(
     )
     relationships.extend(route_relationships)
     unresolved_items.extend(route_unresolved)
+    sec_relationships, sec_unresolved = _quarkus_security_relationships(
+        connection_data_path=database_path,
+        owner=owner,
+        target=target,
+        build_profiles=build_profiles,
+        runtime_profiles=runtime_profiles,
+    )
+    relationships.extend(sec_relationships)
+    unresolved_items.extend(sec_unresolved)
     return tuple(relationships), tuple(unresolved_items)
 
 
@@ -790,9 +836,14 @@ def _is_direct_construction(receiver: str, owner: str) -> bool:
 def _ejb_relationships(
     connection_data_path: Path, target: ImpactTarget
 ) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
-    owner, method_with_parameters = target.signature.split("#", maxsplit=1)
-    method_name, _, parameters = method_with_parameters.partition("(")
-    parameters = parameters.removesuffix(")")
+    if "#" in target.signature:
+        owner, method_with_parameters = target.signature.split("#", maxsplit=1)
+        method_name, _, parameters = method_with_parameters.partition("(")
+        parameters = parameters.removesuffix(")")
+    else:
+        owner = target.signature
+        method_name = ""
+        parameters = ""
     connection = sqlite3.connect(connection_data_path)
     try:
         facts = connection.execute(
@@ -1913,6 +1964,9 @@ def _index_repository(repository_root: Path) -> IndexResult:
     quarkus_route_facts = _analyze_quarkus_route_files(
         contents_by_path, declarations, quarkus_build_facts
     )
+    quarkus_security_facts = _analyze_quarkus_security_files(
+        contents_by_path, declarations, quarkus_config_facts
+    )
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -1931,6 +1985,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
         quarkus_cdi_facts=quarkus_cdi_facts,
         quarkus_rest_facts=quarkus_rest_facts,
         quarkus_route_facts=quarkus_route_facts,
+        quarkus_security_facts=quarkus_security_facts,
     )
     _write_index(result)
     return result
@@ -2023,6 +2078,9 @@ def _refresh_index_if_needed(root: Path) -> None:
                 quarkus_route_facts = _analyze_quarkus_route_files(
                     contents_by_path, declarations, quarkus_build_facts
                 )
+                quarkus_security_facts = _analyze_quarkus_security_files(
+                    contents_by_path, declarations
+                )
                 _replace_changed_source_records(
                     connection,
                     changed_paths,
@@ -2034,6 +2092,7 @@ def _refresh_index_if_needed(root: Path) -> None:
                     ejb_facts,
                     quarkus_build_facts,
                     quarkus_route_facts=quarkus_route_facts,
+                    quarkus_security_facts=quarkus_security_facts,
                     replace_all_ejb_facts=refresh_all_ejb_facts,
                 )
             _write_metadata(connection, _snapshot(root), source_roots)
@@ -4070,6 +4129,7 @@ def _replace_index_contents(
     connection.execute("DELETE FROM quarkus_config_facts")
     connection.execute("DELETE FROM quarkus_cdi_facts")
     connection.execute("DELETE FROM quarkus_rest_facts")
+    connection.execute("DELETE FROM quarkus_security_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
     indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
     connection.executemany(
@@ -4091,6 +4151,7 @@ def _replace_index_contents(
     _insert_quarkus_cdi_facts(connection, result.quarkus_cdi_facts)
     _insert_quarkus_rest_facts(connection, result.quarkus_rest_facts)
     _insert_quarkus_route_facts(connection, result.quarkus_route_facts)
+    _insert_quarkus_security_facts(connection, result.quarkus_security_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
@@ -4238,6 +4299,18 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         flavor TEXT
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS quarkus_security_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        policy TEXT
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -4310,6 +4383,7 @@ def _replace_changed_source_records(
     quarkus_cdi_facts: tuple[QuarkusCDIFact, ...] = (),
     quarkus_rest_facts: tuple[QuarkusRESTFact, ...] = (),
     quarkus_route_facts: tuple[QuarkusRouteFact, ...] = (),
+    quarkus_security_facts: tuple[QuarkusSecurityFact, ...] = (),
     replace_all_ejb_facts: bool = False,
 ) -> None:
     if replace_all_ejb_facts:
@@ -4319,6 +4393,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_cdi_facts")
         connection.execute("DELETE FROM quarkus_rest_facts")
         connection.execute("DELETE FROM quarkus_route_facts")
+        connection.execute("DELETE FROM quarkus_security_facts")
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
@@ -4331,6 +4406,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_cdi_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_rest_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_route_facts WHERE path = ?", (path,))
+        connection.execute("DELETE FROM quarkus_security_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
@@ -4343,6 +4419,7 @@ def _replace_changed_source_records(
     _insert_quarkus_cdi_facts(connection, quarkus_cdi_facts)
     _insert_quarkus_rest_facts(connection, quarkus_rest_facts)
     _insert_quarkus_route_facts(connection, quarkus_route_facts)
+    _insert_quarkus_security_facts(connection, quarkus_security_facts)
 
 
 def _insert_java_facts(
@@ -4567,6 +4644,299 @@ def _insert_quarkus_route_facts(
             for fact in facts
         ),
     )
+
+
+def _insert_quarkus_security_facts(
+    connection: sqlite3.Connection, facts: Iterable[QuarkusSecurityFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO quarkus_security_facts(
+        kind, subject, target, value, path, start_line, end_line, policy
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.policy,
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _extract_security_annotations(snippet: str) -> dict[str, Any] | None:
+    roles_match = re.search(r'@RolesAllowed\s*\(\s*(?:\{([^}]+)\}|["\']([^"\']+)["\'])\s*\)', snippet)
+    if roles_match:
+        raw_roles = roles_match.group(1) or roles_match.group(2) or ""
+        roles = [r.strip().strip('"').strip("'") for r in raw_roles.split(",") if r.strip()]
+        return {"policy_type": "roles_allowed", "roles": roles, "annotation": "@RolesAllowed"}
+
+    if re.search(r'@PermitAll\b', snippet):
+        return {"policy_type": "permit_all", "roles": [], "annotation": "@PermitAll"}
+
+    if re.search(r'@DenyAll\b', snippet):
+        return {"policy_type": "deny_all", "roles": [], "annotation": "@DenyAll"}
+
+    if re.search(r'@Authenticated\b', snippet):
+        return {"policy_type": "authenticated", "roles": [], "annotation": "@Authenticated"}
+
+    perm_match = re.search(r'@PermissionsAllowed\s*\(\s*(?:\{([^}]+)\}|["\']([^"\']+)["\'])\s*\)', snippet)
+    if perm_match:
+        raw_perms = perm_match.group(1) or perm_match.group(2) or ""
+        perms = [p.strip().strip('"').strip("'") for p in raw_perms.split(",") if p.strip()]
+        return {"policy_type": "permissions_allowed", "permissions": perms, "annotation": "@PermissionsAllowed"}
+
+    return None
+
+
+def _analyze_quarkus_security_files(
+    contents_by_path: dict[Path, bytes],
+    declarations: tuple[JavaDeclaration, ...],
+    quarkus_config_facts: tuple[QuarkusConfigFact, ...] = (),
+) -> tuple[QuarkusSecurityFact, ...]:
+    facts: list[QuarkusSecurityFact] = []
+
+    perm_rules: dict[str, dict[str, Any]] = {}
+    for cfg in quarkus_config_facts:
+        if cfg.kind == "quarkus_property_source" and cfg.subject.startswith("quarkus.http.auth.permission."):
+            rest_key = cfg.subject[len("quarkus.http.auth.permission."):]
+            if "." in rest_key:
+                perm_name, attr = rest_key.split(".", 1)
+                rule = perm_rules.setdefault(
+                    perm_name,
+                    {"name": perm_name, "path": cfg.path, "start_line": cfg.start_line, "end_line": cfg.end_line},
+                )
+                rule[attr] = cfg.value
+
+    for perm_name, rule in perm_rules.items():
+        if "paths" in rule or "policy" in rule:
+            facts.append(
+                QuarkusSecurityFact(
+                    "security_config_policy",
+                    f"quarkus.http.auth.permission.{perm_name}",
+                    rule.get("paths"),
+                    json.dumps({
+                        "name": perm_name,
+                        "paths": rule.get("paths"),
+                        "policy": rule.get("policy"),
+                        "roles_allowed": rule.get("roles-allowed"),
+                        "methods": rule.get("methods"),
+                    }),
+                    rule["path"],
+                    rule["start_line"],
+                    rule["end_line"],
+                    policy=rule.get("policy"),
+                )
+            )
+
+    for path, content in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        if path.suffix.lower() == ".java":
+            text = content.decode("utf-8", errors="replace")
+            lines = text.splitlines()
+
+            if re.search(r'\bimplements\s+([A-Za-z0-9_$,\s]*\b(SecurityIdentityAugmentor|IdentityProvider|SecurityPolicy)\b[A-Za-z0-9_$,\s]*)', text):
+                for decl in declarations:
+                    if decl.path == path and decl.kind in ("class", "interface"):
+                        facts.append(
+                            QuarkusSecurityFact(
+                                "security_unresolved",
+                                decl.qualified_name,
+                                "custom_security",
+                                f"Custom security component {decl.qualified_name} implements dynamic authentication or identity augmentation.",
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                policy="custom",
+                            )
+                        )
+
+            for decl in declarations:
+                if decl.path != path:
+                    continue
+
+                if decl.kind in ("class", "interface"):
+                    decl_snippet = _get_class_snippet(lines, decl)
+                    sec_info = _extract_security_annotations(decl_snippet)
+                    if sec_info:
+                        facts.append(
+                            QuarkusSecurityFact(
+                                "security_annotation_class",
+                                decl.qualified_name,
+                                None,
+                                json.dumps(sec_info),
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                policy=sec_info.get("policy_type"),
+                            )
+                        )
+
+                elif decl.kind == "method":
+                    method_snippet = _get_method_snippet(lines, decl)
+                    sec_info = _extract_security_annotations(method_snippet)
+                    if sec_info:
+                        facts.append(
+                            QuarkusSecurityFact(
+                                "security_annotation_method",
+                                decl.qualified_name,
+                                decl.qualified_name.rsplit("#", 1)[0],
+                                json.dumps(sec_info),
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                policy=sec_info.get("policy_type"),
+                            )
+                        )
+
+    return tuple(facts)
+
+
+def _quarkus_security_relationships(
+    connection_data_path: Path,
+    owner: str,
+    target: ImpactTarget,
+    build_profiles: tuple[str, ...] = (),
+    runtime_profiles: tuple[str, ...] = (),
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        sec_rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, policy
+            FROM quarkus_security_facts ORDER BY path, start_line"""
+        ).fetchall()
+        config_rows = connection.execute(
+            """SELECT subject, value, path, start_line, end_line FROM quarkus_config_facts WHERE kind = 'quarkus_property_source'"""
+        ).fetchall()
+        rest_rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line FROM quarkus_rest_facts"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return (), ()
+    finally:
+        connection.close()
+
+    if not sec_rows:
+        return (), ()
+
+    sec_facts = [
+        QuarkusSecurityFact(kind, subject, fact_target, value, Path(path), start_line, end_line, policy)
+        for kind, subject, fact_target, value, path, start_line, end_line, policy in sec_rows
+    ]
+
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+    seen_keys: set[tuple[str, str, Path, int, int]] = set()
+
+    target_sig = target.signature
+    target_class = target_sig.rsplit("#", 1)[0]
+    target_method = target_sig.split("#")[-1].split("(")[0] if "#" in target_sig else None
+
+    def matches_subject(f_subject: str) -> bool:
+        if f_subject == target_sig or f_subject == owner:
+            return True
+        f_class, _, f_m = f_subject.partition("#")
+        clean_fm = f_m.split("(")[0] if f_m else ""
+        clean_target_class = target_class.rsplit(".", 1)[-1]
+        clean_f_class = f_class.rsplit(".", 1)[-1]
+        if f_class == target_class or clean_f_class == clean_target_class:
+            if not target_method or not clean_fm or clean_fm == target_method:
+                return True
+        return False
+
+    for sf in sec_facts:
+        if sf.kind == "security_unresolved" and matches_subject(sf.subject):
+            unresolved.append(
+                UnresolvedItem(
+                    sf.value or f"Custom security component on {sf.subject}",
+                    path=sf.path,
+                    start_line=sf.start_line,
+                    end_line=sf.end_line,
+                    evidence_handle=f"quarkus_security:{sf.path.as_posix()}:{sf.start_line}-{sf.end_line}",
+                )
+            )
+
+    method_sec = next((sf for sf in sec_facts if sf.kind == "security_annotation_method" and matches_subject(sf.subject)), None)
+    active_sec = method_sec
+    if active_sec is None:
+        active_sec = next((sf for sf in sec_facts if sf.kind == "security_annotation_class" and (sf.subject == target_class or sf.subject.rsplit(".", 1)[-1] == target_class.rsplit(".", 1)[-1])), None)
+
+    if active_sec is not None:
+        sec_meta = json.loads(active_sec.value) if active_sec.value else {}
+        sec_handle = f"quarkus_security:{active_sec.path.as_posix()}:{active_sec.start_line}-{active_sec.end_line}"
+        chain = [sec_handle]
+
+        raw_val = active_sec.value or ""
+        if "${" in raw_val:
+            for expr_match in re.finditer(r"\$\{([^}:]+)(?::[^}]*)?\}", raw_val):
+                prop_key = expr_match.group(1).strip()
+                for cfg_sub, cfg_val, cfg_p, cfg_sl, cfg_el in config_rows:
+                    if cfg_sub == prop_key:
+                        cfg_path = Path(cfg_p)
+                        cfg_handle = f"quarkus_config:{cfg_path.as_posix()}:{cfg_sl}-{cfg_el}"
+                        if cfg_handle not in chain:
+                            chain.append(cfg_handle)
+
+        rel_key = ("quarkus_security_policy", target_sig, active_sec.path, active_sec.start_line, active_sec.end_line)
+        if rel_key not in seen_keys:
+            seen_keys.add(rel_key)
+            relationships.append(
+                ImpactRelationship(
+                    "quarkus_security_policy",
+                    f"{sec_meta.get('annotation', '@Security')} -> {target_sig}",
+                    active_sec.path,
+                    active_sec.start_line,
+                    active_sec.end_line,
+                    sec_handle,
+                    "high",
+                    False,
+                    None,
+                    evidence_chain=tuple(chain),
+                    business_view=json.dumps(sec_meta),
+                )
+            )
+
+    config_policies = [sf for sf in sec_facts if sf.kind == "security_config_policy"]
+    if config_policies:
+        matching_endpoints = [r for r in rest_rows if r[0] == "rest_endpoint" and matches_subject(r[1])]
+        for ep in matching_endpoints:
+            ep_meta = json.loads(ep[3]) if ep[3] else {}
+            ep_path = ep_meta.get("method_path", "")
+            ep_class_facts = [r for r in rest_rows if r[0] == "rest_resource" and r[1] == ep[1].rsplit("#", 1)[0]]
+            ep_class_path = ep_class_facts[0][2] if ep_class_facts else ""
+            full_route = "/" + "/".join(p.strip("/") for p in (ep_class_path, ep_path) if p.strip("/"))
+
+            for cp in config_policies:
+                cp_meta = json.loads(cp.value) if cp.value else {}
+                path_pattern = cp_meta.get("paths", "")
+                if path_pattern:
+                    clean_pattern = path_pattern.rstrip("*").rstrip("/")
+                    if full_route.startswith(clean_pattern) or clean_pattern == "":
+                        cp_handle = f"quarkus_security:{cp.path.as_posix()}:{cp.start_line}-{cp.end_line}"
+                        rel_key_cp = ("quarkus_security_policy", cp.subject, cp.path, cp.start_line, cp.end_line)
+                        if rel_key_cp not in seen_keys:
+                            seen_keys.add(rel_key_cp)
+                            relationships.append(
+                                ImpactRelationship(
+                                    "quarkus_security_policy",
+                                    f"Config Policy ({cp.subject}) -> {full_route}",
+                                    cp.path,
+                                    cp.start_line,
+                                    cp.end_line,
+                                    cp_handle,
+                                    "high",
+                                    False,
+                                    None,
+                                    evidence_chain=(cp_handle,),
+                                    business_view=json.dumps(cp_meta),
+                                )
+                            )
+
+    return tuple(relationships), tuple(unresolved)
 
 
 def _analyze_quarkus_cdi_files(
