@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -137,6 +138,18 @@ class QuarkusCDIFact:
 
 
 @dataclass(frozen=True)
+class QuarkusRESTFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    flavor: str | None = None
+
+
+@dataclass(frozen=True)
 class ParseFailure:
     path: Path
     start_line: int
@@ -160,6 +173,7 @@ class IndexResult:
     quarkus_build_facts: tuple[QuarkusBuildFact, ...] = ()
     quarkus_config_facts: tuple[QuarkusConfigFact, ...] = ()
     quarkus_cdi_facts: tuple[QuarkusCDIFact, ...] = ()
+    quarkus_rest_facts: tuple[QuarkusRESTFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -270,7 +284,7 @@ class ChangeScopeApplication:
 
 
 def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
-    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|quarkus_build|quarkus_config|quarkus_cdi):(.+):(\d+)-(\d+)", request.evidence_handle)
+    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|quarkus_build|quarkus_config|quarkus_cdi|quarkus_rest):(.+):(\d+)-(\d+)", request.evidence_handle)
     if match is None:
         raise ValueError("Evidence handles must use kind:path:start-end form.")
     path = _validate_relative_path(Path(match.group(1)))
@@ -739,6 +753,13 @@ def _direct_relationships(
     )
     relationships.extend(cdi_relationships)
     unresolved_items.extend(cdi_unresolved)
+    rest_relationships, rest_unresolved = _quarkus_rest_relationships(
+        connection_data_path=database_path,
+        owner=owner,
+        target=target,
+    )
+    relationships.extend(rest_relationships)
+    unresolved_items.extend(rest_unresolved)
     return tuple(relationships), tuple(unresolved_items)
 
 
@@ -1866,6 +1887,9 @@ def _index_repository(repository_root: Path) -> IndexResult:
         {**contents_by_path, **configuration_contents}, declarations
     )
     quarkus_cdi_facts = _analyze_quarkus_cdi_files(contents_by_path, declarations)
+    quarkus_rest_facts = _analyze_quarkus_rest_files(
+        contents_by_path, declarations, quarkus_build_facts, quarkus_config_facts
+    )
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -1882,6 +1906,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
         quarkus_build_facts=quarkus_build_facts,
         quarkus_config_facts=quarkus_config_facts,
         quarkus_cdi_facts=quarkus_cdi_facts,
+        quarkus_rest_facts=quarkus_rest_facts,
     )
     _write_index(result)
     return result
@@ -4016,6 +4041,7 @@ def _replace_index_contents(
     connection.execute("DELETE FROM quarkus_build_facts")
     connection.execute("DELETE FROM quarkus_config_facts")
     connection.execute("DELETE FROM quarkus_cdi_facts")
+    connection.execute("DELETE FROM quarkus_rest_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
     indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
     connection.executemany(
@@ -4035,6 +4061,7 @@ def _replace_index_contents(
     _insert_quarkus_build_facts(connection, result.quarkus_build_facts)
     _insert_quarkus_config_facts(connection, result.quarkus_config_facts)
     _insert_quarkus_cdi_facts(connection, result.quarkus_cdi_facts)
+    _insert_quarkus_rest_facts(connection, result.quarkus_rest_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
@@ -4052,6 +4079,9 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
     ).fetchone() is None
     quarkus_cdi_schema_missing = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_cdi_facts'"
+    ).fetchone() is None
+    quarkus_rest_schema_missing = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_rest_facts'"
     ).fetchone() is None
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -4152,6 +4182,18 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         scope TEXT
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS quarkus_rest_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        flavor TEXT
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -4185,6 +4227,7 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         or quarkus_schema_missing
         or quarkus_config_schema_missing
         or quarkus_cdi_schema_missing
+        or quarkus_rest_schema_missing
     )
 
 
@@ -4220,6 +4263,7 @@ def _replace_changed_source_records(
     quarkus_build_facts: tuple[QuarkusBuildFact, ...] = (),
     quarkus_config_facts: tuple[QuarkusConfigFact, ...] = (),
     quarkus_cdi_facts: tuple[QuarkusCDIFact, ...] = (),
+    quarkus_rest_facts: tuple[QuarkusRESTFact, ...] = (),
     replace_all_ejb_facts: bool = False,
 ) -> None:
     if replace_all_ejb_facts:
@@ -4227,6 +4271,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_build_facts")
         connection.execute("DELETE FROM quarkus_config_facts")
         connection.execute("DELETE FROM quarkus_cdi_facts")
+        connection.execute("DELETE FROM quarkus_rest_facts")
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
@@ -4237,6 +4282,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_build_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_config_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_cdi_facts WHERE path = ?", (path,))
+        connection.execute("DELETE FROM quarkus_rest_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
@@ -4247,6 +4293,7 @@ def _replace_changed_source_records(
     _insert_quarkus_build_facts(connection, quarkus_build_facts)
     _insert_quarkus_config_facts(connection, quarkus_config_facts)
     _insert_quarkus_cdi_facts(connection, quarkus_cdi_facts)
+    _insert_quarkus_rest_facts(connection, quarkus_rest_facts)
 
 
 def _insert_java_facts(
@@ -4427,6 +4474,29 @@ def _insert_quarkus_cdi_facts(
     )
 
 
+def _insert_quarkus_rest_facts(
+    connection: sqlite3.Connection, facts: Iterable[QuarkusRESTFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO quarkus_rest_facts(
+        kind, subject, target, value, path, start_line, end_line, flavor
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.flavor,
+            )
+            for fact in facts
+        ),
+    )
+
+
 def _analyze_quarkus_cdi_files(
     contents_by_path: dict[Path, bytes],
     declarations: tuple[JavaDeclaration, ...],
@@ -4599,6 +4669,228 @@ def _analyze_quarkus_cdi_files(
                             )
                         )
     return tuple(facts)
+
+
+def _analyze_quarkus_rest_files(
+    contents_by_path: dict[Path, bytes],
+    declarations: tuple[JavaDeclaration, ...],
+    quarkus_build_facts: tuple[QuarkusBuildFact, ...] = (),
+    quarkus_config_facts: tuple[QuarkusConfigFact, ...] = (),
+) -> tuple[QuarkusRESTFact, ...]:
+    facts: list[QuarkusRESTFact] = []
+
+    build_flavor = "unknown"
+    for bf in quarkus_build_facts:
+        if bf.kind == "extension":
+            if "resteasy-reactive" in bf.subject or "quarkus-rest" in bf.subject:
+                build_flavor = "quarkus_rest"
+                break
+            elif "resteasy" in bf.subject:
+                build_flavor = "resteasy_classic"
+
+    for path, content in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        if path.suffix.lower() == ".java":
+            text = content.decode("utf-8", errors="replace")
+            lines = text.splitlines()
+
+            has_rest = (
+                "import jakarta.ws.rs" in text
+                or "import javax.ws.rs" in text
+                or "import io.quarkus.resteasy" in text
+                or "@Path" in text
+                or "@GET" in text
+                or "@POST" in text
+                or "@PUT" in text
+                or "@DELETE" in text
+            )
+
+            if has_rest:
+                file_flavor = build_flavor
+                if "org.jboss.resteasy.reactive" in text or "io.quarkus.resteasy.reactive" in text:
+                    file_flavor = "quarkus_rest"
+                elif "org.jboss.resteasy.annotations" in text:
+                    file_flavor = "resteasy_classic"
+
+                for decl in declarations:
+                    if decl.path != path:
+                        continue
+
+                    decl_snippet = "\n".join(lines[max(0, decl.start_line - 6) : decl.end_line])
+
+                    if decl.kind == "class":
+                        app_path_match = re.search(r'@ApplicationPath\s*\(\s*["\']([^"\']+)["\']\s*\)', decl_snippet)
+                        if app_path_match:
+                            facts.append(
+                                QuarkusRESTFact(
+                                    "rest_application",
+                                    decl.qualified_name,
+                                    app_path_match.group(1).strip(),
+                                    None,
+                                    path,
+                                    decl.start_line,
+                                    decl.end_line,
+                                    flavor=file_flavor,
+                                )
+                            )
+
+                        class_path_match = re.search(r'@Path\s*\(\s*["\']([^"\']+)["\']\s*\)', decl_snippet)
+                        if class_path_match:
+                            class_path_val = class_path_match.group(1).strip()
+                            facts.append(
+                                QuarkusRESTFact(
+                                    "rest_resource",
+                                    decl.qualified_name,
+                                    class_path_val,
+                                    None,
+                                    path,
+                                    decl.start_line,
+                                    decl.end_line,
+                                    flavor=file_flavor,
+                                )
+                            )
+
+                    elif decl.kind == "method":
+                        method_snippet = "\n".join(lines[max(0, decl.start_line - 1) : decl.end_line])
+                        http_match = re.search(r'@(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b', method_snippet)
+                        if http_match:
+                            http_method = http_match.group(1)
+                            method_path_match = re.search(r'@Path\s*\(\s*["\']([^"\']+)["\']\s*\)', method_snippet)
+                            method_path_val = method_path_match.group(1).strip() if method_path_match else ""
+
+                            produces_match = re.search(r'@Produces\s*\(\s*(?:\{[^}]*\}|["\']([^"\']+)["\']|([A-Za-z0-9_$.]+))\s*\)', decl_snippet)
+                            produces_val = (produces_match.group(1) or produces_match.group(2)) if produces_match else None
+
+                            consumes_match = re.search(r'@Consumes\s*\(\s*(?:\{[^}]*\}|["\']([^"\']+)["\']|([A-Za-z0-9_$.]+))\s*\)', decl_snippet)
+                            consumes_val = (consumes_match.group(1) or consumes_match.group(2)) if consumes_match else None
+
+                            params = []
+                            for p_match in re.finditer(r'@(PathParam|QueryParam|HeaderParam|CookieParam|FormParam|MatrixParam|BeanParam)\s*\(\s*["\']([^"\']+)["\']\s*\)\s*([A-Za-z0-9_$.<>]+)\s+([A-Za-z0-9_$]+)', decl_snippet):
+                                params.append({
+                                    "role": p_match.group(1),
+                                    "key": p_match.group(2),
+                                    "type": p_match.group(3),
+                                    "name": p_match.group(4),
+                                })
+
+                            meta = {
+                                "http_method": http_method,
+                                "method_path": method_path_val,
+                                "produces": produces_val,
+                                "consumes": consumes_val,
+                                "parameters": params,
+                            }
+
+                            facts.append(
+                                QuarkusRESTFact(
+                                    "rest_endpoint",
+                                    decl.qualified_name,
+                                    f"{http_method} {method_path_val}".strip(),
+                                    json.dumps(meta),
+                                    path,
+                                    decl.start_line,
+                                    decl.end_line,
+                                    flavor=file_flavor,
+                                )
+                            )
+    return tuple(facts)
+
+
+def _quarkus_rest_relationships(
+    connection_data_path: Path,
+    owner: str,
+    target: ImpactTarget,
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, flavor
+            FROM quarkus_rest_facts ORDER BY path, start_line"""
+        ).fetchall()
+        config_rows = connection.execute(
+            """SELECT subject, value FROM quarkus_config_facts WHERE kind = 'quarkus_property_source'"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return (), ()
+    finally:
+        connection.close()
+
+    if not rows:
+        return (), ()
+
+    rest_facts = [
+        QuarkusRESTFact(kind, subject, fact_target, value, Path(path), start_line, end_line, flavor)
+        for kind, subject, fact_target, value, path, start_line, end_line, flavor in rows
+    ]
+
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+
+    http_root_path = ""
+    for prop_key, prop_val in config_rows:
+        if prop_key in {"quarkus.http.root-path", "quarkus.rest.path", "quarkus.resteasy.path"} and prop_val:
+            http_root_path = prop_val.strip()
+            if not http_root_path.startswith("/"):
+                http_root_path = "/" + http_root_path
+
+    app_path = ""
+    app_facts = [f for f in rest_facts if f.kind == "rest_application"]
+    if app_facts and app_facts[0].target:
+        app_path = app_facts[0].target
+        if not app_path.startswith("/"):
+            app_path = "/" + app_path
+
+    target_method_name = target.signature.split("(")[0]
+
+    for f in rest_facts:
+        if f.kind == "rest_endpoint" and (f.subject == target_method_name or f.subject.startswith(owner)):
+            meta = json.loads(f.value) if f.value else {}
+            http_method = meta.get("http_method", "GET")
+            method_path = meta.get("method_path", "")
+
+            owner_class = f.subject.rsplit("#", maxsplit=1)[0]
+            class_facts = [cf for cf in rest_facts if cf.kind == "rest_resource" and cf.subject == owner_class]
+            class_path = class_facts[0].target if class_facts and class_facts[0].target else ""
+
+            parts = [p for p in (http_root_path, app_path, class_path, method_path) if p]
+            full_path = "/" + "/".join(p.strip("/") for p in parts if p.strip("/"))
+            if not full_path or full_path == "//":
+                full_path = "/"
+
+            route_identity = f"{http_method} {full_path}"
+            flavor = f.flavor or "unknown"
+            confidence = "high" if flavor != "unknown" else "medium"
+
+            handle = f"quarkus_rest:{f.path.as_posix()}:{f.start_line}-{f.end_line}"
+            chain = [handle]
+            if class_facts:
+                chain.append(f"quarkus_rest:{class_facts[0].path.as_posix()}:{class_facts[0].start_line}-{class_facts[0].end_line}")
+
+            business_data = {
+                "flavor": flavor,
+                "route": route_identity,
+                "http_method": http_method,
+                "produces": meta.get("produces"),
+                "consumes": meta.get("consumes"),
+                "parameters": meta.get("parameters", []),
+            }
+
+            relationships.append(
+                ImpactRelationship(
+                    "quarkus_rest_contract",
+                    route_identity,
+                    f.path,
+                    f.start_line,
+                    f.end_line,
+                    handle,
+                    confidence,
+                    False,
+                    None,
+                    evidence_chain=tuple(chain),
+                    business_view=json.dumps(business_data),
+                )
+            )
+
+    return tuple(relationships), tuple(unresolved)
 
 
 def _quarkus_cdi_relationships(
