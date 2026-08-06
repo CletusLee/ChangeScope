@@ -4671,6 +4671,47 @@ def _analyze_quarkus_cdi_files(
     return tuple(facts)
 
 
+def _extract_build_profile_conditions(snippet: str) -> list[str]:
+    conds = []
+    if_prof = re.search(r'@IfBuildProfile\s*\(\s*(?:stringValues\s*=\s*)?["\']([^"\']+)["\']\s*\)', snippet)
+    if if_prof:
+        conds.append(f"if:{if_prof.group(1)}")
+    unless_prof = re.search(r'@UnlessBuildProfile\s*\(\s*(?:stringValues\s*=\s*)?["\']([^"\']+)["\']\s*\)', snippet)
+    if unless_prof:
+        conds.append(f"unless:{unless_prof.group(1)}")
+    if_prop = re.search(r'@IfBuildProperty\s*\(\s*name\s*=\s*["\']([^"\']+)["\'](?:\s*,\s*stringValue\s*=\s*["\']([^"\']+)["\'])?\s*\)', snippet)
+    if if_prop:
+        conds.append(f"if_prop:{if_prop.group(1)}={if_prop.group(2) or 'true'}")
+    unless_prop = re.search(r'@UnlessBuildProperty\s*\(\s*name\s*=\s*["\']([^"\']+)["\'](?:\s*,\s*stringValue\s*=\s*["\']([^"\']+)["\'])?\s*\)', snippet)
+    if unless_prop:
+        conds.append(f"unless_prop:{unless_prop.group(1)}={unless_prop.group(2) or 'true'}")
+    prof = re.search(r'@Profile\s*\(\s*["\']([^"\']+)["\']\s*\)', snippet)
+    if prof:
+        conds.append(f"if:{prof.group(1)}")
+    return conds
+
+
+def _get_class_snippet(lines: list[str], decl: JavaDeclaration) -> str:
+    raw_lines = lines[max(0, decl.start_line - 6) : decl.end_line]
+    header_lines = []
+    for line in raw_lines:
+        header_lines.append(line)
+        if re.search(r'\b(class|interface|enum|record)\b', line):
+            break
+    return "\n".join(header_lines)
+
+
+def _get_method_snippet(lines: list[str], decl: JavaDeclaration) -> str:
+    raw_lines = lines[max(0, decl.start_line - 6) : decl.end_line]
+    start_idx = 0
+    for idx, line in enumerate(raw_lines):
+        line_no = max(0, decl.start_line - 6) + idx + 1
+        if line_no < decl.start_line:
+            if re.search(r'\b(class|interface|enum|record)\b', line) or line.strip() == "}":
+                start_idx = idx + 1
+    return "\n".join(raw_lines[start_idx:])
+
+
 def _analyze_quarkus_rest_files(
     contents_by_path: dict[Path, bytes],
     declarations: tuple[JavaDeclaration, ...],
@@ -4693,105 +4734,188 @@ def _analyze_quarkus_rest_files(
             text = content.decode("utf-8", errors="replace")
             lines = text.splitlines()
 
-            has_rest = (
-                "import jakarta.ws.rs" in text
-                or "import javax.ws.rs" in text
-                or "import io.quarkus.resteasy" in text
-                or "@Path" in text
-                or "@GET" in text
-                or "@POST" in text
-                or "@PUT" in text
-                or "@DELETE" in text
-            )
+            file_flavor = build_flavor
+            if "org.jboss.resteasy.reactive" in text or "io.quarkus.resteasy.reactive" in text:
+                file_flavor = "quarkus_rest"
+            elif "org.jboss.resteasy.annotations" in text:
+                file_flavor = "resteasy_classic"
 
-            if has_rest:
-                file_flavor = build_flavor
-                if "org.jboss.resteasy.reactive" in text or "io.quarkus.resteasy.reactive" in text:
-                    file_flavor = "quarkus_rest"
-                elif "org.jboss.resteasy.annotations" in text:
-                    file_flavor = "resteasy_classic"
+            for decl in declarations:
+                if decl.path != path:
+                    continue
 
-                for decl in declarations:
-                    if decl.path != path:
-                        continue
-
-                    decl_snippet = "\n".join(lines[max(0, decl.start_line - 6) : decl.end_line])
-
-                    if decl.kind == "class":
-                        app_path_match = re.search(r'@ApplicationPath\s*\(\s*["\']([^"\']+)["\']\s*\)', decl_snippet)
-                        if app_path_match:
-                            facts.append(
-                                QuarkusRESTFact(
-                                    "rest_application",
-                                    decl.qualified_name,
-                                    app_path_match.group(1).strip(),
-                                    None,
-                                    path,
-                                    decl.start_line,
-                                    decl.end_line,
-                                    flavor=file_flavor,
-                                )
+                if decl.kind in ("class", "interface"):
+                    decl_snippet = _get_class_snippet(lines, decl)
+                    app_path_match = re.search(r'@ApplicationPath\s*\(\s*["\']([^"\']+)["\']\s*\)', decl_snippet)
+                    if app_path_match:
+                        facts.append(
+                            QuarkusRESTFact(
+                                "rest_application",
+                                decl.qualified_name,
+                                app_path_match.group(1).strip(),
+                                None,
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                flavor=file_flavor,
                             )
+                        )
 
-                        class_path_match = re.search(r'@Path\s*\(\s*["\']([^"\']+)["\']\s*\)', decl_snippet)
-                        if class_path_match:
-                            class_path_val = class_path_match.group(1).strip()
-                            facts.append(
-                                QuarkusRESTFact(
-                                    "rest_resource",
-                                    decl.qualified_name,
-                                    class_path_val,
-                                    None,
-                                    path,
-                                    decl.start_line,
-                                    decl.end_line,
-                                    flavor=file_flavor,
-                                )
+                    class_path_match = re.search(r'@Path\s*\(\s*["\']([^"\']+)["\']\s*\)', decl_snippet)
+                    class_path_val = class_path_match.group(1).strip() if class_path_match else ""
+
+                    implements_match = re.search(r'\bimplements\s+([A-Za-z0-9_$,\s]+?)(?:\{|implements|extends)', decl_snippet)
+                    implements_list = []
+                    if implements_match:
+                        implements_list = [i.strip() for i in implements_match.group(1).split(",") if i.strip()]
+
+                    extends_match = re.search(r'\bextends\s+([A-Za-z0-9_$]+)', decl_snippet)
+                    extends_val = extends_match.group(1).strip() if extends_match else None
+
+                    prof_conds = _extract_build_profile_conditions(decl_snippet)
+
+                    is_provider = "@Provider" in decl_snippet
+                    is_filter_or_mapper = bool(re.search(r'\b(ContainerRequestFilter|ContainerResponseFilter|ExceptionMapper|MessageBodyReader|MessageBodyWriter|ParamConverterProvider)\b', decl_snippet))
+
+                    res_meta = {
+                        "kind": decl.kind,
+                        "implements": implements_list,
+                        "extends": extends_val,
+                        "build_profile_conditions": prof_conds,
+                        "is_provider": is_provider,
+                        "is_filter_or_mapper": is_filter_or_mapper,
+                    }
+
+                    facts.append(
+                        QuarkusRESTFact(
+                            "rest_resource",
+                            decl.qualified_name,
+                            class_path_val,
+                            json.dumps(res_meta),
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            flavor=file_flavor,
+                        )
+                    )
+
+                    if is_provider or is_filter_or_mapper:
+                        facts.append(
+                            QuarkusRESTFact(
+                                "rest_provider_filter",
+                                decl.qualified_name,
+                                "filter_provider",
+                                json.dumps({"is_provider": is_provider, "is_filter_or_mapper": is_filter_or_mapper}),
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                flavor=file_flavor,
                             )
+                        )
 
-                    elif decl.kind == "method":
-                        method_snippet = "\n".join(lines[max(0, decl.start_line - 1) : decl.end_line])
-                        http_match = re.search(r'@(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b', method_snippet)
-                        if http_match:
-                            http_method = http_match.group(1)
-                            method_path_match = re.search(r'@Path\s*\(\s*["\']([^"\']+)["\']\s*\)', method_snippet)
-                            method_path_val = method_path_match.group(1).strip() if method_path_match else ""
+                elif decl.kind == "method":
+                    method_snippet = _get_method_snippet(lines, decl)
+                    http_match = re.search(r'@(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b', method_snippet)
+                    method_path_match = re.search(r'@Path\s*\(\s*["\']([^"\']+)["\']\s*\)', method_snippet)
+                    method_path_val = method_path_match.group(1).strip() if method_path_match else ""
 
-                            produces_match = re.search(r'@Produces\s*\(\s*(?:\{[^}]*\}|["\']([^"\']+)["\']|([A-Za-z0-9_$.]+))\s*\)', decl_snippet)
-                            produces_val = (produces_match.group(1) or produces_match.group(2)) if produces_match else None
+                    prof_conds = _extract_build_profile_conditions(method_snippet)
 
-                            consumes_match = re.search(r'@Consumes\s*\(\s*(?:\{[^}]*\}|["\']([^"\']+)["\']|([A-Za-z0-9_$.]+))\s*\)', decl_snippet)
-                            consumes_val = (consumes_match.group(1) or consumes_match.group(2)) if consumes_match else None
+                    produces_match = re.search(r'@Produces\s*\(\s*(?:\{[^}]*\}|["\']([^"\']+)["\']|([A-Za-z0-9_$.]+))\s*\)', method_snippet)
+                    produces_val = (produces_match.group(1) or produces_match.group(2)) if produces_match else None
 
-                            params = []
-                            for p_match in re.finditer(r'@(PathParam|QueryParam|HeaderParam|CookieParam|FormParam|MatrixParam|BeanParam)\s*\(\s*["\']([^"\']+)["\']\s*\)\s*([A-Za-z0-9_$.<>]+)\s+([A-Za-z0-9_$]+)', decl_snippet):
-                                params.append({
-                                    "role": p_match.group(1),
-                                    "key": p_match.group(2),
-                                    "type": p_match.group(3),
-                                    "name": p_match.group(4),
-                                })
+                    consumes_match = re.search(r'@Consumes\s*\(\s*(?:\{[^}]*\}|["\']([^"\']+)["\']|([A-Za-z0-9_$.]+))\s*\)', method_snippet)
+                    consumes_val = (consumes_match.group(1) or consumes_match.group(2)) if consumes_match else None
 
-                            meta = {
-                                "http_method": http_method,
-                                "method_path": method_path_val,
-                                "produces": produces_val,
-                                "consumes": consumes_val,
-                                "parameters": params,
-                            }
+                    params = []
+                    has_servlet_ctx = False
+                    for p_match in re.finditer(r'@(PathParam|QueryParam|HeaderParam|CookieParam|FormParam|MatrixParam|BeanParam|Context)\s*(?:\(\s*["\']([^"\']+)["\']\s*\))?\s*([A-Za-z0-9_$.<>]+)\s+([A-Za-z0-9_$]+)', method_snippet):
+                        role = p_match.group(1)
+                        param_type = p_match.group(3)
+                        params.append({
+                            "role": role,
+                            "key": p_match.group(2) or "",
+                            "type": param_type,
+                            "name": p_match.group(4),
+                        })
+                        if role == "Context" or any(st in param_type for st in ("HttpServletRequest", "HttpServletResponse", "ServletContext", "UriInfo", "HttpHeaders")):
+                            has_servlet_ctx = True
 
-                            facts.append(
-                                QuarkusRESTFact(
-                                    "rest_endpoint",
-                                    decl.qualified_name,
-                                    f"{http_method} {method_path_val}".strip(),
-                                    json.dumps(meta),
-                                    path,
-                                    decl.start_line,
-                                    decl.end_line,
-                                    flavor=file_flavor,
-                                )
+                    if not has_servlet_ctx and ("@Context" in method_snippet or "HttpServletRequest" in method_snippet):
+                        has_servlet_ctx = True
+
+                    execution_mode = "synchronous"
+                    reactive_type = None
+                    streaming = None
+
+                    if re.search(r'@Blocking\b', method_snippet):
+                        execution_mode = "blocking"
+                    elif re.search(r'@NonBlocking\b', method_snippet):
+                        execution_mode = "non_blocking"
+
+                    m_ret = re.search(r'\b(Uni|Multi|CompletionStage|Publisher|Single|Observable|Flux|Mono)\s*<', method_snippet)
+                    if m_ret:
+                        reactive_type = m_ret.group(1)
+                        if execution_mode == "synchronous":
+                            execution_mode = "reactive"
+
+                    if (produces_val and ("SERVER_SENT_EVENTS" in produces_val or "text/event-stream" in produces_val)) or "SERVER_SENT_EVENTS" in method_snippet or "text/event-stream" in method_snippet or "@RestStreamElementType" in method_snippet or "@SseElementType" in method_snippet:
+                        streaming = "server_sent_events"
+                    elif reactive_type == "Multi" or "Publisher" in method_snippet:
+                        if not streaming:
+                            streaming = "stream"
+
+                    ret_type_match = re.search(r'(?:public|protected|private)\s+(?:<[^>]+>\s+)?([A-Za-z0-9_$.<>]+)\s+' + re.escape(decl.name) + r'\b', method_snippet)
+                    return_type_val = ret_type_match.group(1).strip() if ret_type_match else "void"
+
+                    if http_match:
+                        http_method = http_match.group(1)
+                        meta = {
+                            "http_method": http_method,
+                            "method_path": method_path_val,
+                            "produces": produces_val,
+                            "consumes": consumes_val,
+                            "parameters": params,
+                            "execution_mode": execution_mode,
+                            "reactive_type": reactive_type,
+                            "streaming": streaming,
+                            "build_profile_conditions": prof_conds,
+                            "has_servlet_context": has_servlet_ctx,
+                            "return_type": return_type_val,
+                        }
+                        facts.append(
+                            QuarkusRESTFact(
+                                "rest_endpoint",
+                                decl.qualified_name,
+                                f"{http_method} {method_path_val}".strip(),
+                                json.dumps(meta),
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                flavor=file_flavor,
                             )
+                        )
+                    elif method_path_match:
+                        meta = {
+                            "method_path": method_path_val,
+                            "return_type": return_type_val,
+                            "parameters": params,
+                            "build_profile_conditions": prof_conds,
+                            "has_servlet_context": has_servlet_ctx,
+                        }
+                        facts.append(
+                            QuarkusRESTFact(
+                                "rest_subresource_locator",
+                                decl.qualified_name,
+                                method_path_val,
+                                json.dumps(meta),
+                                path,
+                                decl.start_line,
+                                decl.end_line,
+                                flavor=file_flavor,
+                            )
+                        )
+
     return tuple(facts)
 
 
@@ -4824,6 +4948,7 @@ def _quarkus_rest_relationships(
 
     relationships: list[ImpactRelationship] = []
     unresolved: list[UnresolvedItem] = []
+    seen_rel_keys: set[tuple[str, str, Path, int, int, str]] = set()
 
     http_root_path = ""
     for prop_key, prop_val in config_rows:
@@ -4839,17 +4964,106 @@ def _quarkus_rest_relationships(
         if not app_path.startswith("/"):
             app_path = "/" + app_path
 
-    target_method_name = target.signature.split("(")[0]
+    resource_by_class: dict[str, QuarkusRESTFact] = {}
+    for f in rest_facts:
+        if f.kind == "rest_resource":
+            resource_by_class[f.subject] = f
+
+    impls_by_interface: dict[str, list[QuarkusRESTFact]] = {}
+    for cls_name, r_fact in resource_by_class.items():
+        meta = json.loads(r_fact.value) if r_fact.value else {}
+        for iface in meta.get("implements", []):
+            impls_by_interface.setdefault(iface, []).append(r_fact)
+            simple_iface = iface.rsplit(".", maxsplit=1)[-1]
+            if simple_iface != iface:
+                impls_by_interface.setdefault(simple_iface, []).append(r_fact)
+
+    target_sig_name = target.signature.split("(")[0].strip()
+    target_class_part = None
+    target_method_part = None
+
+    if "#" in target_sig_name:
+        target_class_part, target_method_part = target_sig_name.split("#", 1)
+    elif "#" in owner:
+        target_class_part, target_method_part = owner.split("#", 1)
+    else:
+        target_class_part = owner
+        target_method_part = target_sig_name if target_sig_name != owner else None
+
+    def matches_target(f_subject: str) -> bool:
+        f_class, _, f_method = f_subject.partition("#")
+
+        if target_method_part and f_method:
+            if f_method != target_method_part:
+                return False
+
+        if target_class_part:
+            if f_class == target_class_part:
+                return True
+            owner_r_fact = resource_by_class.get(target_class_part)
+            if owner_r_fact:
+                o_meta = json.loads(owner_r_fact.value) if owner_r_fact.value else {}
+                o_impls = o_meta.get("implements", [])
+                for imp in o_impls:
+                    if imp == f_class or imp.endswith("." + f_class) or f_class.endswith("." + imp):
+                        return True
+            subj_r_fact = resource_by_class.get(f_class)
+            if subj_r_fact:
+                s_meta = json.loads(subj_r_fact.value) if subj_r_fact.value else {}
+                s_impls = s_meta.get("implements", [])
+                for imp in s_impls:
+                    if imp == target_class_part or imp.endswith("." + target_class_part) or target_class_part.endswith("." + imp):
+                        return True
+            return False
+
+        return True
 
     for f in rest_facts:
-        if f.kind == "rest_endpoint" and (f.subject == target_method_name or f.subject.startswith(owner)):
+        if matches_target(f.subject):
+            if f.kind == "rest_provider_filter":
+                unresolved.append(
+                    UnresolvedItem(
+                        f"JAX-RS provider / filter ContainerRequestFilter on {f.subject}",
+                        path=f.path,
+                        start_line=f.start_line,
+                        end_line=f.end_line,
+                        evidence_handle=f"quarkus_rest:{f.path.as_posix()}:{f.start_line}-{f.end_line}",
+                    )
+                )
+
+    endpoint_facts = [f for f in rest_facts if f.kind == "rest_endpoint"]
+    locator_facts = [f for f in rest_facts if f.kind == "rest_subresource_locator"]
+
+    subresource_target_classes: set[str] = set()
+    for loc in locator_facts:
+        loc_meta = json.loads(loc.value) if loc.value else {}
+        loc_ret = loc_meta.get("return_type", "Object").split("<")[0].strip()
+        if loc_ret not in ("Object", "void"):
+            subresource_target_classes.add(loc_ret)
+
+    for f in endpoint_facts:
+        subject_class = f.subject.rsplit("#", maxsplit=1)[0]
+        if matches_target(f.subject) or any(matches_target(f"{impl.subject}#{f.subject.split('#')[-1]}") for impl in impls_by_interface.get(subject_class, [])):
             meta = json.loads(f.value) if f.value else {}
             http_method = meta.get("http_method", "GET")
             method_path = meta.get("method_path", "")
 
-            owner_class = f.subject.rsplit("#", maxsplit=1)[0]
-            class_facts = [cf for cf in rest_facts if cf.kind == "rest_resource" and cf.subject == owner_class]
+            class_facts = [cf for cf in rest_facts if cf.kind == "rest_resource" and cf.subject == subject_class]
             class_path = class_facts[0].target if class_facts and class_facts[0].target else ""
+
+            interface_handles = []
+            if not class_path and class_facts:
+                cf_meta = json.loads(class_facts[0].value) if class_facts[0].value else {}
+                for iface in cf_meta.get("implements", []):
+                    iface_facts = [cf for cf in rest_facts if cf.kind == "rest_resource" and (cf.subject == iface or cf.subject.endswith("." + iface))]
+                    if iface_facts:
+                        if not class_path:
+                            class_path = iface_facts[0].target or ""
+                        interface_handles.append(f"quarkus_rest:{iface_facts[0].path.as_posix()}:{iface_facts[0].start_line}-{iface_facts[0].end_line}")
+
+            # If this class has no class_path and is a subresource target class, skip direct standalone top-level route mapping
+            if not class_path and not interface_handles and (subject_class in subresource_target_classes or subject_class.rsplit(".", maxsplit=1)[-1] in subresource_target_classes):
+                continue
 
             parts = [p for p in (http_root_path, app_path, class_path, method_path) if p]
             full_path = "/" + "/".join(p.strip("/") for p in parts if p.strip("/"))
@@ -4864,6 +5078,16 @@ def _quarkus_rest_relationships(
             chain = [handle]
             if class_facts:
                 chain.append(f"quarkus_rest:{class_facts[0].path.as_posix()}:{class_facts[0].start_line}-{class_facts[0].end_line}")
+            for ih in interface_handles:
+                if ih not in chain:
+                    chain.append(ih)
+
+            prof_conds = meta.get("build_profile_conditions", [])
+            if class_facts:
+                cf_meta = json.loads(class_facts[0].value) if class_facts[0].value else {}
+                for c in cf_meta.get("build_profile_conditions", []):
+                    if c not in prof_conds:
+                        prof_conds.append(c)
 
             business_data = {
                 "flavor": flavor,
@@ -4872,23 +5096,122 @@ def _quarkus_rest_relationships(
                 "produces": meta.get("produces"),
                 "consumes": meta.get("consumes"),
                 "parameters": meta.get("parameters", []),
+                "execution_mode": meta.get("execution_mode", "synchronous"),
             }
+            if meta.get("reactive_type"):
+                business_data["reactive_type"] = meta.get("reactive_type")
+            if meta.get("streaming"):
+                business_data["streaming"] = meta.get("streaming")
+            if prof_conds:
+                business_data["build_profile_conditions"] = prof_conds
 
-            relationships.append(
-                ImpactRelationship(
-                    "quarkus_rest_contract",
-                    route_identity,
-                    f.path,
-                    f.start_line,
-                    f.end_line,
-                    handle,
-                    confidence,
-                    False,
-                    None,
-                    evidence_chain=tuple(chain),
-                    business_view=json.dumps(business_data),
+            rel_key = ("quarkus_rest_contract", route_identity, f.path, f.start_line, f.end_line, handle)
+            if rel_key not in seen_rel_keys:
+                seen_rel_keys.add(rel_key)
+                relationships.append(
+                    ImpactRelationship(
+                        "quarkus_rest_contract",
+                        route_identity,
+                        f.path,
+                        f.start_line,
+                        f.end_line,
+                        handle,
+                        confidence,
+                        False,
+                        None,
+                        evidence_chain=tuple(chain),
+                        business_view=json.dumps(business_data),
+                    )
                 )
-            )
+
+            if meta.get("has_servlet_context"):
+                unresolved.append(
+                    UnresolvedItem(
+                        f"Servlet coupling via HttpServletRequest on endpoint {f.subject}",
+                        path=f.path,
+                        start_line=f.start_line,
+                        end_line=f.end_line,
+                        evidence_handle=handle,
+                    )
+                )
+
+    for loc in locator_facts:
+        loc_class = loc.subject.rsplit("#", maxsplit=1)[0]
+        loc_meta = json.loads(loc.value) if loc.value else {}
+        loc_return_type = loc_meta.get("return_type", "Object")
+
+        loc_class_facts = [cf for cf in rest_facts if cf.kind == "rest_resource" and cf.subject == loc_class]
+        loc_class_path = loc_class_facts[0].target if loc_class_facts and loc_class_facts[0].target else ""
+        sub_loc_path = loc_meta.get("method_path", "")
+
+        loc_handle = f"quarkus_rest:{loc.path.as_posix()}:{loc.start_line}-{loc.end_line}"
+
+        clean_ret_type = loc_return_type.split("<")[0].strip()
+        matching_sub_resources = [
+            rf for rf in rest_facts if rf.kind == "rest_resource" and (rf.subject == clean_ret_type or rf.subject.rsplit(".", maxsplit=1)[-1] == clean_ret_type)
+        ]
+
+        if not matching_sub_resources or clean_ret_type in ("Object", "void") or len(matching_sub_resources) > 1:
+            if matches_target(loc.subject) or any(matches_target(f"{sub.subject}#{e.subject.split('#')[-1]}") for sub in matching_sub_resources for e in endpoint_facts if e.subject.startswith(sub.subject)):
+                unresolved.append(
+                    UnresolvedItem(
+                        f"Ambiguous subresource locator return type: {loc_return_type} on {loc.subject}",
+                        path=loc.path,
+                        start_line=loc.start_line,
+                        end_line=loc.end_line,
+                        evidence_handle=loc_handle,
+                    )
+                )
+        else:
+            sub_res_fact = matching_sub_resources[0]
+            sub_endpoints = [e for e in endpoint_facts if e.subject.startswith(sub_res_fact.subject)]
+
+            for ep in sub_endpoints:
+                if matches_target(loc.subject) or matches_target(ep.subject) or matches_target(sub_res_fact.subject):
+                    ep_meta = json.loads(ep.value) if ep.value else {}
+                    ep_http_method = ep_meta.get("http_method", "GET")
+                    ep_method_path = ep_meta.get("method_path", "")
+
+                    parts = [p for p in (http_root_path, app_path, loc_class_path, sub_loc_path, ep_method_path) if p]
+                    composed_path = "/" + "/".join(p.strip("/") for p in parts if p.strip("/"))
+                    if not composed_path or composed_path == "//":
+                        composed_path = "/"
+
+                    route_identity = f"{ep_http_method} {composed_path}"
+                    flavor = ep.flavor or loc.flavor or "unknown"
+                    confidence = "high" if flavor != "unknown" else "medium"
+
+                    ep_handle = f"quarkus_rest:{ep.path.as_posix()}:{ep.start_line}-{ep.end_line}"
+                    chain = [ep_handle, loc_handle]
+
+                    business_data = {
+                        "flavor": flavor,
+                        "route": route_identity,
+                        "http_method": ep_http_method,
+                        "produces": ep_meta.get("produces"),
+                        "consumes": ep_meta.get("consumes"),
+                        "parameters": ep_meta.get("parameters", []),
+                        "execution_mode": ep_meta.get("execution_mode", "synchronous"),
+                    }
+
+                    rel_key = ("quarkus_rest_contract", route_identity, ep.path, ep.start_line, ep.end_line, ep_handle)
+                    if rel_key not in seen_rel_keys:
+                        seen_rel_keys.add(rel_key)
+                        relationships.append(
+                            ImpactRelationship(
+                                "quarkus_rest_contract",
+                                route_identity,
+                                ep.path,
+                                ep.start_line,
+                                ep.end_line,
+                                ep_handle,
+                                confidence,
+                                False,
+                                None,
+                                evidence_chain=tuple(chain),
+                                business_view=json.dumps(business_data),
+                            )
+                        )
 
     return tuple(relationships), tuple(unresolved)
 

@@ -1,0 +1,3 @@
+# Treat Native Image as an evidence boundary, not build verification
+
+ChangeScope treats the Native Image Boundary as a first-class part of Quarkus Local Analysis because GraalVM native images are a primary deployment form for target applications. It indexes source-controlled reflection, proxy, resource, serialization, service-provider, configuration, and test evidence, but it does not run GraalVM or Mandrel, claim complete closed-world reachability, or treat generated build outputs as authoritative by default. A future opt-in Build Evidence Import must record the producing commit, build and runtime profiles, Quarkus and GraalVM versions, and other build provenance before generated artifacts can strengthen a conclusion.
