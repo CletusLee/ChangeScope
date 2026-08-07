@@ -349,7 +349,7 @@ class ChangeScopeApplication:
 
 
 def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
-    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|quarkus_build|quarkus_config|quarkus_cdi|quarkus_rest):(.+):(\d+)-(\d+)", request.evidence_handle)
+    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|source|quarkus_build|quarkus_config|quarkus_cdi|quarkus_rest|quarkus_route|quarkus_security|quarkus_test|quarkus_native|quarkus_boundary):(.+):(\d+)-(\d+)", request.evidence_handle)
     if match is None:
         raise ValueError("Evidence handles must use kind:path:start-end form.")
     path = _validate_relative_path(Path(match.group(1)))

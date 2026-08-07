@@ -135,6 +135,14 @@ def _index_report(result: IndexResult) -> dict[str, object]:
         "invocation_count": len(result.invocations),
         "spring_configuration_evidence_count": len(result.spring_facts),
         "quarkus_build_evidence_count": len(result.quarkus_build_facts),
+        "quarkus_configuration_evidence_count": len(result.quarkus_config_facts),
+        "quarkus_cdi_evidence_count": len(result.quarkus_cdi_facts),
+        "quarkus_rest_evidence_count": len(result.quarkus_rest_facts),
+        "quarkus_route_evidence_count": len(result.quarkus_route_facts),
+        "quarkus_security_evidence_count": len(result.quarkus_security_facts),
+        "quarkus_test_evidence_count": len(result.quarkus_test_facts),
+        "quarkus_native_evidence_count": len(result.quarkus_native_facts),
+        "quarkus_boundary_evidence_count": len(result.quarkus_boundary_facts),
         "parse_failures": [
             {
                 "path": _report_path(failure.path),
