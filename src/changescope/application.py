@@ -206,6 +206,18 @@ class QuarkusNativeFact:
 
 
 @dataclass(frozen=True)
+class QuarkusBoundaryFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    category: str | None = None
+
+
+@dataclass(frozen=True)
 class IndexResult:
     source_roots: tuple[Path, ...]
     indexed_files: tuple[Path, ...]
@@ -226,6 +238,7 @@ class IndexResult:
     quarkus_security_facts: tuple[QuarkusSecurityFact, ...] = ()
     quarkus_test_facts: tuple[QuarkusTestFact, ...] = ()
     quarkus_native_facts: tuple[QuarkusNativeFact, ...] = ()
+    quarkus_boundary_facts: tuple[QuarkusBoundaryFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -868,6 +881,13 @@ def _direct_relationships(
     )
     relationships.extend(nat_relationships)
     unresolved_items.extend(nat_unresolved)
+    b_relationships, b_unresolved = _quarkus_boundary_relationships(
+        connection_data_path=database_path,
+        owner=owner,
+        target=target,
+    )
+    relationships.extend(b_relationships)
+    unresolved_items.extend(b_unresolved)
     return tuple(relationships), tuple(unresolved_items)
 
 
@@ -2015,6 +2035,9 @@ def _index_repository(repository_root: Path) -> IndexResult:
     quarkus_native_facts = _analyze_quarkus_native_files(
         {**contents_by_path, **configuration_contents}, declarations
     )
+    quarkus_boundary_facts = _analyze_quarkus_boundary_files(
+        {**contents_by_path, **configuration_contents}, declarations
+    )
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -2036,6 +2059,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
         quarkus_security_facts=quarkus_security_facts,
         quarkus_test_facts=quarkus_test_facts,
         quarkus_native_facts=quarkus_native_facts,
+        quarkus_boundary_facts=quarkus_boundary_facts,
     )
     _write_index(result)
     return result
@@ -2137,6 +2161,9 @@ def _refresh_index_if_needed(root: Path) -> None:
                 quarkus_native_facts = _analyze_quarkus_native_files(
                     {**contents_by_path, **configuration_contents}, declarations
                 )
+                quarkus_boundary_facts = _analyze_quarkus_boundary_files(
+                    {**contents_by_path, **configuration_contents}, declarations
+                )
                 _replace_changed_source_records(
                     connection,
                     changed_paths,
@@ -2151,6 +2178,7 @@ def _refresh_index_if_needed(root: Path) -> None:
                     quarkus_security_facts=quarkus_security_facts,
                     quarkus_test_facts=quarkus_test_facts,
                     quarkus_native_facts=quarkus_native_facts,
+                    quarkus_boundary_facts=quarkus_boundary_facts,
                     replace_all_ejb_facts=refresh_all_ejb_facts,
                 )
             _write_metadata(connection, _snapshot(root), source_roots)
@@ -2165,7 +2193,14 @@ def _discover_source_roots(root: Path) -> tuple[Path, ...]:
 
     conventional_roots = tuple(
         candidate
-        for candidate in (Path("src/main/java"), Path("src/test/java"))
+        for candidate in (
+            Path("src/main/java"),
+            Path("src/test/java"),
+            Path("src/main/kotlin"),
+            Path("src/test/kotlin"),
+            Path("src/main/scala"),
+            Path("src/test/scala"),
+        )
         if (root / candidate).is_dir()
     )
     eclipse_roots = _eclipse_source_roots(root)
@@ -2325,7 +2360,8 @@ def _java_files(
                 name for name in directories if name not in EXCLUDED_DIRECTORY_NAMES
             ]
             for filename in filenames:
-                if not filename.endswith(".java"):
+                ext = Path(filename).suffix.lower()
+                if ext not in (".java", ".kt", ".scala"):
                     continue
                 candidate = Path(directory) / filename
                 relative_path = candidate.relative_to(root)
@@ -2350,6 +2386,10 @@ def _analyze_java_files(
     declarations: list[JavaDeclaration] = []
     invocations: list[JavaInvocation] = []
     parse_failures: list[ParseFailure] = []
+
+    for relative_path, content in contents_by_path.items():
+        if not relative_path.name.endswith(".java"):
+            continue
     for path, source in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
         is_test = any(path.is_relative_to(root) for root in test_roots)
         # Keep native grammar and parser state scoped to one source file. This avoids
@@ -4196,6 +4236,7 @@ def _replace_index_contents(
     connection.execute("DELETE FROM quarkus_security_facts")
     connection.execute("DELETE FROM quarkus_test_facts")
     connection.execute("DELETE FROM quarkus_native_facts")
+    connection.execute("DELETE FROM quarkus_boundary_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
     indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
     connection.executemany(
@@ -4220,6 +4261,7 @@ def _replace_index_contents(
     _insert_quarkus_security_facts(connection, result.quarkus_security_facts)
     _insert_quarkus_test_facts(connection, result.quarkus_test_facts)
     _insert_quarkus_native_facts(connection, result.quarkus_native_facts)
+    _insert_quarkus_boundary_facts(connection, result.quarkus_boundary_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
@@ -4403,6 +4445,18 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         scope TEXT
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS quarkus_boundary_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        category TEXT
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -4478,6 +4532,7 @@ def _replace_changed_source_records(
     quarkus_security_facts: tuple[QuarkusSecurityFact, ...] = (),
     quarkus_test_facts: tuple[QuarkusTestFact, ...] = (),
     quarkus_native_facts: tuple[QuarkusNativeFact, ...] = (),
+    quarkus_boundary_facts: tuple[QuarkusBoundaryFact, ...] = (),
     replace_all_ejb_facts: bool = False,
 ) -> None:
     if replace_all_ejb_facts:
@@ -4490,13 +4545,15 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_security_facts")
         connection.execute("DELETE FROM quarkus_test_facts")
         connection.execute("DELETE FROM quarkus_native_facts")
+        connection.execute("DELETE FROM quarkus_boundary_facts")
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_invocations WHERE path = ?", (path,))
         connection.execute("DELETE FROM parse_failures WHERE path = ?", (path,))
         connection.execute("DELETE FROM spring_facts WHERE path = ?", (path,))
-        connection.execute("DELETE FROM ejb_facts WHERE path = ?", (path,))
+        if not replace_all_ejb_facts:
+            connection.execute("DELETE FROM ejb_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_build_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_config_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_cdi_facts WHERE path = ?", (path,))
@@ -4505,6 +4562,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_security_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_test_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_native_facts WHERE path = ?", (path,))
+        connection.execute("DELETE FROM quarkus_boundary_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
@@ -4520,6 +4578,7 @@ def _replace_changed_source_records(
     _insert_quarkus_security_facts(connection, quarkus_security_facts)
     _insert_quarkus_test_facts(connection, quarkus_test_facts)
     _insert_quarkus_native_facts(connection, quarkus_native_facts)
+    _insert_quarkus_boundary_facts(connection, quarkus_boundary_facts)
 
 
 def _insert_java_facts(
@@ -4795,6 +4854,377 @@ def _insert_quarkus_test_facts(
 def _insert_quarkus_native_facts(
     connection: sqlite3.Connection, facts: Iterable[QuarkusNativeFact]
 ) -> None:
+    connection.executemany(
+        """INSERT INTO quarkus_native_facts(
+        kind, subject, target, value, path, start_line, end_line, scope
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.scope,
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _insert_quarkus_boundary_facts(
+    connection: sqlite3.Connection, facts: Iterable[QuarkusBoundaryFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO quarkus_boundary_facts(
+        kind, subject, target, value, path, start_line, end_line, category
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                str(fact.path),
+                fact.start_line,
+                fact.end_line,
+                fact.category,
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _analyze_quarkus_boundary_files(
+    contents_by_path: dict[Path, bytes],
+    declarations: tuple[JavaDeclaration, ...],
+) -> tuple[QuarkusBoundaryFact, ...]:
+    facts: list[QuarkusBoundaryFact] = []
+
+    for path in contents_by_path.keys():
+        if any(part in ("target", "build", ".quarkus", "node_modules") for part in path.parts):
+            continue
+        ext = path.suffix.lower()
+        if ext in (".kt", ".scala"):
+            facts.append(
+                QuarkusBoundaryFact(
+                    "kotlin_scala_gap",
+                    path.name,
+                    None,
+                    f"Kotlin (.kt) or Scala (.scala) source file '{path.as_posix()}' present in repository cannot be statically parsed; analysis is restricted to Java source files and Gradle Kotlin DSL.",
+                    path,
+                    1,
+                    1,
+                    category="coverage_gap",
+                )
+            )
+
+    for path, content in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        if any(part in ("target", "build", ".quarkus") for part in path.parts):
+            continue
+
+        if path.suffix.lower() != ".java":
+            continue
+
+        text = content.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+
+        for decl in declarations:
+            if decl.path != path:
+                continue
+
+            if decl.kind in ("class", "interface"):
+                decl_snippet = _get_class_snippet(lines, decl)
+                full_class_text = "\n".join(lines[max(0, decl.start_line - 1) : decl.end_line])
+
+                if "@QuarkusMain" in decl_snippet or "QuarkusApplication" in decl_snippet:
+                    facts.append(
+                        QuarkusBoundaryFact(
+                            "quarkus_main",
+                            decl.qualified_name,
+                            None,
+                            json.dumps({"class": decl.qualified_name}),
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            category="entry_point",
+                        )
+                    )
+
+                if "PanacheRepository" in decl_snippet or "PanacheEntity" in decl_snippet or "@Entity" in decl_snippet:
+                    facts.append(
+                        QuarkusBoundaryFact(
+                            "panache_repository",
+                            decl.qualified_name,
+                            None,
+                            json.dumps({"class": decl.qualified_name}),
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            category="persistence",
+                        )
+                    )
+                    facts.append(
+                        QuarkusBoundaryFact(
+                            "persistence_unresolved",
+                            decl.qualified_name,
+                            None,
+                            f"Generated Panache CRUD methods (persist, delete, find, listAll), query interpretation, and database dispatch for '{decl.name}' cannot be statically resolved to database schema.",
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            category="persistence",
+                        )
+                    )
+
+            elif decl.kind == "method":
+                method_snippet = _get_method_snippet(lines, decl)
+
+                if decl.name == "main" and "String" in method_snippet:
+                    facts.append(
+                        QuarkusBoundaryFact(
+                            "quarkus_main",
+                            decl.qualified_name,
+                            None,
+                            json.dumps({"method": decl.qualified_name}),
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            category="entry_point",
+                        )
+                    )
+
+                if "@Startup" in method_snippet or ("@Observes" in method_snippet and ("StartupEvent" in method_snippet or "ShutdownEvent" in method_snippet)):
+                    facts.append(
+                        QuarkusBoundaryFact(
+                            "startup_event",
+                            decl.qualified_name,
+                            None,
+                            json.dumps({"method": decl.qualified_name}),
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            category="lifecycle",
+                        )
+                    )
+
+                if any(ann in method_snippet for ann in ("@Incoming", "@Outgoing", "@Channel")):
+                    facts.append(
+                        QuarkusBoundaryFact(
+                            "messaging",
+                            decl.qualified_name,
+                            None,
+                            f"Quarkus Reactive Messaging boundary (@Incoming/@Outgoing/@Channel) on '{decl.name}' cannot be statically linked to message broker topic.",
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            category="messaging",
+                        )
+                    )
+
+                if "@Scheduled" in method_snippet:
+                    facts.append(
+                        QuarkusBoundaryFact(
+                            "scheduler",
+                            decl.qualified_name,
+                            None,
+                            f"Quarkus Scheduler boundary (@Scheduled) on '{decl.name}' execution flow cannot be statically linked to runtime timer trigger.",
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            category="scheduler",
+                        )
+                    )
+
+                if any(ann in method_snippet for ann in ("@GraphQLApi", "@Query", "@Mutation")):
+                    facts.append(
+                        QuarkusBoundaryFact(
+                            "graphql",
+                            decl.qualified_name,
+                            None,
+                            f"Quarkus GraphQL boundary (@GraphQLApi/@Query/@Mutation) on '{decl.name}' cannot be statically mapped to client GraphQL query.",
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            category="graphql",
+                        )
+                    )
+
+                if "@GrpcService" in method_snippet or "BindableService" in method_snippet:
+                    facts.append(
+                        QuarkusBoundaryFact(
+                            "grpc",
+                            decl.qualified_name,
+                            None,
+                            f"Quarkus gRPC boundary (@GrpcService) on '{decl.name}' cannot be statically mapped to gRPC client stub.",
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            category="grpc",
+                        )
+                    )
+
+                if "@WebServlet" in method_snippet:
+                    facts.append(
+                        QuarkusBoundaryFact(
+                            "servlet",
+                            decl.qualified_name,
+                            None,
+                            f"Quarkus Servlet boundary (@WebServlet) on '{decl.name}' cannot be statically mapped to HTTP container routes.",
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            category="servlet",
+                        )
+                    )
+
+                if "@Observes" in method_snippet and "StartupEvent" not in method_snippet and "ShutdownEvent" not in method_snippet:
+                    facts.append(
+                        QuarkusBoundaryFact(
+                            "cdi_event",
+                            decl.qualified_name,
+                            None,
+                            f"Dynamic CDI event dispatch (@Observes) on '{decl.name}' cannot be statically bound to event producers.",
+                            path,
+                            decl.start_line,
+                            decl.end_line,
+                            category="cdi_event",
+                        )
+                    )
+
+    return tuple(facts)
+
+
+def _quarkus_boundary_relationships(
+    connection_data_path: Path,
+    owner: str,
+    target: ImpactTarget,
+) -> tuple[tuple[ImpactRelationship, ...], tuple[UnresolvedItem, ...]]:
+    connection = sqlite3.connect(connection_data_path)
+    try:
+        b_rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, category
+            FROM quarkus_boundary_facts ORDER BY path, start_line"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return (), ()
+    finally:
+        connection.close()
+
+    relationships: list[ImpactRelationship] = []
+    unresolved: list[UnresolvedItem] = []
+    seen_keys: set[tuple[str, str, Path, int, int]] = set()
+
+    target_sig = target.signature
+    target_class = target_sig.rsplit("#", 1)[0]
+    target_method = target_sig.split("#")[-1].split("(")[0] if "#" in target_sig else None
+    clean_target_class = target_class.rsplit(".", 1)[-1]
+
+    def matches_target(f_subject: str) -> bool:
+        if f_subject == target_sig or f_subject == owner:
+            return True
+        f_c, _, f_m = f_subject.partition("#")
+        clean_fm = f_m.split("(")[0] if f_m else ""
+        clean_fc = f_c.rsplit(".", 1)[-1]
+        if f_c == target_class or clean_fc == clean_target_class:
+            if not target_method or not clean_fm or clean_fm == target_method:
+                return True
+        return False
+
+    b_facts = [
+        QuarkusBoundaryFact(kind, subject, fact_target, value, Path(path), start_line, end_line, category)
+        for kind, subject, fact_target, value, path, start_line, end_line, category in b_rows
+    ]
+
+    for bf in b_facts:
+        if bf.kind == "kotlin_scala_gap":
+            unresolved.append(
+                UnresolvedItem(
+                    bf.value or "Kotlin/Scala source file present in repository.",
+                    path=bf.path,
+                    start_line=bf.start_line,
+                    end_line=bf.end_line,
+                    evidence_handle=f"quarkus_boundary:{bf.path.as_posix()}:{bf.start_line}-{bf.end_line}",
+                )
+            )
+
+    for bf in b_facts:
+        if matches_target(bf.subject):
+            handle = f"quarkus_boundary:{bf.path.as_posix()}:{bf.start_line}-{bf.end_line}"
+            if bf.kind == "quarkus_main":
+                rel_key = ("quarkus_main_entry", bf.subject, bf.path, bf.start_line, bf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_main_entry",
+                            f"Quarkus Main Entry ({bf.subject}) -> {target_sig}",
+                            bf.path,
+                            bf.start_line,
+                            bf.end_line,
+                            handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=(handle,),
+                            business_view=bf.value,
+                        )
+                    )
+
+            elif bf.kind == "startup_event":
+                rel_key = ("quarkus_lifecycle", bf.subject, bf.path, bf.start_line, bf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_lifecycle",
+                            f"Quarkus Lifecycle ({bf.subject}) -> {target_sig}",
+                            bf.path,
+                            bf.start_line,
+                            bf.end_line,
+                            handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=(handle,),
+                            business_view=bf.value,
+                        )
+                    )
+
+            elif bf.kind == "panache_repository":
+                rel_key = ("quarkus_persistence", bf.subject, bf.path, bf.start_line, bf.end_line)
+                if rel_key not in seen_keys:
+                    seen_keys.add(rel_key)
+                    relationships.append(
+                        ImpactRelationship(
+                            "quarkus_persistence",
+                            f"Panache Persistence ({bf.subject}) -> {target_sig}",
+                            bf.path,
+                            bf.start_line,
+                            bf.end_line,
+                            handle,
+                            "high",
+                            False,
+                            None,
+                            evidence_chain=(handle,),
+                            business_view=bf.value,
+                        )
+                    )
+
+            elif bf.kind in ("persistence_unresolved", "messaging", "scheduler", "graphql", "grpc", "servlet", "cdi_event"):
+                unresolved.append(
+                    UnresolvedItem(
+                        bf.value or f"Unsupported Quarkus boundary '{bf.kind}' on {bf.subject}",
+                        path=bf.path,
+                        start_line=bf.start_line,
+                        end_line=bf.end_line,
+                        evidence_handle=handle,
+                    )
+                )
+
+    return tuple(relationships), tuple(unresolved)
     connection.executemany(
         """INSERT INTO quarkus_native_facts(
         kind, subject, target, value, path, start_line, end_line, scope
