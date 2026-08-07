@@ -1,6 +1,6 @@
 # ChangeScope
 
-Local-first, evidence-backed impact analysis for Java, Spring Boot, and WildFly repositories.
+Local-first, evidence-backed impact analysis for Java, Spring Boot, WildFly, and Quarkus repositories.
 
 ## The problem
 
@@ -21,18 +21,15 @@ ChangeScope is not a generic code-search, code-memory, or full semantic call-gra
 
 ## Current status
 
-The current release is a JRE-free Java, Spring/Spring Boot, and annotation- and descriptor-backed WildFly EJB local-analysis slice. It is intended to answer `Class#method` impact questions inside one repository. The application service is exposed through a small CLI today; an MCP adapter is not implemented yet.
+The current release is a JRE-free Java, Spring/Spring Boot, annotation- and descriptor-backed WildFly EJB, and Quarkus local-analysis capability. It is intended to answer `Class#method` impact questions inside one repository. The application service is exposed through a small CLI today; an MCP adapter is not implemented yet.
 
 The implementation has been smoke-tested against four public Spring Boot applications: [Spring Petclinic](https://github.com/spring-projects/spring-petclinic), [Spring Petclinic REST](https://github.com/spring-petclinic/spring-petclinic-rest), [Spring Petclinic Modulith](https://github.com/spring-petclinic/spring-petclinic-modulith), and the [RealWorld Spring Boot application](https://github.com/gothinkster/spring-boot-realworld-example-app). In the current validation run, all four completed indexing with zero Java parse failures and zero file-read failures; representative MVC, REST, profile-aware, event-driven, MyBatis, Security, GraphQL, and Spring-test impact queries resolved successfully.
 
-This validates the local indexing and reporting workflow. It does not claim that the reports are complete runtime dependency graphs.
+The WildFly EJB path has also been smoke-tested against five public quickstarts: [`ejb-remote`](https://github.com/wildfly/quickstart/tree/main/ejb-remote), [`ejb-throws-exception`](https://github.com/wildfly/quickstart/tree/main/ejb-throws-exception), [`ejb-security-context-propagation`](https://github.com/wildfly/quickstart/tree/main/ejb-security-context-propagation), [`helloworld-mdb`](https://github.com/wildfly/quickstart/tree/main/helloworld-mdb), and [`ejb-timer`](https://github.com/wildfly/quickstart/tree/main/ejb-timer).
 
-The WildFly EJB path has also been smoke-tested against five public quickstarts. [`ejb-remote`](https://github.com/wildfly/quickstart/tree/main/ejb-remote) exercises remote stateless and stateful business views, including bean-side `@Remote` declarations and a remote JNDI client. [`ejb-throws-exception`](https://github.com/wildfly/quickstart/tree/main/ejb-throws-exception) exercises a local business view, field `@EJB` injection, and a multi-module EAR. [`ejb-security-context-propagation`](https://github.com/wildfly/quickstart/tree/main/ejb-security-context-propagation) exercises EJB-to-EJB remote injection and WildFly client configuration. [`helloworld-mdb`](https://github.com/wildfly/quickstart/tree/main/helloworld-mdb) and [`ejb-timer`](https://github.com/wildfly/quickstart/tree/main/ejb-timer) exercise unsupported MessageDriven and timer/no-interface boundaries; those reports retain explicit unresolved items rather than guessing container behavior. All five repositories indexed with zero Java parse failures and zero file-read failures.
+The Quarkus path has been validated against four representative official [Quarkus quickstarts](https://github.com/quarkusio/quarkus-quickstarts): [`getting-started`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/getting-started) (REST, CDI, and `@QuarkusTest` integration), [`rest-client-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/rest-client-quickstart) (MicroProfile REST Client contracts and DTOs), [`hibernate-orm-panache-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/hibernate-orm-panache-quickstart) (Panache persistence boundaries and repository CRUD), and [`security-jpa-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/security-jpa-quickstart) (Security `@RolesAllowed` policies and test endpoints). All repositories indexed with zero parse failures and produced evidence-backed impact reports with conservative disclaimers for unverified runtime behavior.
 
 This matrix covers the current annotation-oriented WildFly path and its explicit unsupported boundaries. It does not claim that every EJB deployment style has been observed in a public application. Descriptor-backed `ejb-jar.xml`/`jboss-ejb3.xml` projects, setter injection, EJB-aware test injection, and legacy `javax.ejb` applications remain fixture-covered until a representative Java EE/JBoss EAP project is added. Runtime deployment success, arbitrary JNDI resolution, and cross-repository traversal remain outside the local structural analysis claim.
-
-## What it can do today
-
 ### Repository indexing
 
 `changescope index` analyzes the current working directory as one repository root. It can:
@@ -100,12 +97,26 @@ The current WildFly slice can recognize and connect evidence for:
 
 Descriptor conflicts, incomplete links, and naming-based selection remain explicit unresolved items. Inherited EJB Business Interfaces and injection-backed dispatch are supported with conservative structural matching; implicit no-interface views, Session Bean class inheritance, message-driven beans, CDI, arbitrary JNDI lookup or naming selection, and other container mechanisms remain unresolved or out of scope for the current slice.
 
+### Local Quarkus evidence and Native Image boundaries
+
+The current Quarkus slice can recognize and connect evidence for:
+
+- Maven/Gradle Quarkus dependencies and profile properties via `--build-profile` and `--runtime-profile`;
+- CDI-managed beans (`@ApplicationScoped`, `@RequestScoped`, `@Singleton`), qualifiers, and `@Inject` field, constructor, or method Injection Points;
+- Quarkus REST / RESTEasy endpoints (`@Path`, `@GET`, `@POST`, `@Consumes`, `@Produces`, `Uni`/`Multi` reactive types);
+- Reactive Routes declared via `@Route`;
+- MicroProfile / Quarkus REST Client contracts (`@RegisterRestClient`);
+- Security authorization and authentication policies (`@RolesAllowed`, `@Authenticated`);
+- `@QuarkusTest`, `@QuarkusIntegrationTest`, `@InjectMock`, and `@TestHTTPEndpoint` test wiring;
+- GraalVM Native Image evidence (`@RegisterForReflection`, `@RegisterForProxy`, `META-INF/services/` SPIs, `reflection-config.json`); and
+- Panache persistence boundaries (`PanacheRepository`, `PanacheEntity`) with conservative disclaimers for generated CRUD methods and database queries.
+
 ### Profiles, reports, and evidence navigation
 
 The impact command accepts repeatable profile selection:
 
 ```text
---profile h2 --profile spring-data-jpa
+--profile h2 --build-profile dev --runtime-profile prod
 ```
 
 Selected profiles are treated as active. Base configuration is combined with matching profile-specific configuration. Without an explicit profile, profile-specific findings remain conditional instead of being assumed active.
@@ -206,18 +217,18 @@ Run these commands from the root of the repository you want to analyze:
 changescope index
 
 # Ask for a human-readable impact report.
-changescope impact OwnerController#processFindForm
+changescope impact GreetingResource#hello
 
-# Select one or more Spring profiles and return JSON.
-changescope impact OwnerController#processFindForm \
-  --profile h2 --profile spring-data-jpa --format json
+# Select Spring, Quarkus build, and runtime profiles and return JSON.
+changescope impact GreetingResource#hello \
+  --build-profile dev --runtime-profile prod --format json
 
 # Retrieve evidence returned by an impact report.
-changescope evidence "declaration:src/main/java/example/OrderService.java:3-8" \
+changescope evidence "quarkus_rest:src/main/java/example/GreetingResource.java:22-26" \
   --enclosing-symbol --format json
 
 # Retrieve an explicit bounded source range.
-changescope source src/main/java/example/OrderService.java 3 8 --format json
+changescope source src/main/java/example/GreetingResource.java 3 8 --format json
 ```
 
 The CLI also works as a module:
@@ -236,7 +247,7 @@ Run the repository test suite with:
 python -m unittest discover -s tests -v
 ```
 
-The current test suite covers repository discovery, Java structural facts, direct callers and callees, ambiguity, incremental refresh, Spring configuration, profiles, properties, YAML, XML, bounded evidence navigation, WildFly EJB contracts, injection-backed dispatch, descriptor-backed contracts, EJB-aware tests, unsupported container behavior, and CLI text/JSON consistency. The latest validation run completed 103 tests successfully. The public-project smoke tests above validate repository indexing and representative report paths; they do not replace the isolated fixture matrix for descriptor conflicts, ambiguous candidates, inheritance cycles, or other conservative unresolved cases.
+The current test suite covers repository discovery, Java structural facts, direct callers and callees, ambiguity, incremental refresh, Spring configuration, profiles, properties, YAML, XML, bounded evidence navigation, WildFly EJB contracts, injection-backed dispatch, descriptor-backed contracts, EJB-aware tests, Quarkus CDI, REST, Reactive Routes, REST Client, Security, tests, Native Image evidence, persistence boundaries, unsupported container behavior, and CLI text/JSON consistency. The latest validation run completed 184 tests successfully. The public-project smoke tests above validate repository indexing and representative report paths; they do not replace the isolated fixture matrix for descriptor conflicts, ambiguous candidates, inheritance cycles, or other conservative unresolved cases.
 
 ## Design principles
 
@@ -249,4 +260,4 @@ The current test suite covers repository discovery, Java structural facts, direc
 
 ## Direction of future work
 
-Future stages may add richer container naming resolution, requirement/diff/API targets, deeper Java resolution, verified HTTP/REST cross-repository analysis, Workspace Catalog support, Quarkus, and additional framework or language adapters. Those capabilities are not part of the current release and should not be inferred from the current reports.
+Future stages may add richer container naming resolution, requirement/diff/API targets, deeper Java resolution, verified HTTP/REST cross-repository analysis, Workspace Catalog support, and additional framework or language adapters. Those capabilities are not part of the current release and should not be inferred from the current reports.
