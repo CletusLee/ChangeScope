@@ -351,16 +351,85 @@ class ImpactResult:
     snapshot: IndexSnapshot | None
 
 
+@dataclass(frozen=True)
+class CatalogRepository:
+    repository_id: str
+    repository_path: Path
+    git_commit: str | None
+    working_tree_state: str
+
+
+@dataclass(frozen=True)
+class CatalogMapping:
+    source_repository_id: str
+    contract_kind: str
+    contract_key: str
+    target_repository_id: str
+    target_contract_key: str
+    provenance: str = ""
+
+
+@dataclass(frozen=True)
+class CatalogRegisterRepositoryRequest:
+    catalog_root: Path
+    repository_id: str
+    repository_path: Path
+
+
+@dataclass(frozen=True)
+class CatalogRegisterMappingRequest:
+    catalog_root: Path
+    source_repository_id: str
+    contract_kind: str
+    contract_key: str
+    target_repository_id: str
+    target_contract_key: str
+    provenance: str = ""
+
+
+@dataclass(frozen=True)
+class CatalogResolveMappingRequest:
+    catalog_root: Path
+    source_repository_id: str
+    contract_kind: str
+    contract_key: str
+
+
+@dataclass(frozen=True)
+class CatalogResult:
+    outcome: str
+    repository: CatalogRepository | None = None
+    mapping: CatalogMapping | None = None
+    candidates: tuple[CatalogMapping, ...] = ()
+    unresolved_items: tuple[UnresolvedItem, ...] = ()
+    snapshot: IndexSnapshot | None = None
+
+
 class ChangeScopeApplication:
     """The application-service seam shared by CLI, tests, and future adapters."""
 
-    def execute(self, request: IndexRequest | ImpactRequest | EvidenceRequest | SourceRequest) -> IndexResult | ImpactResult | SourceNavigation:
+    def execute(
+        self,
+        request: IndexRequest
+        | ImpactRequest
+        | EvidenceRequest
+        | SourceRequest
+        | CatalogRegisterRepositoryRequest
+        | CatalogRegisterMappingRequest
+        | CatalogResolveMappingRequest,
+    ) -> IndexResult | ImpactResult | SourceNavigation | CatalogResult:
         if isinstance(request, IndexRequest):
             return _index_repository(request.repository_root)
         if isinstance(request, EvidenceRequest):
             return _evidence_context(request)
         if isinstance(request, SourceRequest):
             return _source_range(request)
+        if isinstance(request, CatalogRegisterRepositoryRequest):
+            return _catalog_register_repository(request)
+        if isinstance(request, CatalogRegisterMappingRequest):
+            return _catalog_register_mapping(request)
+        if isinstance(request, CatalogResolveMappingRequest):
+            return _catalog_resolve_mapping(request)
         return _impact_repository(request)
 
 
@@ -9358,3 +9427,213 @@ def _quarkus_build_impact_evidence(
         )
 
     return assumptions, unresolved
+
+
+def _catalog_db_path(catalog_root: Path) -> Path:
+    catalog_dir = catalog_root.resolve() / ".changescope"
+    catalog_dir.mkdir(parents=True, exist_ok=True)
+    return catalog_dir / "catalog.sqlite"
+
+
+def _ensure_catalog_tables(connection: sqlite3.Connection) -> bool:
+    repo_table_missing = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'catalog_repositories'"
+    ).fetchone() is None
+    mapping_table_missing = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'catalog_mappings'"
+    ).fetchone() is None
+
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS catalog_repositories (
+        repository_id TEXT PRIMARY KEY,
+        repository_path TEXT NOT NULL,
+        git_commit TEXT,
+        working_tree_state TEXT NOT NULL
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS catalog_mappings (
+        source_repository_id TEXT NOT NULL,
+        contract_kind TEXT NOT NULL,
+        contract_key TEXT NOT NULL,
+        target_repository_id TEXT NOT NULL,
+        target_contract_key TEXT NOT NULL,
+        provenance TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    return repo_table_missing or mapping_table_missing
+
+
+def _catalog_register_repository(request: CatalogRegisterRepositoryRequest) -> CatalogResult:
+    repo_path = request.repository_path.resolve()
+    db_path = repo_path / ".changescope" / "index.sqlite"
+    snapshot: IndexSnapshot | None = None
+    if db_path.is_file():
+        conn = sqlite3.connect(db_path)
+        try:
+            snapshot = _read_index_snapshot(conn, repo_path)
+        finally:
+            conn.close()
+    else:
+        snapshot = _snapshot(repo_path)
+
+    git_commit = snapshot.git_commit if snapshot else None
+    working_tree_state = snapshot.working_tree_state if snapshot else "clean"
+
+    catalog_db = _catalog_db_path(request.catalog_root)
+    conn = sqlite3.connect(catalog_db)
+    try:
+        _ensure_catalog_tables(conn)
+        conn.execute(
+            """INSERT OR REPLACE INTO catalog_repositories(
+            repository_id, repository_path, git_commit, working_tree_state
+            ) VALUES (?, ?, ?, ?)""",
+            (request.repository_id, repo_path.as_posix(), git_commit, working_tree_state),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    cat_repo = CatalogRepository(
+        repository_id=request.repository_id,
+        repository_path=repo_path,
+        git_commit=git_commit,
+        working_tree_state=working_tree_state,
+    )
+    return CatalogResult("registered", repository=cat_repo, snapshot=snapshot)
+
+
+def _catalog_register_mapping(request: CatalogRegisterMappingRequest) -> CatalogResult:
+    catalog_db = _catalog_db_path(request.catalog_root)
+    conn = sqlite3.connect(catalog_db)
+    try:
+        _ensure_catalog_tables(conn)
+        conn.execute(
+            """INSERT INTO catalog_mappings(
+            source_repository_id, contract_kind, contract_key, target_repository_id, target_contract_key, provenance
+            ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                request.source_repository_id,
+                request.contract_kind,
+                request.contract_key,
+                request.target_repository_id,
+                request.target_contract_key,
+                request.provenance,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    mapping = CatalogMapping(
+        source_repository_id=request.source_repository_id,
+        contract_kind=request.contract_kind,
+        contract_key=request.contract_key,
+        target_repository_id=request.target_repository_id,
+        target_contract_key=request.target_contract_key,
+        provenance=request.provenance,
+    )
+    return CatalogResult("registered", mapping=mapping)
+
+
+def _catalog_resolve_mapping(request: CatalogResolveMappingRequest) -> CatalogResult:
+    catalog_db = request.catalog_root.resolve() / ".changescope" / "catalog.sqlite"
+    if not catalog_db.is_file():
+        return CatalogResult(
+            "missing",
+            unresolved_items=(
+                _unresolved("No Workspace Catalog exists. Register repositories and mappings first."),
+            ),
+        )
+
+    conn = sqlite3.connect(catalog_db)
+    try:
+        _ensure_catalog_tables(conn)
+
+        source_repo_row = conn.execute(
+            "SELECT repository_id, repository_path, git_commit, working_tree_state FROM catalog_repositories WHERE repository_id = ?",
+            (request.source_repository_id,),
+        ).fetchone()
+
+        if source_repo_row is None:
+            return CatalogResult(
+                "missing",
+                unresolved_items=(
+                    _unresolved(f"Source repository '{request.source_repository_id}' is not registered in the Workspace Catalog."),
+                ),
+            )
+
+        rows = conn.execute(
+            """SELECT source_repository_id, contract_kind, contract_key, target_repository_id, target_contract_key, provenance
+            FROM catalog_mappings
+            WHERE source_repository_id = ? AND contract_kind = ? AND contract_key = ?""",
+            (request.source_repository_id, request.contract_kind, request.contract_key),
+        ).fetchall()
+
+        if not rows:
+            return CatalogResult(
+                "missing",
+                unresolved_items=(
+                    _unresolved(f"No explicit contract mapping registered for contract key '{request.contract_key}' (kind: {request.contract_kind}) in source repository '{request.source_repository_id}'."),
+                ),
+            )
+
+        mappings = tuple(
+            CatalogMapping(r[0], r[1], r[2], r[3], r[4], r[5])
+            for r in rows
+        )
+
+        if len(mappings) > 1:
+            return CatalogResult("ambiguous", candidates=mappings)
+
+        resolved_mapping = mappings[0]
+
+        target_repo_row = conn.execute(
+            "SELECT repository_id, repository_path, git_commit, working_tree_state FROM catalog_repositories WHERE repository_id = ?",
+            (resolved_mapping.target_repository_id,),
+        ).fetchone()
+
+        if target_repo_row is None:
+            return CatalogResult(
+                "missing",
+                mapping=resolved_mapping,
+                unresolved_items=(
+                    _unresolved(f"Target repository '{resolved_mapping.target_repository_id}' is not registered in the Workspace Catalog."),
+                ),
+            )
+
+        target_repo_path = Path(target_repo_row[1])
+        registered_target_commit = target_repo_row[2]
+
+        target_index_db = target_repo_path / ".changescope" / "index.sqlite"
+        if not target_index_db.is_file():
+            return CatalogResult(
+                "missing",
+                mapping=resolved_mapping,
+                unresolved_items=(
+                    _unresolved(f"Target repository '{resolved_mapping.target_repository_id}' local Repository Index is missing at '{target_repo_path}'."),
+                ),
+            )
+
+        target_conn = sqlite3.connect(target_index_db)
+        try:
+            current_target_snapshot = _read_index_snapshot(target_conn, target_repo_path)
+        finally:
+            target_conn.close()
+
+        if current_target_snapshot.git_commit != registered_target_commit:
+            return CatalogResult(
+                "stale",
+                mapping=resolved_mapping,
+                unresolved_items=(
+                    _unresolved(
+                        f"Target repository '{resolved_mapping.target_repository_id}' index snapshot is stale "
+                        f"(registered commit: {registered_target_commit or 'none'}, current commit: {current_target_snapshot.git_commit or 'none'})."
+                    ),
+                ),
+                snapshot=current_target_snapshot,
+            )
+
+        return CatalogResult("resolved", mapping=resolved_mapping, snapshot=current_target_snapshot)
+    finally:
+        conn.close()
