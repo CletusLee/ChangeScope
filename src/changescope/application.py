@@ -5191,7 +5191,11 @@ def _extract_java_soap_facts(
 
                 ws_anno = _find_soap_annotation(modifiers, source, imports, "WebService")
                 wsp_anno = _find_soap_annotation(modifiers, source, imports, "WebServiceProvider")
+                wsc_anno = _find_soap_annotation(modifiers, source, imports, "WebServiceClient")
                 wf_anno = _find_soap_annotation(modifiers, source, imports, "WebFault")
+                hc_anno = _find_soap_annotation(modifiers, source, imports, "HandlerChain")
+                xt_anno = _find_soap_annotation(modifiers, source, imports, "XmlType")
+                xr_anno = _find_soap_annotation(modifiers, source, imports, "XmlRootElement")
 
                 start_line = node.start_point[0] + 1
                 end_line = node.end_point[0] + 1
@@ -5219,10 +5223,26 @@ def _extract_java_soap_facts(
                     val_str = f"{svc_name}|{port_name}|{wsdl_loc}"
                     facts.append(SOAPFact("java_provider", qualified_name, None, val_str, rel_path, start_line, end_line, target_ns))
 
+                if wsc_anno is not None:
+                    wsc_name = wsc_anno.get("name") or type_name
+                    target_ns = wsc_anno.get("targetNamespace") or ""
+                    wsdl_loc = wsc_anno.get("wsdlLocation") or ""
+                    val_str = f"{wsc_name}|{target_ns}"
+                    facts.append(SOAPFact("java_client", qualified_name, wsdl_loc, val_str, rel_path, start_line, end_line, target_ns))
+
                 if wf_anno is not None:
                     wf_name = wf_anno.get("name") or type_name
                     target_ns = wf_anno.get("targetNamespace") or ""
                     facts.append(SOAPFact("java_fault", qualified_name, wf_name, target_ns, rel_path, start_line, end_line, target_ns))
+
+                if hc_anno is not None:
+                    hc_file = hc_anno.get("file") or hc_anno.get("value") or ""
+                    facts.append(SOAPFact("soap_handler", qualified_name, hc_file, "handler_chain_xml", rel_path, start_line, end_line))
+
+                if xt_anno is not None or xr_anno is not None:
+                    bind_name = (xr_anno.get("name") if xr_anno else None) or (xt_anno.get("name") if xt_anno else None) or type_name
+                    bind_ns = (xr_anno.get("namespace") if xr_anno else None) or (xt_anno.get("namespace") if xt_anno else None) or ""
+                    facts.append(SOAPFact("java_xml_binding", qualified_name, bind_name, bind_ns, rel_path, start_line, end_line, bind_ns))
 
                 body_node = node.child_by_field_name("body")
                 if body_node:
@@ -5233,6 +5253,7 @@ def _extract_java_soap_facts(
                                 m_name = _node_text(m_name_node, source)
                                 m_modifiers = next((c for c in child.children if c.type == "modifiers"), None)
                                 wm_anno = _find_soap_annotation(m_modifiers, source, imports, "WebMethod")
+                                we_anno = _find_soap_annotation(m_modifiers, source, imports, "WebEndpoint")
                                 oneway_anno = _find_soap_annotation(m_modifiers, source, imports, "Oneway")
                                 m_sl = child.start_point[0] + 1
                                 m_el = child.end_point[0] + 1
@@ -5242,7 +5263,6 @@ def _extract_java_soap_facts(
 
                                 op_name = (wm_anno.get("operationName") if wm_anno else None) or m_name
                                 action = wm_anno.get("action") if wm_anno else None
-
                                 target_ns = ws_anno.get("targetNamespace") if ws_anno else None
 
                                 if ws_anno is not None or wm_anno is not None or oneway_anno is not None:
@@ -5256,6 +5276,45 @@ def _extract_java_soap_facts(
                                             m_sl,
                                             m_el,
                                             target_ns,
+                                        )
+                                    )
+
+                                if we_anno is not None:
+                                    ep_port = we_anno.get("name") or m_name
+                                    ret_type_node = child.child_by_field_name("type")
+                                    ret_type = _node_text(ret_type_node, source) if ret_type_node else ""
+                                    facts.append(
+                                        SOAPFact(
+                                            "java_client_port",
+                                            f"{qualified_name}#{m_name}",
+                                            ret_type,
+                                            ep_port,
+                                            rel_path,
+                                            m_sl,
+                                            m_el,
+                                        )
+                                    )
+
+                        elif child.type == "field_declaration":
+                            f_modifiers = next((c for c in child.children if c.type == "modifiers"), None)
+                            wsr_anno = _find_soap_annotation(f_modifiers, source, imports, "WebServiceRef")
+                            if wsr_anno is not None:
+                                decl = child.child_by_field_name("declarator")
+                                f_name_node = decl.child_by_field_name("name") if decl else None
+                                if f_name_node:
+                                    f_name = _node_text(f_name_node, source)
+                                    f_sl = child.start_point[0] + 1
+                                    f_el = child.end_point[0] + 1
+                                    ref_type = wsr_anno.get("type") or wsr_anno.get("value") or ""
+                                    facts.append(
+                                        SOAPFact(
+                                            "java_client_ref",
+                                            f"{qualified_name}#{f_name}",
+                                            ref_type,
+                                            wsr_anno.get("name") or f_name,
+                                            rel_path,
+                                            f_sl,
+                                            f_el,
                                         )
                                     )
 
@@ -5281,7 +5340,7 @@ def _find_soap_annotation(modifiers, source: bytes, imports: dict[str, str], tar
             continue
 
         imported = imports.get(simple_name)
-        if name.startswith(("javax.jws.", "jakarta.jws.", "javax.xml.ws.", "jakarta.xml.ws.")):
+        if name.startswith(("javax.jws.", "jakarta.jws.", "javax.xml.ws.", "jakarta.xml.ws.", "javax.xml.bind.", "jakarta.xml.bind.")):
             allowed = True
         elif imported is not None:
             allowed = imported in {
@@ -5291,6 +5350,8 @@ def _find_soap_annotation(modifiers, source: bytes, imports: dict[str, str], tar
                 f"jakarta.jws.soap.{target_name}",
                 f"javax.xml.ws.{target_name}",
                 f"jakarta.xml.ws.{target_name}",
+                f"javax.xml.bind.annotation.{target_name}",
+                f"jakarta.xml.bind.annotation.{target_name}",
             }
         else:
             allowed = (
@@ -5298,6 +5359,8 @@ def _find_soap_annotation(modifiers, source: bytes, imports: dict[str, str], tar
                 or imports.get("jakarta.jws") == "jakarta.jws.*"
                 or imports.get("javax.xml.ws") == "javax.xml.ws.*"
                 or imports.get("jakarta.xml.ws") == "jakarta.xml.ws.*"
+                or imports.get("javax.xml.bind.annotation") == "javax.xml.bind.annotation.*"
+                or imports.get("jakarta.xml.bind.annotation") == "jakarta.xml.bind.annotation.*"
             )
         if not allowed:
             continue
@@ -5324,7 +5387,7 @@ def _analyze_soap_descriptor_files(contents: dict[Path, bytes]) -> list[SOAPFact
     facts: list[SOAPFact] = []
     for rel_path, raw_bytes in contents.items():
         name_lower = rel_path.name.lower()
-        if name_lower not in {"webservices.xml", "jboss-webservices.xml"}:
+        if name_lower not in {"webservices.xml", "jboss-webservices.xml", "jbossws-cxf.xml"}:
             continue
         try:
             text = raw_bytes.decode("utf-8", errors="replace")
@@ -5332,17 +5395,26 @@ def _analyze_soap_descriptor_files(contents: dict[Path, bytes]) -> list[SOAPFact
         except Exception:
             continue
 
-        for pc in root_elem.iter():
-            if _xml_local_name(pc.tag) == "port-component":
-                pc_name = _xml_child_text(pc, "port-component-name")
-                sei = _xml_child_text(pc, "service-endpoint-interface")
-                impl_bean = None
-                for sib in pc:
-                    if _xml_local_name(sib.tag) == "service-impl-bean":
-                        impl_bean = _xml_child_text(sib, "servlet-link") or _xml_child_text(sib, "ejb-link")
-                line = _xml_descriptor_line(text, "port-component-name", pc_name) if pc_name else 1
-                if impl_bean:
-                    facts.append(SOAPFact("descriptor_endpoint", impl_bean, pc_name, f"{sei or ''}|{pc_name or ''}", rel_path, line, line))
+        if name_lower in {"webservices.xml", "jboss-webservices.xml"}:
+            for pc in root_elem.iter():
+                if _xml_local_name(pc.tag) == "port-component":
+                    pc_name = _xml_child_text(pc, "port-component-name")
+                    sei = _xml_child_text(pc, "service-endpoint-interface")
+                    impl_bean = None
+                    for sib in pc:
+                        if _xml_local_name(sib.tag) == "service-impl-bean":
+                            impl_bean = _xml_child_text(sib, "servlet-link") or _xml_child_text(sib, "ejb-link")
+                    line = _xml_descriptor_line(text, "port-component-name", pc_name) if pc_name else 1
+                    if impl_bean:
+                        facts.append(SOAPFact("descriptor_endpoint", impl_bean, pc_name, f"{sei or ''}|{pc_name or ''}", rel_path, line, line))
+
+        elif name_lower == "jbossws-cxf.xml":
+            for feat in root_elem.iter():
+                tag_local = _xml_local_name(feat.tag)
+                if tag_local in ("feature", "interceptor", "inInterceptors", "outInterceptors"):
+                    cls_name = feat.get("class") or feat.text or tag_local
+                    line = _xml_descriptor_line(text, tag_local, cls_name)
+                    facts.append(SOAPFact("jboss_config", rel_path.as_posix(), str(cls_name).strip(), tag_local, rel_path, line, line))
     return facts
 
 
