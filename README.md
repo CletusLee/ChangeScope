@@ -1,35 +1,37 @@
 # ChangeScope
 
-Local-first, evidence-backed impact analysis for Java, Spring Boot, WildFly, and Quarkus repositories.
+Local-first, evidence-backed impact analysis for Java, Spring Boot, WildFly EJB, WildFly & JBoss SOAP, and Quarkus repositories.
 
 ## The problem
 
 Before changing legacy code, an engineer needs to know more than where a name appears in a text search. The useful question is:
 
-> If this method, component, configuration key, or contract changes, what local code and tests may be affected, and what source evidence proves it?
+> If this method, component, configuration key, WSDL operation, or interface contract changes, what local code, services, configuration, and tests are affected—and what source evidence proves it?
 
-ChangeScope answers a deliberately smaller version of that question for a checked-out repository. It builds a local SQLite index, analyzes Java source structurally with Tree-sitter, and produces a reviewable report containing:
+ChangeScope answers a deliberately smaller version of that question for checked-out repositories. It builds a local SQLite index, analyzes Java source structurally with Tree-sitter, parses WSDL/XSD contracts and framework descriptors, and produces a reviewable impact report containing:
 
-- the interpreted change target;
+- the interpreted change target (Java `Class#method` or SOAP WSDL operation);
 - affected relationships grouped by their evidence-backed kind;
 - source paths and line ranges;
-- confidence levels;
+- confidence levels (high, medium, low);
 - assumptions and unresolved items; and
-- the local Git snapshot used for the analysis.
+- the local Git snapshot and Workspace Catalog provenance used for the analysis.
 
 ChangeScope is not a generic code-search, code-memory, or full semantic call-graph product. Its primary design rule is conservative: an unsupported or ambiguous relationship is reported as unresolved instead of being guessed.
 
 ## Current status
 
-The current release is a JRE-free Java, Spring/Spring Boot, annotation- and descriptor-backed WildFly EJB, and Quarkus local-analysis capability. It is intended to answer `Class#method` impact questions inside one repository. The application service is exposed through a small CLI today; an MCP adapter is not implemented yet.
+The current release is a JRE-free local-analysis capability covering Java, Spring/Spring Boot, annotation- and descriptor-backed WildFly EJB, Quarkus, WildFly & JBoss SOAP Web Services (JAX-WS / WSDL / XSD), and cross-repository analysis via the Workspace Catalog. The application service is exposed through a CLI; an MCP adapter is planned.
 
-The implementation has been smoke-tested against four public Spring Boot applications: [Spring Petclinic](https://github.com/spring-projects/spring-petclinic), [Spring Petclinic REST](https://github.com/spring-petclinic/spring-petclinic-rest), [Spring Petclinic Modulith](https://github.com/spring-petclinic/spring-petclinic-modulith), and the [RealWorld Spring Boot application](https://github.com/gothinkster/spring-boot-realworld-example-app). In the current validation run, all four completed indexing with zero Java parse failures and zero file-read failures; representative MVC, REST, profile-aware, event-driven, MyBatis, Security, GraphQL, and Spring-test impact queries resolved successfully.
+### Validation benchmarks
 
-The WildFly EJB path has also been smoke-tested against five public quickstarts: [`ejb-remote`](https://github.com/wildfly/quickstart/tree/main/ejb-remote), [`ejb-throws-exception`](https://github.com/wildfly/quickstart/tree/main/ejb-throws-exception), [`ejb-security-context-propagation`](https://github.com/wildfly/quickstart/tree/main/ejb-security-context-propagation), [`helloworld-mdb`](https://github.com/wildfly/quickstart/tree/main/helloworld-mdb), and [`ejb-timer`](https://github.com/wildfly/quickstart/tree/main/ejb-timer).
+- **Spring / Spring Boot**: Tested against four public Spring Boot applications: [Spring Petclinic](https://github.com/spring-projects/spring-petclinic), [Spring Petclinic REST](https://github.com/spring-spring-petclinic-rest), [Spring Petclinic Modulith](https://github.com/spring-petclinic/spring-petclinic-modulith), and [RealWorld Spring Boot](https://github.com/gothinkster/spring-boot-realworld-example-app).
+- **WildFly EJB**: Tested against five official WildFly EJB quickstarts: [`ejb-remote`](https://github.com/wildfly/quickstart/tree/main/ejb-remote), [`ejb-throws-exception`](https://github.com/wildfly/quickstart/tree/main/ejb-throws-exception), [`ejb-security-context-propagation`](https://github.com/wildfly/quickstart/tree/main/ejb-security-context-propagation), [`helloworld-mdb`](https://github.com/wildfly/quickstart/tree/main/helloworld-mdb), and [`ejb-timer`](https://github.com/wildfly/quickstart/tree/main/ejb-timer).
+- **Quarkus**: Tested against four official Quarkus quickstarts: [`getting-started`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/getting-started), [`rest-client-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/rest-client-quickstart), [`hibernate-orm-panache-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/hibernate-orm-panache-quickstart), and [`security-jpa-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/security-jpa-quickstart).
+- **WildFly & JBoss SOAP**: Validated against three representative official [WildFly quickstarts](https://github.com/wildfly/quickstart): [`helloworld-ws`](https://github.com/wildfly/quickstart/tree/main/helloworld-ws) (POJO Web Service), [`jaxws-ejb`](https://github.com/wildfly/quickstart/tree/main/jaxws-ejb) (EJB Session Bean SOAP Web Service with Remote Business Interfaces), and [`jaxws-retail`](https://github.com/wildfly/quickstart/tree/main/jaxws-retail) (Complex WSDL contract, XSD payload binding, and evidence navigation). All repositories indexed with zero parse failures and resolved 3-tier evidence graphs (`WSDL operation -> XSD schema element -> Endpoint implementation & Client caller`).
 
-The Quarkus path has been validated against four representative official [Quarkus quickstarts](https://github.com/quarkusio/quarkus-quickstarts): [`getting-started`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/getting-started) (REST, CDI, and `@QuarkusTest` integration), [`rest-client-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/rest-client-quickstart) (MicroProfile REST Client contracts and DTOs), [`hibernate-orm-panache-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/hibernate-orm-panache-quickstart) (Panache persistence boundaries and repository CRUD), and [`security-jpa-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/security-jpa-quickstart) (Security `@RolesAllowed` policies and test endpoints). All repositories indexed with zero parse failures and produced evidence-backed impact reports with conservative disclaimers for unverified runtime behavior.
+## Key capabilities
 
-This matrix covers the current annotation-oriented WildFly path and its explicit unsupported boundaries. It does not claim that every EJB deployment style has been observed in a public application. Descriptor-backed `ejb-jar.xml`/`jboss-ejb3.xml` projects, setter injection, EJB-aware test injection, and legacy `javax.ejb` applications remain fixture-covered until a representative Java EE/JBoss EAP project is added. Runtime deployment success, arbitrary JNDI resolution, and cross-repository traversal remain outside the local structural analysis claim.
 ### Repository indexing
 
 `changescope index` analyzes the current working directory as one repository root. It can:
@@ -38,159 +40,88 @@ This matrix covers the current annotation-oriented WildFly path and its explicit
 - fall back to a constrained recursive Java scan for irregular repositories;
 - exclude common metadata, build, dependency, vendor, generated-output, and local-index directories;
 - index Java declarations, method invocations, annotations, source locations, and test-source classification;
-- discover local `.properties`, `.yml`, `.yaml`, and `.xml` configuration files in conventional resource/config locations;
-- record unreadable files and Java parse failures instead of silently omitting them;
+- discover local `.properties`, `.yml`, `.yaml`, `.xml`, `.wsdl`, and `.xsd` configuration and contract files;
 - store the local Repository Index in `.changescope/index.sqlite`; and
 - record available Git commit and working-tree provenance in the Index Snapshot.
 
-The index contains structural facts and evidence locations. It is not a mirror of the entire source repository.
+### Target resolution
 
-### Method target resolution
+ChangeScope supports two change target formats:
 
-`changescope impact Class#method` resolves a target from indexed Java declarations.
+1. **Java Target**: `changescope impact Class#method`
+2. **SOAP Target**: `changescope impact --soap-wsdl <path> --soap-port-type <portType> --soap-operation <operation>`
 
-- One matching method produces a `resolved` target with its signature and declaration evidence.
-- Multiple matches produce an `ambiguous` result with candidates; overloaded methods are not silently selected.
+- One matching target produces a `resolved` outcome with signature/evidence.
+- Multiple candidates produce an `ambiguous` result; overloaded methods are not silently selected.
 - No match produces a `not_found` result.
-- A resolved target is not the same as a complete impact graph. The report can still contain unresolved items.
-
-### Local Java relationships
-
-For a resolved target, the current structural rules can report:
-
-- explicit direct callers when the receiver is provably the target owner or a direct construction of it;
-- possible same-owner callers when the syntax is strong but the receiver is not fully resolved;
-- direct test calls when the caller is in a discovered test source root;
-- direct callees when a call can be tied to exactly one local declaration under the conservative rules; and
-- source evidence and confidence for every asserted relationship.
-
-The report also records unresolved calls whose receiver, overload, or dispatch target cannot be proven.
 
 ### Local Spring and Spring Boot evidence
 
-The current Spring slice can recognize and connect evidence for:
-
-- stereotype-managed classes using `@Component`, `@Service`, `@Repository`, `@Controller`, `@RestController`, or `@Configuration`;
-- explicit Java `@Bean` factory methods;
-- unique local field or constructor injection using `@Autowired`, `@Inject`, or `@Resource` when the selected rules identify one candidate;
-- `@Value` property consumers;
-- `@ConfigurationProperties` prefixes;
-- keys and values from `application.properties`, profile-specific properties, `application.yml`, and `application.yaml`;
-- explicit Spring XML `<bean>` definitions and `<property ref="...">` references;
-- XML property placeholders and matching local property sources; and
-- Spring-aware tests that explicitly load or target a changed class through supported test annotations.
-
-These findings are represented as distinct relationship kinds, including `spring_configuration_boundary`, `bean_consumer`, `property_consumer`, `property_source`, and `spring_test`. A Spring configuration boundary is class-level, indirect evidence; it must not be read as proof that Spring directly invokes the changed method.
+Recognizes and connects:
+- `@Component`, `@Service`, `@Repository`, `@Controller`, `@RestController`, `@Configuration`;
+- Java `@Bean` factory methods;
+- `@Autowired`, `@Inject`, `@Resource` field/constructor injection;
+- `@Value` and `@ConfigurationProperties` property consumers;
+- Spring XML `<bean>` definitions and `<property ref="...">` references; and
+- Spring-aware test loading (`@SpringBootTest`, etc.).
 
 ### WildFly EJB evidence
 
-The current WildFly slice can recognize and connect evidence for:
-
+Recognizes and connects:
 - `javax.ejb` and `jakarta.ejb` `@Local` and `@Remote` business interfaces;
 - `@Stateless`, `@Stateful`, and `@Singleton` Session Beans;
-- explicit interface-to-implementation relationships in both target directions;
-- local and remote view metadata, including uncertainty about consumers outside the Repository Index;
-- unique `@EJB` field and setter Injection Points with explicit invocation evidence and medium-confidence container dispatch;
-- descriptor-backed `ejb-jar.xml` Session Beans, business views, and explicit injection targets;
-- EJB-aware test wiring under Maven/Gradle/Eclipse test source roots, reported separately from production injection; and
-- ordered Evidence Chains for the relationship facts supporting each conclusion.
+- local and remote view metadata;
+- unique `@EJB` field and setter Injection Points with medium-confidence container dispatch;
+- descriptor-backed `ejb-jar.xml` and `jboss-ejb3.xml` Session Beans and business views; and
+- EJB-aware test wiring.
 
-Descriptor conflicts, incomplete links, and naming-based selection remain explicit unresolved items. Inherited EJB Business Interfaces and injection-backed dispatch are supported with conservative structural matching; implicit no-interface views, Session Bean class inheritance, message-driven beans, CDI, arbitrary JNDI lookup or naming selection, and other container mechanisms remain unresolved or out of scope for the current slice.
+### Local Quarkus evidence
 
-### Local Quarkus evidence and Native Image boundaries
+Recognizes and connects:
+- CDI-managed beans (`@ApplicationScoped`, `@RequestScoped`, `@Singleton`), qualifiers, and `@Inject` points;
+- Quarkus REST / RESTEasy endpoints (`@Path`, `@GET`, `@POST`, `@Consumes`, `@Produces`, `Uni`/`Multi`);
+- Reactive Routes (`@Route`);
+- MicroProfile REST Clients (`@RegisterRestClient`);
+- Security policies (`@RolesAllowed`, `@Authenticated`);
+- Test wiring (`@QuarkusTest`, `@QuarkusIntegrationTest`, `@InjectMock`, `@TestHTTPEndpoint`); and
+- GraalVM Native Image evidence and Panache persistence boundaries.
 
-The current Quarkus slice can recognize and connect evidence for:
+### WildFly & JBoss SOAP Web Services evidence
 
-- Maven/Gradle Quarkus dependencies and profile properties via `--build-profile` and `--runtime-profile`;
-- CDI-managed beans (`@ApplicationScoped`, `@RequestScoped`, `@Singleton`), qualifiers, and `@Inject` field, constructor, or method Injection Points;
-- Quarkus REST / RESTEasy endpoints (`@Path`, `@GET`, `@POST`, `@Consumes`, `@Produces`, `Uni`/`Multi` reactive types);
-- Reactive Routes declared via `@Route`;
-- MicroProfile / Quarkus REST Client contracts (`@RegisterRestClient`);
-- Security authorization and authentication policies (`@RolesAllowed`, `@Authenticated`);
-- `@QuarkusTest`, `@QuarkusIntegrationTest`, `@InjectMock`, and `@TestHTTPEndpoint` test wiring;
-- GraalVM Native Image evidence (`@RegisterForReflection`, `@RegisterForProxy`, `META-INF/services/` SPIs, `reflection-config.json`); and
-- Panache persistence boundaries (`PanacheRepository`, `PanacheEntity`) with conservative disclaimers for generated CRUD methods and database queries.
+Recognizes and connects:
+- WSDL 1.1 operations, messages, portTypes, and schema element/complexType payload graphs;
+- Recursive repository-local WSDL/XSD import traversal with cyclic path safety and remote reference detection;
+- Portable `javax.jws.*`, `jakarta.jws.*`, `javax.xml.ws.*`, `jakarta.xml.ws.*` annotations (`@WebService`, `@WebMethod`, `@Oneway`, `@WebServiceClient`, `@WebEndpoint`, `@WebServiceRef`, `@WebServiceProvider`, `@WebFault`);
+- XML binding annotations (`@XmlType`, `@XmlRootElement`, `@XmlElement`, `@RequestWrapper`, `@ResponseWrapper`);
+- Code-first endpoints reported as derived contracts at medium Confidence;
+- Unified impact neighborhoods for SOAP-exposed EJB Session Beans (`@Stateless` + `@WebService`);
+- Web-service descriptors (`webservices.xml`, `jboss-webservices.xml`, `jbossws-cxf.xml`);
+- `@HandlerChain` XML resolution (`handler-chain.xml`, `handlers.xml`) and JBossWS/CXF interceptors; and
+- WS-Policy attachments (`wsp:Policy`), WS-Security, WS-Addressing (`@Addressing`), MTOM (`@MTOM`), and SOAP 1.1/1.2 binding styles.
+
+### Workspace Catalog and cross-repository continuation
+
+`changescope catalog` manages explicit repository registrations and typed contract mappings across repositories in `.changescope/catalog.sqlite`:
+
+- `changescope catalog register-repo --id <id> --path <path>`: registers repository identity and tracks index commit SHA staleness.
+- `changescope catalog register-mapping --source-repo <id> --kind <rest|soap|ejb> --key <key> --target-repo <id> --target-key <key>`: registers explicit cross-repository contract mapping.
+- `changescope catalog resolve --source-repo <id> --kind <kind> --key <key>`: resolves exact mapping.
+- **Cross-repository continuation**: When a registered target repository or contract mapping is present, ChangeScope continues impact analysis from a client in repository A to the matching endpoint implementation in repository B (e.g. across container migration from `javax` to `jakarta`).
 
 ### Profiles, reports, and evidence navigation
 
-The impact command accepts repeatable profile selection:
-
-```text
---profile h2 --build-profile dev --runtime-profile prod
-```
-
-Selected profiles are treated as active. Base configuration is combined with matching profile-specific configuration. Without an explicit profile, profile-specific findings remain conditional instead of being assumed active.
-
-Reports are available as human-readable text or JSON. JSON exposes the same structured facts as text, including:
-
-- the requested and resolved target;
-- relationships, confidence, profile, conditional status, and evidence handles;
-- assumptions;
-- unresolved items; and
-- Index Snapshot provenance.
-
-Evidence handles support bounded retrieval so a caller can inspect only the relevant source context:
-
-- `changescope evidence <handle>` returns a small context window;
-- `--enclosing-symbol` expands to the enclosing method or constructor;
-- `--max-characters` applies a response budget; and
-- `changescope source <path> <start-line> <end-line>` retrieves an explicit bounded range.
-
-Oversized results report truncation and a continuation position rather than silently returning incomplete source.
-
-## What it cannot do yet
-
-The following limitations are intentional and should be treated as part of the current contract.
-
-### Java and runtime limitations
-
-ChangeScope currently cannot:
-
-- perform complete Java type or classpath resolution;
-- compile the application or require a JRE/JDK;
-- prove all overload selection, inheritance, interface implementation, virtual dispatch, or generic type relationships;
-- resolve reflection, method handles, dynamic proxies, generated code, annotation processors, or framework-generated calls;
-- infer relationships from names alone;
-- analyze Python, JavaScript/TypeScript, C/C++, C#, Go, VB.NET, or VB6 source in the current CLI; or
-- accept a requirement, Git diff, API contract, or arbitrary symbol as a target. The current target form is `Class#method`.
-
-### Spring and Spring Boot limitations
-
-The current Spring support does not fully resolve:
-
-- component scanning and imported configuration;
-- conditional auto-configuration;
-- profile expressions such as `!prod`, `prod & region`, or other dynamic profile logic;
-- environment-variable overrides and SpEL expressions;
-- `@Primary`, qualifiers, named resources, collection injection, or multiple bean candidates;
-- inherited configuration, factory indirection, proxy/advice behavior, AOP dispatch, or runtime bean selection;
-- all Spring test loading behavior; or
-- runtime property values, deployment environment, actuator state, or application startup behavior.
-
-Unsupported mechanisms appear as unresolved items when the analyzer can identify them. They are not silently promoted to high-confidence relationships.
-
-### Repository and application-boundary limitations
-
-The current release analyzes one local checkout at a time. It does not yet:
-
-- traverse a Workspace Catalog or cross-repository relationship;
-- connect an HTTP/REST client to a remote handler or target repository;
-- analyze CDI, JAX-RS, JMS, SOAP, gRPC, CORBA, or other non-Spring application boundaries;
-- ingest OpenAPI or other external contract catalogs;
-- run the Spring Boot application or its Maven/Gradle tests as part of impact analysis; or
-- discover production state, remote source, or remote Git objects.
-
-The REST and GraphQL sample applications used for validation are therefore analyzed as local Java repositories. Their network endpoints are not treated as proven cross-repository contracts.
+- Profile selection: `--profile <spring>` `--build-profile <quarkus>` `--runtime-profile <quarkus>`.
+- Format parity: `--format text` and `--format json` output equivalent facts, evidence handles, and provenance.
+- Evidence navigation:
+  - `changescope evidence <handle>`: context window view.
+  - `changescope source <path> <start-line> <end-line>`: explicit line range view.
 
 ## Installation
 
 Requirements:
-
 - Python 3.10 or newer;
-- no local JRE or JDK requirement for ChangeScope itself; and
-- a checked-out repository to analyze.
-
-Create an environment and install the package in editable mode:
+- No local JRE or JDK requirement for ChangeScope; and
+- A checked-out repository to analyze.
 
 ```powershell
 python -m venv .venv
@@ -206,58 +137,55 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
-The Java parser dependencies are intentionally pinned. In particular, `tree-sitter==0.25.2` is paired with `tree-sitter-java==0.23.5`; using the incompatible 0.26 runtime can cause native parser failures on real-world Java syntax.
+Dependencies are pinned: `tree-sitter==0.25.2` is paired with `tree-sitter-java==0.23.5`.
 
 ## CLI quick start
-
-Run these commands from the root of the repository you want to analyze:
 
 ```bash
 # Build or refresh the local SQLite index.
 changescope index
 
-# Ask for a human-readable impact report.
+# Ask for a Java method target impact report.
 changescope impact GreetingResource#hello
 
-# Select Spring, Quarkus build, and runtime profiles and return JSON.
-changescope impact GreetingResource#hello \
-  --build-profile dev --runtime-profile prod --format json
+# Ask for a SOAP WSDL operation target impact report.
+changescope impact --soap-wsdl wsdl/order_service.wsdl --soap-port-type OrderPortType --soap-operation placeOrder
 
-# Retrieve evidence returned by an impact report.
-changescope evidence "quarkus_rest:src/main/java/example/GreetingResource.java:22-26" \
-  --enclosing-symbol --format json
+# Register repository in Workspace Catalog.
+changescope catalog register-repo --id order-service --path ./order-service
 
-# Retrieve an explicit bounded source range.
-changescope source src/main/java/example/GreetingResource.java 3 8 --format json
+# Register explicit contract mapping in Workspace Catalog.
+changescope catalog register-mapping \
+  --source-repo order-service \
+  --kind soap \
+  --key "{http://example.org/orders}OrderPortType#placeOrder" \
+  --target-repo payment-service \
+  --target-key "{http://example.org/orders}OrderPortType#placeOrder"
+
+# Retrieve source evidence from handle.
+changescope evidence "soap_wsdl:wsdl/order_service.wsdl:15-20" --enclosing-symbol --format json
 ```
-
-The CLI also works as a module:
-
-```bash
-python -m changescope --help
-```
-
-`impact` exits successfully only when the requested target is resolved. Ambiguous and not-found targets use a non-zero exit code so automation cannot mistake an uncertain target for a completed analysis.
 
 ## Development and verification
 
-Run the repository test suite with:
+Run the full repository test suite with:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The current test suite covers repository discovery, Java structural facts, direct callers and callees, ambiguity, incremental refresh, Spring configuration, profiles, properties, YAML, XML, bounded evidence navigation, WildFly EJB contracts, injection-backed dispatch, descriptor-backed contracts, EJB-aware tests, Quarkus CDI, REST, Reactive Routes, REST Client, Security, tests, Native Image evidence, persistence boundaries, unsupported container behavior, and CLI text/JSON consistency. The latest validation run completed 184 tests successfully. The public-project smoke tests above validate repository indexing and representative report paths; they do not replace the isolated fixture matrix for descriptor conflicts, ambiguous candidates, inheritance cycles, or other conservative unresolved cases.
+The test suite contains **213 unit and integration tests (100% passing)** covering:
+- Repository discovery & Java AST parsing;
+- Spring Boot beans, properties, and XML;
+- WildFly EJB session beans, descriptors, and interfaces;
+- Quarkus CDI, REST, REST Client, Security, and Native Image boundaries;
+- Workspace Catalog repository registration and mapping resolution; and
+- WildFly & JBoss SOAP WSDL/XSD payload graphs, portable endpoints, EJB SOAP beans, handlers, policies, cross-repo continuation, and report parity.
 
 ## Design principles
 
-- Evidence before breadth: every asserted relationship has inspectable local source evidence.
-- Conservative confidence: uncertainty is part of the result, not an internal error.
-- Local-only by default: no telemetry, cloud calls, remote fetching, embeddings, vector databases, daemons, or Docker daemon access.
-- JRE-free analysis: the first Java workflow uses Python and Tree-sitter rather than a JVM semantic resolver.
-- One application seam: the CLI delegates to `ChangeScopeApplication.execute`, leaving room for future adapters without duplicating analysis behavior.
-- Small vertical slices: new framework and language support should add a runnable, tested report behavior rather than an unverified broad call graph.
-
-## Direction of future work
-
-Future stages may add richer container naming resolution, requirement/diff/API targets, deeper Java resolution, verified HTTP/REST cross-repository analysis, Workspace Catalog support, and additional framework or language adapters. Because SOAP/JAX-WS is common in the target WildFly and JBoss estate, the next planned P0 container boundary is the contract-first [WildFly and JBoss SOAP impact analysis](docs/specs/wildfly-jboss-soap-impact-analysis.md). It is planned work, not part of the current release, and must not be inferred from current reports.
+- **Evidence before breadth**: every asserted relationship has inspectable local source evidence.
+- **Conservative confidence**: uncertainty is reported as unresolved, never guessed.
+- **Local-only by default**: no telemetry, cloud calls, remote fetching, embeddings, vector databases, daemons, or Docker daemon access.
+- **JRE-free static analysis**: pure Python and Tree-sitter parser without JVM dependencies.
+- **Small vertical slices**: runnable, tested report behaviors built in incremental stages.
