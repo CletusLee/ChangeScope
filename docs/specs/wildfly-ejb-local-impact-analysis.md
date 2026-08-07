@@ -18,7 +18,7 @@ Every asserted relationship will carry Confidence and an ordered chain of Eviden
 4. As an engineer, I want overloaded targets to remain ambiguous when the existing target syntax cannot select a signature, so that ChangeScope does not silently choose an overload.
 5. As an engineer, I want `javax.ejb` annotations recognized, so that legacy Java EE applications are supported.
 6. As an engineer, I want `jakarta.ejb` annotations recognized, so that newer Jakarta EE applications use the same analysis path.
-7. As an engineer, I want EJB annotations recognized only when their imports or fully qualified names prove the EJB namespace, so that unrelated annotations with the same simple name are not treated as WildFly Container Evidence.
+7. As an engineer, I want EJB annotations recognized only when their imports or fully qualified names prove the EJB namespace, so that unrelated annotations with the same simple name are not treated as WildFly/JBoss Container Evidence.
 8. As an engineer, I want `@Local` EJB Business Interfaces reported as local views, so that their scope is clear.
 9. As an engineer, I want `@Remote` EJB Business Interfaces reported as remote views, so that I do not mistake repository-local findings for a complete consumer list.
 10. As an engineer targeting a remote view, I want the report to state that external consumers may exist outside the Repository Index, so that cross-repository uncertainty remains visible.

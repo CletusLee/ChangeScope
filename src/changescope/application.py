@@ -218,6 +218,18 @@ class QuarkusBoundaryFact:
 
 
 @dataclass(frozen=True)
+class SOAPFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    namespace: str | None = None
+
+
+@dataclass(frozen=True)
 class IndexResult:
     source_roots: tuple[Path, ...]
     indexed_files: tuple[Path, ...]
@@ -239,6 +251,7 @@ class IndexResult:
     quarkus_test_facts: tuple[QuarkusTestFact, ...] = ()
     quarkus_native_facts: tuple[QuarkusNativeFact, ...] = ()
     quarkus_boundary_facts: tuple[QuarkusBoundaryFact, ...] = ()
+    soap_facts: tuple[SOAPFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -249,10 +262,13 @@ class IndexRequest:
 @dataclass(frozen=True)
 class ImpactRequest:
     repository_root: Path
-    target: str
+    target: str | None = None
     profiles: tuple[str, ...] = ()
     build_profiles: tuple[str, ...] = ()
     runtime_profiles: tuple[str, ...] = ()
+    soap_wsdl: Path | None = None
+    soap_port_type: str | None = None
+    soap_operation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -349,7 +365,7 @@ class ChangeScopeApplication:
 
 
 def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
-    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|source|quarkus_build|quarkus_config|quarkus_cdi|quarkus_rest|quarkus_route|quarkus_security|quarkus_test|quarkus_native|quarkus_boundary):(.+):(\d+)-(\d+)", request.evidence_handle)
+    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|source|quarkus_build|quarkus_config|quarkus_cdi|quarkus_rest|quarkus_route|quarkus_security|quarkus_test|quarkus_native|quarkus_boundary|soap_wsdl):(.+):(\d+)-(\d+)", request.evidence_handle)
     if match is None:
         raise ValueError("Evidence handles must use kind:path:start-end form.")
     path = _validate_relative_path(Path(match.group(1)))
@@ -463,10 +479,52 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
     database_path = root / ".changescope" / "index.sqlite"
     if not database_path.is_file():
         return ImpactResult(
-            "index_missing", request.target, None, (), (), (),
+            "index_missing", request.target or "soap_target", None, (), (), (),
             (_unresolved("No local Repository Index exists. Run `changescope index` first."),), None,
         )
     _refresh_index_if_needed(root)
+
+    has_soap_args = any(
+        arg is not None
+        for arg in (request.soap_wsdl, request.soap_port_type, request.soap_operation)
+    )
+    if request.target is not None and has_soap_args:
+        conn = sqlite3.connect(database_path)
+        try:
+            snapshot = _read_index_snapshot(conn, root)
+        finally:
+            conn.close()
+        return ImpactResult(
+            "invalid_target",
+            request.target,
+            None,
+            (),
+            (),
+            (),
+            (_unresolved("Cannot mix Java target ('Class#method') and SOAP target arguments (--soap-wsdl, --soap-port-type, --soap-operation)."),),
+            snapshot,
+        )
+
+    if has_soap_args or request.target is None:
+        if not (request.soap_wsdl and request.soap_port_type and request.soap_operation):
+            conn = sqlite3.connect(database_path)
+            try:
+                snapshot = _read_index_snapshot(conn, root)
+            finally:
+                conn.close()
+            req_target = request.target or "soap_target"
+            return ImpactResult(
+                "invalid_target",
+                req_target,
+                None,
+                (),
+                (),
+                (),
+                (_unresolved("Must specify all SOAP target arguments (--soap-wsdl, --soap-port-type, --soap-operation)."),),
+                snapshot,
+            )
+        return _impact_soap_repository(request, root, database_path)
+
     target_parts = request.target.split("#")
     if len(target_parts) != 2 or not all(target_parts):
         connection = sqlite3.connect(database_path)
@@ -2038,6 +2096,9 @@ def _index_repository(repository_root: Path) -> IndexResult:
     quarkus_boundary_facts = _analyze_quarkus_boundary_files(
         {**contents_by_path, **configuration_contents}, declarations
     )
+    soap_facts = _analyze_soap_files(
+        {**contents_by_path, **configuration_contents}, root
+    )
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -2060,6 +2121,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
         quarkus_test_facts=quarkus_test_facts,
         quarkus_native_facts=quarkus_native_facts,
         quarkus_boundary_facts=quarkus_boundary_facts,
+        soap_facts=soap_facts,
     )
     _write_index(result)
     return result
@@ -2164,6 +2226,9 @@ def _refresh_index_if_needed(root: Path) -> None:
                 quarkus_boundary_facts = _analyze_quarkus_boundary_files(
                     {**contents_by_path, **configuration_contents}, declarations
                 )
+                soap_facts = _analyze_soap_files(
+                    {**contents_by_path, **configuration_contents}, root
+                )
                 _replace_changed_source_records(
                     connection,
                     changed_paths,
@@ -2179,6 +2244,7 @@ def _refresh_index_if_needed(root: Path) -> None:
                     quarkus_test_facts=quarkus_test_facts,
                     quarkus_native_facts=quarkus_native_facts,
                     quarkus_boundary_facts=quarkus_boundary_facts,
+                    soap_facts=soap_facts,
                     replace_all_ejb_facts=refresh_all_ejb_facts,
                 )
             _write_metadata(connection, _snapshot(root), source_roots)
@@ -2460,7 +2526,7 @@ def _configuration_files(
                 path = Path(directory) / filename
                 path_posix = path.as_posix()
                 is_config = (
-                    path.suffix.lower() in {".properties", ".yml", ".yaml", ".xml", ".json"}
+                    path.suffix.lower() in {".properties", ".yml", ".yaml", ".xml", ".json", ".wsdl", ".xsd"}
                     or "META-INF/services" in path_posix
                     or "META-INF/native-image" in path_posix
                 )
@@ -2473,7 +2539,7 @@ def _configuration_files(
                     read_failures.add(relative_path)
 
     for path in root.iterdir():
-        if not path.is_file() or path.suffix.lower() not in {".properties", ".yml", ".yaml", ".xml"}:
+        if not path.is_file() or path.suffix.lower() not in {".properties", ".yml", ".yaml", ".xml", ".wsdl", ".xsd"}:
             continue
         name = path.name.lower()
         if not (
@@ -4237,6 +4303,7 @@ def _replace_index_contents(
     connection.execute("DELETE FROM quarkus_test_facts")
     connection.execute("DELETE FROM quarkus_native_facts")
     connection.execute("DELETE FROM quarkus_boundary_facts")
+    connection.execute("DELETE FROM soap_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
     indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
     connection.executemany(
@@ -4262,6 +4329,7 @@ def _replace_index_contents(
     _insert_quarkus_test_facts(connection, result.quarkus_test_facts)
     _insert_quarkus_native_facts(connection, result.quarkus_native_facts)
     _insert_quarkus_boundary_facts(connection, result.quarkus_boundary_facts)
+    _insert_soap_facts(connection, result.soap_facts)
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
@@ -4285,6 +4353,9 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
     ).fetchone() is None
     quarkus_route_schema_missing = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_route_facts'"
+    ).fetchone() is None
+    soap_schema_missing = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'soap_facts'"
     ).fetchone() is None
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -4457,6 +4528,18 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         category TEXT
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS soap_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        namespace TEXT
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -4492,6 +4575,7 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         or quarkus_cdi_schema_missing
         or quarkus_rest_schema_missing
         or quarkus_route_schema_missing
+        or soap_schema_missing
     )
 
 
@@ -4533,6 +4617,7 @@ def _replace_changed_source_records(
     quarkus_test_facts: tuple[QuarkusTestFact, ...] = (),
     quarkus_native_facts: tuple[QuarkusNativeFact, ...] = (),
     quarkus_boundary_facts: tuple[QuarkusBoundaryFact, ...] = (),
+    soap_facts: tuple[SOAPFact, ...] = (),
     replace_all_ejb_facts: bool = False,
 ) -> None:
     if replace_all_ejb_facts:
@@ -4546,6 +4631,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_test_facts")
         connection.execute("DELETE FROM quarkus_native_facts")
         connection.execute("DELETE FROM quarkus_boundary_facts")
+        connection.execute("DELETE FROM soap_facts")
     for path in changed_paths:
         connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
         connection.execute("DELETE FROM java_declarations WHERE path = ?", (path,))
@@ -4563,6 +4649,7 @@ def _replace_changed_source_records(
         connection.execute("DELETE FROM quarkus_test_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_native_facts WHERE path = ?", (path,))
         connection.execute("DELETE FROM quarkus_boundary_facts WHERE path = ?", (path,))
+        connection.execute("DELETE FROM soap_facts WHERE path = ?", (path,))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         ((path, status, content_hash) for path, (status, content_hash) in current_files.items() if path in changed_paths),
@@ -4579,6 +4666,7 @@ def _replace_changed_source_records(
     _insert_quarkus_test_facts(connection, quarkus_test_facts)
     _insert_quarkus_native_facts(connection, quarkus_native_facts)
     _insert_quarkus_boundary_facts(connection, quarkus_boundary_facts)
+    _insert_soap_facts(connection, soap_facts)
 
 
 def _insert_java_facts(
@@ -4895,6 +4983,283 @@ def _insert_quarkus_boundary_facts(
             for fact in facts
         ),
     )
+
+
+def _insert_soap_facts(
+    connection: sqlite3.Connection, facts: Iterable[SOAPFact]
+) -> None:
+    connection.executemany(
+        """INSERT INTO soap_facts(
+        kind, subject, target, value, path, start_line, end_line, namespace
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                fact.kind,
+                fact.subject,
+                fact.target,
+                fact.value,
+                fact.path.as_posix(),
+                fact.start_line,
+                fact.end_line,
+                fact.namespace,
+            )
+            for fact in facts
+        ),
+    )
+
+
+def _analyze_soap_files(contents: dict[Path, bytes], root: Path) -> tuple[SOAPFact, ...]:
+    facts: list[SOAPFact] = []
+    visited_imports: set[Path] = set()
+    for rel_path, raw_bytes in sorted(contents.items(), key=lambda pair: pair[0].as_posix()):
+        if rel_path.suffix.lower() not in {".wsdl", ".xsd"}:
+            continue
+        try:
+            text = raw_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        file_facts = _parse_soap_wsdl_or_xsd(rel_path, text, root, contents, visited_imports)
+        facts.extend(file_facts)
+    return tuple(facts)
+
+
+def _parse_soap_wsdl_or_xsd(
+    rel_path: Path,
+    text: str,
+    root: Path,
+    contents: dict[Path, bytes],
+    visited_imports: set[Path],
+) -> list[SOAPFact]:
+    facts: list[SOAPFact] = []
+    try:
+        elem_tree = ElementTree.fromstring(text)
+    except ElementTree.ParseError:
+        return facts
+
+    namespaces = _extract_namespaces(text)
+    target_namespace = elem_tree.get("targetNamespace") or elem_tree.get("namespace") or ""
+    if target_namespace:
+        namespaces[""] = target_namespace
+
+    def resolve_qname(qname_str: str | None) -> str:
+        if not qname_str:
+            return ""
+        if qname_str.startswith("{"):
+            return qname_str
+        if ":" in qname_str:
+            prefix, local = qname_str.split(":", 1)
+            ns_uri = namespaces.get(prefix, target_namespace)
+            return f"{{{ns_uri}}}{local}" if ns_uri else local
+        ns_uri = namespaces.get("", target_namespace)
+        return f"{{{ns_uri}}}{qname_str}" if ns_uri else qname_str
+
+    for child in elem_tree.iter():
+        tag_local = _xml_local_name(child.tag)
+
+        if tag_local in ("import", "include"):
+            location = child.get("location") or child.get("schemaLocation")
+            imp_ns = child.get("namespace") or target_namespace
+            line = _xml_descriptor_line(text, tag_local, location)
+            if location:
+                if location.startswith("http://") or location.startswith("https://"):
+                    facts.append(SOAPFact("import", location, imp_ns, "remote_import", rel_path, line, line, target_namespace))
+                else:
+                    target_rel = (rel_path.parent / location)
+                    try:
+                        normalized_rel = Path(os.path.normpath(target_rel))
+                        if str(normalized_rel).startswith(".."):
+                            facts.append(SOAPFact("import", location, imp_ns, "unresolvable_import", rel_path, line, line, target_namespace))
+                        elif normalized_rel in contents or (root / normalized_rel).is_file():
+                            facts.append(SOAPFact("import", location, imp_ns, "local_import", rel_path, line, line, target_namespace))
+                        else:
+                            facts.append(SOAPFact("import", location, imp_ns, "unresolvable_import", rel_path, line, line, target_namespace))
+                    except Exception:
+                        facts.append(SOAPFact("import", location, imp_ns, "unresolvable_import", rel_path, line, line, target_namespace))
+
+        elif tag_local == "portType":
+            pt_name = child.get("name")
+            if pt_name:
+                pt_qname = f"{{{target_namespace}}}{pt_name}" if target_namespace else pt_name
+                pt_line = _xml_descriptor_line(text, "portType", pt_name)
+                facts.append(SOAPFact("port_type", pt_qname, None, pt_name, rel_path, pt_line, pt_line, target_namespace))
+
+                for op in child:
+                    if _xml_local_name(op.tag) == "operation":
+                        op_name = op.get("name")
+                        if op_name:
+                            op_line = _xml_descriptor_line(text, "operation", op_name)
+                            in_msg = None
+                            out_msg = None
+                            for sub in op:
+                                sub_tag = _xml_local_name(sub.tag)
+                                if sub_tag == "input":
+                                    in_msg = resolve_qname(sub.get("message"))
+                                elif sub_tag == "output":
+                                    out_msg = resolve_qname(sub.get("message"))
+                                elif sub_tag == "fault":
+                                    fault_msg = resolve_qname(sub.get("message"))
+                                    fault_name = sub.get("name")
+                                    facts.append(SOAPFact("operation_fault", op_name, pt_qname, fault_msg, rel_path, op_line, op_line, target_namespace))
+                            facts.append(SOAPFact("operation", op_name, pt_qname, in_msg, rel_path, op_line, op_line, target_namespace))
+                            facts.append(SOAPFact("operation_input", op_name, pt_qname, in_msg, rel_path, op_line, op_line, target_namespace))
+                            if out_msg:
+                                facts.append(SOAPFact("operation_output", op_name, pt_qname, out_msg, rel_path, op_line, op_line, target_namespace))
+
+        elif tag_local == "message":
+            msg_name = child.get("name")
+            if msg_name:
+                msg_qname = f"{{{target_namespace}}}{msg_name}" if target_namespace else msg_name
+                msg_line = _xml_descriptor_line(text, "message", msg_name)
+                facts.append(SOAPFact("message", msg_qname, None, msg_name, rel_path, msg_line, msg_line, target_namespace))
+                for part in child:
+                    if _xml_local_name(part.tag) == "part":
+                        part_name = part.get("name")
+                        part_target = resolve_qname(part.get("element") or part.get("type"))
+                        facts.append(SOAPFact("message_part", msg_qname, part_target, part_name, rel_path, msg_line, msg_line, target_namespace))
+
+        elif tag_local == "binding":
+            binding_name = child.get("name")
+            if binding_name:
+                binding_qname = f"{{{target_namespace}}}{binding_name}" if target_namespace else binding_name
+                pt_ref = resolve_qname(child.get("type"))
+                b_line = _xml_descriptor_line(text, "binding", binding_name)
+                facts.append(SOAPFact("binding", binding_qname, pt_ref, binding_name, rel_path, b_line, b_line, target_namespace))
+                for b_op in child:
+                    if _xml_local_name(b_op.tag) == "operation":
+                        b_op_name = b_op.get("name")
+                        if b_op_name:
+                            action = None
+                            for sub in b_op:
+                                if _xml_local_name(sub.tag) == "operation":
+                                    action = sub.get("soapAction")
+                            facts.append(SOAPFact("binding_operation", binding_qname, b_op_name, action, rel_path, b_line, b_line, target_namespace))
+
+        elif tag_local == "service":
+            service_name = child.get("name")
+            if service_name:
+                service_qname = f"{{{target_namespace}}}{service_name}" if target_namespace else service_name
+                s_line = _xml_descriptor_line(text, "service", service_name)
+                facts.append(SOAPFact("service", service_qname, None, service_name, rel_path, s_line, s_line, target_namespace))
+                for port in child:
+                    if _xml_local_name(port.tag) == "port":
+                        port_name = port.get("name")
+                        b_ref = resolve_qname(port.get("binding"))
+                        addr = None
+                        for sub in port:
+                            if _xml_local_name(sub.tag) == "address":
+                                addr = sub.get("location")
+                        facts.append(SOAPFact("port", service_qname, b_ref, f"{port_name}|{addr or ''}", rel_path, s_line, s_line, target_namespace))
+
+        elif tag_local == "element":
+            elem_name = child.get("name")
+            if elem_name:
+                elem_qname = f"{{{target_namespace}}}{elem_name}" if target_namespace else elem_name
+                type_ref = resolve_qname(child.get("type"))
+                e_line = _xml_descriptor_line(text, "element", elem_name)
+                facts.append(SOAPFact("schema_element", elem_qname, type_ref, elem_name, rel_path, e_line, e_line, target_namespace))
+
+        elif tag_local in ("complexType", "simpleType"):
+            t_name = child.get("name")
+            if t_name:
+                t_qname = f"{{{target_namespace}}}{t_name}" if target_namespace else t_name
+                t_line = _xml_descriptor_line(text, tag_local, t_name)
+                facts.append(SOAPFact("schema_type", t_qname, None, t_name, rel_path, t_line, t_line, target_namespace))
+
+    return facts
+
+
+def _extract_namespaces(text: str) -> dict[str, str]:
+    namespaces: dict[str, str] = {}
+    for match in re.finditer(r'xmlns(?::([A-Za-z0-9_-]+))?\s*=\s*["\']([^"\']+)["\']', text):
+        prefix = match.group(1) or ""
+        uri = match.group(2)
+        namespaces[prefix] = uri
+    return namespaces
+
+
+def _impact_soap_repository(request: ImpactRequest, root: Path, database_path: Path) -> ImpactResult:
+    connection = sqlite3.connect(database_path)
+    try:
+        snapshot = _read_index_snapshot(connection, root)
+        wsdl_rel_path = request.soap_wsdl.as_posix() if request.soap_wsdl else ""
+        target_port_type = request.soap_port_type or ""
+        target_operation = request.soap_operation or ""
+
+        rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, namespace
+            FROM soap_facts WHERE kind = 'operation' AND subject = ?""",
+            (target_operation,),
+        ).fetchall()
+
+        matched_rows = []
+        for r in rows:
+            f_kind, f_subject, f_target, f_value, f_path, f_start_line, f_end_line, f_namespace = r
+            f_path_posix = Path(f_path).as_posix()
+            wsdl_posix = Path(wsdl_rel_path).as_posix()
+            if f_path_posix != wsdl_posix and not f_path_posix.endswith("/" + wsdl_posix) and not wsdl_posix.endswith("/" + f_path_posix):
+                continue
+            if _matches_port_type(f_target or "", target_port_type):
+                matched_rows.append(r)
+
+        target_name_str = f"soap:{wsdl_rel_path}#{target_port_type}#{target_operation}"
+
+        if not matched_rows:
+            return ImpactResult("not_found", target_name_str, None, (), (), (), (_unresolved(f"SOAP target operation '{target_operation}' was not found in WSDL '{wsdl_rel_path}'."),), snapshot)
+
+        candidates = tuple(
+            ImpactTarget(
+                f"{r[2]}#{r[1]}",
+                Path(r[4]),
+                r[5],
+                r[6],
+                f"soap_wsdl:{r[4]}:{r[5]}-{r[6]}",
+            )
+            for r in matched_rows
+        )
+
+        if len(matched_rows) > 1:
+            return ImpactResult("ambiguous", target_name_str, None, candidates, (), (), (), snapshot)
+
+        resolved_row = matched_rows[0]
+        f_kind, f_subject, f_target, f_value, f_path, f_start_line, f_end_line, f_namespace = resolved_row
+        target = candidates[0]
+
+        import_rows = connection.execute(
+            "SELECT subject, value, path, start_line, end_line FROM soap_facts WHERE kind = 'import' AND value IN ('remote_import', 'unresolvable_import')"
+        ).fetchall()
+        unresolved_items = []
+        for imp_subj, imp_val, imp_path, imp_sl, imp_el in import_rows:
+            msg = f"Remote or unresolvable WSDL/XSD import location: {imp_subj}"
+            unresolved_items.append(
+                _unresolved(msg, path=Path(imp_path), start_line=imp_sl, end_line=imp_el, evidence_kind="soap_wsdl")
+            )
+
+        assumptions = (
+            "SOAP analysis ground truth is established by repository-local WSDL 1.1 and XML Schema contract evidence.",
+            "No network or server-side dynamic compilation was performed.",
+        )
+
+        return ImpactResult(
+            "resolved",
+            target_name_str,
+            target,
+            (),
+            (),
+            assumptions,
+            tuple(unresolved_items),
+            snapshot,
+        )
+    finally:
+        connection.close()
+
+
+def _matches_port_type(port_type_qname: str, target_port_type: str) -> bool:
+    if target_port_type.startswith("{"):
+        return port_type_qname == target_port_type
+    if "}" in port_type_qname:
+        local_name = port_type_qname.rsplit("}", maxsplit=1)[-1]
+        return local_name == target_port_type
+    return port_type_qname == target_port_type
 
 
 def _analyze_quarkus_boundary_files(

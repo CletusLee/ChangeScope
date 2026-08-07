@@ -120,9 +120,9 @@ _Avoid_: Inferred runtime environment, default deployment profile
 The oldest Java source language level that ChangeScope can analyze. The initial baseline is Java 5, with Java 6 and later also supported.
 _Avoid_: Runtime requirement, deployment JVM
 
-**WildFly Container Evidence**:
-The WildFly and Java EE evidence ChangeScope recognizes for relationship discovery: EJB local and remote interfaces, `@EJB` injection, JNDI references, CDI injection and qualifiers, JAX-RS resources, servlet mappings, and relevant `web.xml` and `ejb-jar.xml` descriptors.
-_Avoid_: Generic framework hint
+**WildFly/JBoss Container Evidence**:
+Source, contract, packaging, and deployment-descriptor evidence that identifies a relationship managed by a WildFly or JBoss application-server generation. The server product and generation describe the evidence flavor; they do not by themselves prove deployment or define a contract's identity.
+_Avoid_: WildFly Container Evidence, generic framework hint, verified deployment
 
 **EJB Business Interface**:
 A Java interface identified as local or remote by explicit EJB source annotation or deployment-descriptor evidence that defines the callable contract exposed by a Session Bean.
@@ -143,6 +143,30 @@ _Avoid_: Architecture View, runtime endpoint
 **Container Dispatch**:
 The WildFly-managed runtime step from an EJB Business Interface reference to a Session Bean. Source evidence can identify candidates, but deployment packaging or configuration may keep the dispatch from being fully proven.
 _Avoid_: Direct method call, static dispatch
+
+**SOAP Contract Boundary**:
+An evidence-backed synchronous web-service boundary described by a WSDL contract or portable XML Web Services metadata. It spans clients, endpoints, operations, payloads, handlers, and deployment evidence without treating an endpoint address or application-server version as the contract.
+_Avoid_: WildFly SOAP support, deployed URL, generic XML call
+
+**SOAP Contract Identity**:
+The stable identity of a SOAP service, port, binding, or operation derived from WSDL qualified names and message structure, or from an explicit Workspace Catalog mapping to that contract. Java names, endpoint addresses, and similar operation names are not sufficient identity.
+_Avoid_: Endpoint URL, Java method name, server deployment name
+
+**SOAP Endpoint**:
+A repository-local POJO, Session Bean, provider, or explicit descriptor target that implements a SOAP Contract Boundary. Source and descriptor evidence can identify the intended endpoint without proving that the application server deploys it successfully.
+_Avoid_: REST endpoint, deployed service
+
+**SOAP Client**:
+A typed XML Web Services proxy, injected web-service reference, generated service view, or structurally explicit programmatic client that consumes a SOAP Contract Boundary. Low-level dynamic message construction remains unresolved unless it can be tied to one contract operation.
+_Avoid_: Arbitrary HTTP client, endpoint address
+
+**SOAP Payload Contract**:
+The WSDL message, XML Schema element or type, fault, and corresponding XML-bound Java type used by a SOAP operation. It records serialization-sensitive impact without claiming runtime marshalling compatibility.
+_Avoid_: Java DTO alone, sample XML
+
+**Source-controlled Generated Contract Evidence**:
+Generated contract artifacts committed under an application's authoritative source roots, such as XML Web Services service views, endpoint interfaces, and XML-bound payload types. Their generated origin is retained as provenance; generated build-output directories remain non-authoritative.
+_Avoid_: Build output, opaque generated code
 
 **Workspace Catalog**:
 The authoritative local catalog of registered repositories, logical contract identities, verified cross-repository relationships, and their analysis provenance. It does not become a copy of application source code.

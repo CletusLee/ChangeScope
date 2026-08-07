@@ -260,4 +260,4 @@ The current test suite covers repository discovery, Java structural facts, direc
 
 ## Direction of future work
 
-Future stages may add richer container naming resolution, requirement/diff/API targets, deeper Java resolution, verified HTTP/REST cross-repository analysis, Workspace Catalog support, and additional framework or language adapters. Those capabilities are not part of the current release and should not be inferred from the current reports.
+Future stages may add richer container naming resolution, requirement/diff/API targets, deeper Java resolution, verified HTTP/REST cross-repository analysis, Workspace Catalog support, and additional framework or language adapters. Because SOAP/JAX-WS is common in the target WildFly and JBoss estate, the next planned P0 container boundary is the contract-first [WildFly and JBoss SOAP impact analysis](docs/specs/wildfly-jboss-soap-impact-analysis.md). It is planned work, not part of the current release, and must not be inferred from current reports.

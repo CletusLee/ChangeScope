@@ -24,7 +24,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
         "--format", choices=("text", "json"), default="text", help="report format"
     )
     impact_command = subcommands.add_parser("impact", help="report local Java method impact")
-    impact_command.add_argument("target", help="Java target in Class#method form")
+    impact_command.add_argument("target", nargs="?", default=None, help="Java target in Class#method form")
+    impact_command.add_argument(
+        "--soap-wsdl", type=Path, default=None, help="WSDL file path relative to repository"
+    )
+    impact_command.add_argument(
+        "--soap-port-type", default=None, help="Port type QName in Clark notation {ns}Name or Name"
+    )
+    impact_command.add_argument(
+        "--soap-operation", default=None, help="WSDL operation name"
+    )
     impact_command.add_argument(
         "--format", choices=("text", "json"), default="text", help="report format"
     )
@@ -60,6 +69,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
         _render_index_result(result, parsed.format)
         return 0
     if parsed.command == "impact":
+        has_soap = any(
+            arg is not None
+            for arg in (parsed.soap_wsdl, parsed.soap_port_type, parsed.soap_operation)
+        )
+        if parsed.target is not None and has_soap:
+            parser.error("Cannot mix Java target ('Class#method') and SOAP target arguments (--soap-wsdl, --soap-port-type, --soap-operation)")
+        if parsed.target is None and not (parsed.soap_wsdl and parsed.soap_port_type and parsed.soap_operation):
+            parser.error("Must specify either a Java target ('Class#method') or all SOAP target arguments (--soap-wsdl, --soap-port-type, --soap-operation)")
+
         result = ChangeScopeApplication().execute(
             ImpactRequest(
                 Path.cwd(),
@@ -67,6 +85,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 tuple(parsed.profiles),
                 tuple(parsed.build_profiles),
                 tuple(parsed.runtime_profiles),
+                parsed.soap_wsdl,
+                parsed.soap_port_type,
+                parsed.soap_operation,
             )
         )
         _render_impact_result(result, parsed.format)
@@ -105,6 +126,7 @@ def _render_index_result(result: IndexResult, output_format: str) -> None:
     print(f"Explicit invocation evidence: {report['invocation_count']}")
     print(f"Spring Configuration Evidence: {report['spring_configuration_evidence_count']}")
     print(f"Quarkus Build Evidence: {report['quarkus_build_evidence_count']}")
+    print(f"SOAP Contract Evidence: {report['soap_contract_evidence_count']}")
     print("Included Java files:")
     for path in report["indexed_files"]:
         print(f"- {path}")
@@ -143,6 +165,7 @@ def _index_report(result: IndexResult) -> dict[str, object]:
         "quarkus_test_evidence_count": len(result.quarkus_test_facts),
         "quarkus_native_evidence_count": len(result.quarkus_native_facts),
         "quarkus_boundary_evidence_count": len(result.quarkus_boundary_facts),
+        "soap_contract_evidence_count": len(result.soap_facts),
         "parse_failures": [
             {
                 "path": _report_path(failure.path),
