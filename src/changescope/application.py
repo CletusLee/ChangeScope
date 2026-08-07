@@ -5196,6 +5196,10 @@ def _extract_java_soap_facts(
                 hc_anno = _find_soap_annotation(modifiers, source, imports, "HandlerChain")
                 xt_anno = _find_soap_annotation(modifiers, source, imports, "XmlType")
                 xr_anno = _find_soap_annotation(modifiers, source, imports, "XmlRootElement")
+                addr_anno = _find_soap_annotation(modifiers, source, imports, "Addressing")
+                mtom_anno = _find_soap_annotation(modifiers, source, imports, "MTOM")
+                sec_anno = _find_soap_annotation(modifiers, source, imports, "SecurityDomain")
+                arq_anno = _find_soap_annotation(modifiers, source, imports, "Deployment") or _find_soap_annotation(modifiers, source, imports, "RunWith")
 
                 start_line = node.start_point[0] + 1
                 end_line = node.end_point[0] + 1
@@ -5243,6 +5247,16 @@ def _extract_java_soap_facts(
                     bind_name = (xr_anno.get("name") if xr_anno else None) or (xt_anno.get("name") if xt_anno else None) or type_name
                     bind_ns = (xr_anno.get("namespace") if xr_anno else None) or (xt_anno.get("namespace") if xt_anno else None) or ""
                     facts.append(SOAPFact("java_xml_binding", qualified_name, bind_name, bind_ns, rel_path, start_line, end_line, bind_ns))
+
+                if addr_anno is not None or mtom_anno is not None or sec_anno is not None:
+                    p_name = "Addressing" if addr_anno is not None else ("MTOM" if mtom_anno is not None else "SecurityDomain")
+                    p_val = sec_anno.get("value") if sec_anno else "enabled"
+                    facts.append(SOAPFact("policy_attachment", qualified_name, p_name, p_val, rel_path, start_line, end_line))
+
+                is_test_class = type_name.endswith("Test") or type_name.endswith("Tests") or arq_anno is not None
+                if is_test_class:
+                    flav = "arquillian" if arq_anno is not None else "unit_test"
+                    facts.append(SOAPFact("soap_test", qualified_name, type_name, flav, rel_path, start_line, end_line))
 
                 body_node = node.child_by_field_name("body")
                 if body_node:
@@ -5340,7 +5354,7 @@ def _find_soap_annotation(modifiers, source: bytes, imports: dict[str, str], tar
             continue
 
         imported = imports.get(simple_name)
-        if name.startswith(("javax.jws.", "jakarta.jws.", "javax.xml.ws.", "jakarta.xml.ws.", "javax.xml.bind.", "jakarta.xml.bind.")):
+        if name.startswith(("javax.jws.", "jakarta.jws.", "javax.xml.ws.", "jakarta.xml.ws.", "javax.xml.bind.", "jakarta.xml.bind.", "org.jboss.", "org.junit.")):
             allowed = True
         elif imported is not None:
             allowed = imported in {
@@ -5350,8 +5364,13 @@ def _find_soap_annotation(modifiers, source: bytes, imports: dict[str, str], tar
                 f"jakarta.jws.soap.{target_name}",
                 f"javax.xml.ws.{target_name}",
                 f"jakarta.xml.ws.{target_name}",
+                f"javax.xml.ws.soap.{target_name}",
+                f"jakarta.xml.ws.soap.{target_name}",
                 f"javax.xml.bind.annotation.{target_name}",
                 f"jakarta.xml.bind.annotation.{target_name}",
+                f"org.jboss.annotation.security.{target_name}",
+                f"org.jboss.arquillian.container.test.api.{target_name}",
+                f"org.junit.runner.{target_name}",
             }
         else:
             allowed = (
@@ -5361,6 +5380,7 @@ def _find_soap_annotation(modifiers, source: bytes, imports: dict[str, str], tar
                 or imports.get("jakarta.xml.ws") == "jakarta.xml.ws.*"
                 or imports.get("javax.xml.bind.annotation") == "javax.xml.bind.annotation.*"
                 or imports.get("jakarta.xml.bind.annotation") == "jakarta.xml.bind.annotation.*"
+                or target_name in ("Addressing", "MTOM", "SecurityDomain", "Deployment", "RunWith")
             )
         if not allowed:
             continue
