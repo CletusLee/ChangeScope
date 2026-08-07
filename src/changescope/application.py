@@ -652,6 +652,61 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
     assumptions = [
         "Structural analysis asserts only explicit invocation syntax tied to the resolved target.",
     ]
+
+    connection = sqlite3.connect(database_path)
+    try:
+        class_qname = candidates[0].signature.split("#")[0]
+        soap_class_facts = connection.execute(
+            "SELECT kind, subject, target, value, path, start_line, end_line FROM soap_facts WHERE (kind IN ('java_endpoint', 'java_provider') AND subject = ?) OR (kind = 'java_method' AND subject = ?)",
+            (class_qname, candidates[0].signature),
+        ).fetchall()
+        if soap_class_facts:
+            m_simple = candidates[0].signature.split("#")[1].split("(")[0]
+            op_facts = connection.execute(
+                "SELECT subject, target, value, path, start_line, end_line FROM soap_facts WHERE kind = 'operation' AND subject = ?",
+                (m_simple,),
+            ).fetchall()
+            if op_facts:
+                w_op, w_pt, w_in, w_path, w_sl, w_el = op_facts[0]
+                w_handle = f"soap_wsdl:{w_path}:{w_sl}-{w_el}"
+                relationships = (
+                    ImpactRelationship(
+                        kind="soap_endpoint_implementation",
+                        caller=f"{w_pt}#{w_op}",
+                        path=Path(w_path),
+                        start_line=w_sl,
+                        end_line=w_el,
+                        evidence_handle=w_handle,
+                        evidence_chain=(w_handle, candidates[0].evidence_handle),
+                        confidence="high",
+                    ),
+                ) + relationships
+            else:
+                assumptions.append("Code-first Java endpoint metadata specifies a derived contract; deployed WSDL remains unverified.")
+                relationships = (
+                    ImpactRelationship(
+                        kind="soap_endpoint_implementation",
+                        caller=f"derived:{candidates[0].signature}",
+                        path=candidates[0].path,
+                        start_line=candidates[0].start_line,
+                        end_line=candidates[0].end_line,
+                        evidence_handle=candidates[0].evidence_handle,
+                        evidence_chain=(candidates[0].evidence_handle,),
+                        confidence="medium",
+                    ),
+                ) + relationships
+            if any(f[0] == "java_provider" for f in soap_class_facts):
+                unresolved_items.append(
+                    _unresolved(
+                        "WebServiceProvider endpoint payload-to-operation dispatch remains unresolved without WSDL contract evidence.",
+                        path=candidates[0].path,
+                        start_line=candidates[0].start_line,
+                        end_line=candidates[0].end_line,
+                        evidence_kind="declaration",
+                    )
+                )
+    finally:
+        connection.close()
     if request.profiles:
         assumptions.append(
             "Active Spring profiles: " + ", ".join(request.profiles) + "."
@@ -2574,6 +2629,10 @@ def _configuration_files(
         Path("src/test/resources"),
         Path("resources"),
         Path("config"),
+        Path("wsdl"),
+        Path("schema"),
+        Path("schemas"),
+        Path("."),
         *source_roots,
     ]
     indexed: dict[Path, bytes] = {}
@@ -5089,7 +5148,202 @@ def _analyze_soap_files(contents: dict[Path, bytes], root: Path) -> tuple[SOAPFa
             continue
         file_facts = _parse_soap_wsdl_or_xsd(rel_path, text, root, contents, visited_imports)
         facts.extend(file_facts)
+    facts.extend(_analyze_java_soap_files(contents))
+    facts.extend(_analyze_soap_descriptor_files(contents))
     return tuple(facts)
+
+
+def _analyze_java_soap_files(contents: dict[Path, bytes]) -> list[SOAPFact]:
+    facts: list[SOAPFact] = []
+    parser = Parser(Language(tree_sitter_java.language()))
+    for rel_path, raw_bytes in contents.items():
+        if rel_path.suffix.lower() != ".java":
+            continue
+        try:
+            tree = parser.parse(raw_bytes)
+            imports = _java_imports(raw_bytes, tree.root_node)
+            pkg_name = _package_name(tree.root_node, raw_bytes)
+            file_facts = _extract_java_soap_facts(rel_path, raw_bytes, tree.root_node, imports, pkg_name)
+            facts.extend(file_facts)
+        except Exception:
+            continue
+    return facts
+
+
+def _extract_java_soap_facts(
+    rel_path: Path,
+    source: bytes,
+    root_node,
+    imports: dict[str, str],
+    pkg_name: str,
+) -> list[SOAPFact]:
+    facts: list[SOAPFact] = []
+    type_kinds = {"class_declaration", "interface_declaration"}
+
+    def visit(node, enclosing_types: tuple[str, ...]) -> None:
+        if node.type in type_kinds:
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                type_name = _node_text(name_node, source)
+                current_types = enclosing_types + (type_name,)
+                qualified_name = f"{pkg_name}.{'.'.join(current_types)}" if pkg_name else ".".join(current_types)
+                modifiers = next((c for c in node.children if c.type == "modifiers"), None)
+
+                ws_anno = _find_soap_annotation(modifiers, source, imports, "WebService")
+                wsp_anno = _find_soap_annotation(modifiers, source, imports, "WebServiceProvider")
+                wf_anno = _find_soap_annotation(modifiers, source, imports, "WebFault")
+
+                start_line = node.start_point[0] + 1
+                end_line = node.end_point[0] + 1
+
+                if ws_anno is not None:
+                    sei = ws_anno.get("endpointInterface")
+                    ws_name = ws_anno.get("name") or type_name
+                    target_ns = ws_anno.get("targetNamespace") or (f"http://{pkg_name.split('.')[0]}.example.org/" if pkg_name else "")
+                    svc_name = ws_anno.get("serviceName") or f"{type_name}Service"
+                    port_name = ws_anno.get("portName") or f"{ws_name}Port"
+                    wsdl_loc = ws_anno.get("wsdlLocation")
+
+                    if sei and not (sei.startswith("javax.") or sei.startswith("jakarta.")):
+                        if "." not in sei and pkg_name:
+                            sei = f"{pkg_name}.{sei}"
+
+                    val_str = f"{ws_name}|{svc_name}|{port_name}|{wsdl_loc or ''}"
+                    facts.append(SOAPFact("java_endpoint", qualified_name, sei, val_str, rel_path, start_line, end_line, target_ns))
+
+                if wsp_anno is not None:
+                    target_ns = wsp_anno.get("targetNamespace") or ""
+                    svc_name = wsp_anno.get("serviceName") or ""
+                    port_name = wsp_anno.get("portName") or ""
+                    wsdl_loc = wsp_anno.get("wsdlLocation") or ""
+                    val_str = f"{svc_name}|{port_name}|{wsdl_loc}"
+                    facts.append(SOAPFact("java_provider", qualified_name, None, val_str, rel_path, start_line, end_line, target_ns))
+
+                if wf_anno is not None:
+                    wf_name = wf_anno.get("name") or type_name
+                    target_ns = wf_anno.get("targetNamespace") or ""
+                    facts.append(SOAPFact("java_fault", qualified_name, wf_name, target_ns, rel_path, start_line, end_line, target_ns))
+
+                body_node = node.child_by_field_name("body")
+                if body_node:
+                    for child in body_node.named_children:
+                        if child.type == "method_declaration":
+                            m_name_node = child.child_by_field_name("name")
+                            if m_name_node:
+                                m_name = _node_text(m_name_node, source)
+                                m_modifiers = next((c for c in child.children if c.type == "modifiers"), None)
+                                wm_anno = _find_soap_annotation(m_modifiers, source, imports, "WebMethod")
+                                oneway_anno = _find_soap_annotation(m_modifiers, source, imports, "Oneway")
+                                m_sl = child.start_point[0] + 1
+                                m_el = child.end_point[0] + 1
+
+                                if wm_anno and wm_anno.get("exclude") == "true":
+                                    continue
+
+                                op_name = (wm_anno.get("operationName") if wm_anno else None) or m_name
+                                action = wm_anno.get("action") if wm_anno else None
+
+                                target_ns = ws_anno.get("targetNamespace") if ws_anno else None
+
+                                if ws_anno is not None or wm_anno is not None or oneway_anno is not None:
+                                    facts.append(
+                                        SOAPFact(
+                                            "java_method",
+                                            f"{qualified_name}#{m_name}",
+                                            op_name,
+                                            f"{action or ''}|{'oneway' if oneway_anno else 'twoway'}",
+                                            rel_path,
+                                            m_sl,
+                                            m_el,
+                                            target_ns,
+                                        )
+                                    )
+
+        for child in node.named_children:
+            visit(child, enclosing_types if node.type not in type_kinds else current_types)
+
+    visit(root_node, ())
+    return facts
+
+
+def _find_soap_annotation(modifiers, source: bytes, imports: dict[str, str], target_name: str) -> dict[str, str] | None:
+    if modifiers is None:
+        return None
+    for annotation in modifiers.children:
+        if annotation.type not in {"marker_annotation", "annotation"}:
+            continue
+        name_node = annotation.child_by_field_name("name") or (annotation.named_children[0] if annotation.named_children else None)
+        if not name_node:
+            continue
+        name = _node_text(name_node, source)
+        simple_name = name.rsplit(".", 1)[-1]
+        if simple_name != target_name:
+            continue
+
+        imported = imports.get(simple_name)
+        if name.startswith(("javax.jws.", "jakarta.jws.", "javax.xml.ws.", "jakarta.xml.ws.")):
+            allowed = True
+        elif imported is not None:
+            allowed = imported in {
+                f"javax.jws.{target_name}",
+                f"jakarta.jws.{target_name}",
+                f"javax.jws.soap.{target_name}",
+                f"jakarta.jws.soap.{target_name}",
+                f"javax.xml.ws.{target_name}",
+                f"jakarta.xml.ws.{target_name}",
+            }
+        else:
+            allowed = (
+                imports.get("javax.jws") == "javax.jws.*"
+                or imports.get("jakarta.jws") == "jakarta.jws.*"
+                or imports.get("javax.xml.ws") == "javax.xml.ws.*"
+                or imports.get("jakarta.xml.ws") == "jakarta.xml.ws.*"
+            )
+        if not allowed:
+            continue
+
+        params: dict[str, str] = {}
+        if annotation.type == "annotation":
+            for child in annotation.named_children:
+                if child.type == "annotation_argument_list":
+                    for arg in child.named_children:
+                        if arg.type == "element_value_pair":
+                            k_node = arg.child_by_field_name("key") or (arg.named_children[0] if arg.named_children else None)
+                            v_node = arg.child_by_field_name("value") or (arg.named_children[1] if len(arg.named_children) > 1 else None)
+                            if k_node and v_node:
+                                key = _node_text(k_node, source).strip()
+                                val = _node_text(v_node, source).strip().strip('"').strip("'")
+                                params[key] = val
+                        elif arg.type in ("string_literal", "identifier"):
+                            params["value"] = _node_text(arg, source).strip().strip('"').strip("'")
+        return params
+    return None
+
+
+def _analyze_soap_descriptor_files(contents: dict[Path, bytes]) -> list[SOAPFact]:
+    facts: list[SOAPFact] = []
+    for rel_path, raw_bytes in contents.items():
+        name_lower = rel_path.name.lower()
+        if name_lower not in {"webservices.xml", "jboss-webservices.xml"}:
+            continue
+        try:
+            text = raw_bytes.decode("utf-8", errors="replace")
+            root_elem = ElementTree.fromstring(text)
+        except Exception:
+            continue
+
+        for pc in root_elem.iter():
+            if _xml_local_name(pc.tag) == "port-component":
+                pc_name = _xml_child_text(pc, "port-component-name")
+                sei = _xml_child_text(pc, "service-endpoint-interface")
+                impl_bean = None
+                for sib in pc:
+                    if _xml_local_name(sib.tag) == "service-impl-bean":
+                        impl_bean = _xml_child_text(sib, "servlet-link") or _xml_child_text(sib, "ejb-link")
+                line = _xml_descriptor_line(text, "port-component-name", pc_name) if pc_name else 1
+                if impl_bean:
+                    facts.append(SOAPFact("descriptor_endpoint", impl_bean, pc_name, f"{sei or ''}|{pc_name or ''}", rel_path, line, line))
+    return facts
 
 
 def _parse_soap_wsdl_or_xsd(
@@ -5100,6 +5354,10 @@ def _parse_soap_wsdl_or_xsd(
     visited_imports: set[Path],
 ) -> list[SOAPFact]:
     facts: list[SOAPFact] = []
+    if rel_path in visited_imports:
+        return facts
+    visited_imports.add(rel_path)
+
     try:
         elem_tree = ElementTree.fromstring(text)
     except ElementTree.ParseError:
@@ -5140,6 +5398,17 @@ def _parse_soap_wsdl_or_xsd(
                             facts.append(SOAPFact("import", location, imp_ns, "unresolvable_import", rel_path, line, line, target_namespace))
                         elif normalized_rel in contents or (root / normalized_rel).is_file():
                             facts.append(SOAPFact("import", location, imp_ns, "local_import", rel_path, line, line, target_namespace))
+                            if normalized_rel not in visited_imports:
+                                imp_bytes = contents.get(normalized_rel)
+                                if imp_bytes is None and (root / normalized_rel).is_file():
+                                    try:
+                                        imp_bytes = (root / normalized_rel).read_bytes()
+                                    except Exception:
+                                        imp_bytes = None
+                                if imp_bytes:
+                                    imp_text = imp_bytes.decode("utf-8", errors="replace")
+                                    nested_facts = _parse_soap_wsdl_or_xsd(normalized_rel, imp_text, root, contents, visited_imports)
+                                    facts.extend(nested_facts)
                         else:
                             facts.append(SOAPFact("import", location, imp_ns, "unresolvable_import", rel_path, line, line, target_namespace))
                     except Exception:
@@ -5151,46 +5420,35 @@ def _parse_soap_wsdl_or_xsd(
                 pt_qname = f"{{{target_namespace}}}{pt_name}" if target_namespace else pt_name
                 pt_line = _xml_descriptor_line(text, "portType", pt_name)
                 facts.append(SOAPFact("port_type", pt_qname, None, pt_name, rel_path, pt_line, pt_line, target_namespace))
-
                 for op in child:
                     if _xml_local_name(op.tag) == "operation":
                         op_name = op.get("name")
+                        op_line = _xml_descriptor_line(text, "operation", op_name)
                         if op_name:
-                            op_line = _xml_descriptor_line(text, "operation", op_name)
-                            in_msg = None
-                            out_msg = None
+                            facts.append(SOAPFact("operation", op_name, pt_qname, op_name, rel_path, op_line, op_line, target_namespace))
                             for sub in op:
-                                sub_tag = _xml_local_name(sub.tag)
-                                if sub_tag == "input":
-                                    in_msg = resolve_qname(sub.get("message"))
-                                elif sub_tag == "output":
-                                    out_msg = resolve_qname(sub.get("message"))
-                                elif sub_tag == "fault":
-                                    fault_msg = resolve_qname(sub.get("message"))
-                                    fault_name = sub.get("name")
-                                    facts.append(SOAPFact("operation_fault", op_name, pt_qname, fault_msg, rel_path, op_line, op_line, target_namespace))
-                            facts.append(SOAPFact("operation", op_name, pt_qname, in_msg, rel_path, op_line, op_line, target_namespace))
-                            facts.append(SOAPFact("operation_input", op_name, pt_qname, in_msg, rel_path, op_line, op_line, target_namespace))
-                            if out_msg:
-                                facts.append(SOAPFact("operation_output", op_name, pt_qname, out_msg, rel_path, op_line, op_line, target_namespace))
+                                sub_kind = _xml_local_name(sub.tag)
+                                if sub_kind in ("input", "output", "fault"):
+                                    msg_ref = resolve_qname(sub.get("message"))
+                                    facts.append(SOAPFact(f"operation_{sub_kind}", op_name, pt_qname, msg_ref, rel_path, op_line, op_line, target_namespace))
 
         elif tag_local == "message":
             msg_name = child.get("name")
             if msg_name:
                 msg_qname = f"{{{target_namespace}}}{msg_name}" if target_namespace else msg_name
-                msg_line = _xml_descriptor_line(text, "message", msg_name)
-                facts.append(SOAPFact("message", msg_qname, None, msg_name, rel_path, msg_line, msg_line, target_namespace))
+                m_line = _xml_descriptor_line(text, "message", msg_name)
+                facts.append(SOAPFact("message", msg_qname, None, msg_name, rel_path, m_line, m_line, target_namespace))
                 for part in child:
                     if _xml_local_name(part.tag) == "part":
-                        part_name = part.get("name")
-                        part_target = resolve_qname(part.get("element") or part.get("type"))
-                        facts.append(SOAPFact("message_part", msg_qname, part_target, part_name, rel_path, msg_line, msg_line, target_namespace))
+                        p_name = part.get("name")
+                        e_ref = resolve_qname(part.get("element") or part.get("type"))
+                        facts.append(SOAPFact("message_part", msg_qname, e_ref, p_name, rel_path, m_line, m_line, target_namespace))
 
         elif tag_local == "binding":
             binding_name = child.get("name")
+            pt_ref = resolve_qname(child.get("type"))
             if binding_name:
                 binding_qname = f"{{{target_namespace}}}{binding_name}" if target_namespace else binding_name
-                pt_ref = resolve_qname(child.get("type"))
                 b_line = _xml_descriptor_line(text, "binding", binding_name)
                 facts.append(SOAPFact("binding", binding_qname, pt_ref, binding_name, rel_path, b_line, b_line, target_namespace))
                 for b_op in child:
@@ -5246,6 +5504,197 @@ def _extract_namespaces(text: str) -> dict[str, str]:
     return namespaces
 
 
+def _soap_payload_relationships(
+    connection: sqlite3.Connection,
+    wsdl_path: str,
+    port_type_qname: str,
+    operation_name: str,
+) -> tuple[list[ImpactRelationship], list[UnresolvedItem]]:
+    relationships: list[ImpactRelationship] = []
+    unresolved_items: list[UnresolvedItem] = []
+
+    op_facts = connection.execute(
+        """SELECT kind, subject, target, value, path, start_line, end_line, namespace
+        FROM soap_facts WHERE kind IN ('operation_input', 'operation_output', 'operation_fault')
+        AND subject = ?""",
+        (operation_name,),
+    ).fetchall()
+
+    for row in op_facts:
+        f_kind, op_name, pt_ref, msg_qname, f_path, sl, el, ns = row
+        if not msg_qname:
+            continue
+        op_handle = f"soap_wsdl:{f_path}:{sl}-{el}"
+
+        msg_rows = connection.execute(
+            """SELECT subject, target, value, path, start_line, end_line
+            FROM soap_facts WHERE kind IN ('message', 'message_part') AND subject = ?""",
+            (msg_qname,),
+        ).fetchall()
+
+        for m_row in msg_rows:
+            m_subj, m_target, m_val, m_path, m_sl, m_el = m_row
+            m_handle = f"soap_wsdl:{m_path}:{m_sl}-{m_el}"
+            rel_kind = "soap_fault" if f_kind == "operation_fault" else "soap_payload"
+
+            relationships.append(
+                ImpactRelationship(
+                    kind=rel_kind,
+                    caller=m_subj,
+                    path=Path(m_path),
+                    start_line=m_sl,
+                    end_line=m_el,
+                    evidence_handle=m_handle,
+                    evidence_chain=(op_handle, m_handle),
+                    confidence="high",
+                )
+            )
+
+            if m_target:
+                elem_rows = connection.execute(
+                    """SELECT subject, target, value, path, start_line, end_line
+                    FROM soap_facts WHERE kind IN ('schema_element', 'schema_type') AND subject = ?""",
+                    (m_target,),
+                ).fetchall()
+
+                for e_row in elem_rows:
+                    e_subj, e_target, e_val, e_path, e_sl, e_el = e_row
+                    e_handle = f"soap_wsdl:{e_path}:{e_sl}-{e_el}"
+                    relationships.append(
+                        ImpactRelationship(
+                            kind=rel_kind,
+                            caller=e_subj,
+                            path=Path(e_path),
+                            start_line=e_sl,
+                            end_line=e_el,
+                            evidence_handle=e_handle,
+                            evidence_chain=(op_handle, m_handle, e_handle),
+                            confidence="high",
+                        )
+                    )
+
+    import_rows = connection.execute(
+        "SELECT subject, value, path, start_line, end_line FROM soap_facts WHERE kind = 'import' AND value IN ('remote_import', 'unresolvable_import')"
+    ).fetchall()
+    for imp_subj, imp_val, imp_path, imp_sl, imp_el in import_rows:
+        msg = f"Remote or unresolvable WSDL/XSD import location: {imp_subj}"
+        unresolved_items.append(
+            _unresolved(msg, path=Path(imp_path), start_line=imp_sl, end_line=imp_el, evidence_kind="soap_wsdl")
+        )
+
+    return relationships, unresolved_items
+
+
+def _soap_endpoint_relationships(
+    connection: sqlite3.Connection,
+    target_port_type: str,
+    target_operation: str,
+    resolved_op_row: tuple,
+    root: Path,
+    database_path: Path,
+) -> tuple[list[ImpactRelationship], list[UnresolvedItem]]:
+    relationships: list[ImpactRelationship] = []
+    unresolved_items: list[UnresolvedItem] = []
+
+    f_kind, op_name, pt_qname, in_msg, f_path, sl, el, ns = resolved_op_row
+    op_handle = f"soap_wsdl:{f_path}:{sl}-{el}"
+
+    java_methods = connection.execute(
+        "SELECT subject, target, value, path, start_line, end_line, namespace FROM soap_facts WHERE kind = 'java_method' AND target = ?",
+        (target_operation,),
+    ).fetchall()
+
+    for m_subj, m_target, m_val, m_path, m_sl, m_el, m_ns in java_methods:
+        class_qname, method_name = m_subj.rsplit("#", 1)
+
+        ep_rows = connection.execute(
+            "SELECT subject, target, value, path, start_line, end_line, namespace FROM soap_facts WHERE kind = 'java_endpoint' AND subject = ?",
+            (class_qname,),
+        ).fetchall()
+
+        sei_qname = ep_rows[0][1] if ep_rows else None
+        m_handle = f"declaration:{m_path}:{m_sl}-{m_el}"
+
+        relationships.append(
+            ImpactRelationship(
+                kind="soap_endpoint_implementation",
+                caller=m_subj,
+                path=Path(m_path),
+                start_line=m_sl,
+                end_line=m_el,
+                evidence_handle=m_handle,
+                evidence_chain=(op_handle, m_handle),
+                confidence="high",
+            )
+        )
+
+        if sei_qname:
+            sei_methods = connection.execute(
+                "SELECT path, start_line, end_line FROM soap_facts WHERE kind = 'java_method' AND subject LIKE ? AND target = ?",
+                (f"{sei_qname}#%", target_operation),
+            ).fetchall()
+            for s_path, s_sl, s_el in sei_methods:
+                s_handle = f"declaration:{s_path}:{s_sl}-{s_el}"
+                relationships.append(
+                    ImpactRelationship(
+                        kind="soap_container_dispatch",
+                        caller=f"{sei_qname}#{method_name}",
+                        path=Path(s_path),
+                        start_line=s_sl,
+                        end_line=s_el,
+                        evidence_handle=s_handle,
+                        evidence_chain=(op_handle, s_handle, m_handle),
+                        confidence="high",
+                    )
+                )
+
+        ejb_rows = connection.execute(
+            "SELECT kind, subject, target, value, path, start_line, end_line FROM ejb_facts WHERE subject = ? AND kind IN ('session_bean', 'stateless_bean')",
+            (class_qname,),
+        ).fetchall()
+
+        if ejb_rows:
+            target_item = ImpactTarget(m_subj, Path(m_path), m_sl, m_el, m_handle)
+            ejb_rels, ejb_unres = _direct_relationships(database_path, target_item)
+            for r in ejb_rels:
+                conf = "medium" if "caller" in r.kind or "callee" in r.kind else r.confidence
+                relationships.append(
+                    ImpactRelationship(
+                        kind=r.kind,
+                        caller=r.caller,
+                        path=r.path,
+                        start_line=r.start_line,
+                        end_line=r.end_line,
+                        evidence_handle=r.evidence_handle,
+                        evidence_chain=(op_handle, *r.evidence_chain),
+                        confidence=conf,
+                        profile=r.profile,
+                        business_view=r.business_view,
+                    )
+                )
+            unresolved_items.extend(ejb_unres)
+
+    desc_rows = connection.execute(
+        "SELECT subject, target, value, path, start_line, end_line FROM soap_facts WHERE kind = 'descriptor_endpoint'"
+    ).fetchall()
+    for d_subj, d_target, d_val, d_path, d_sl, d_el in desc_rows:
+        d_handle = f"soap_wsdl:{d_path}:{d_sl}-{d_el}"
+        relationships.append(
+            ImpactRelationship(
+                kind="soap_configuration",
+                caller=d_subj,
+                path=Path(d_path),
+                start_line=d_sl,
+                end_line=d_el,
+                evidence_handle=d_handle,
+                evidence_chain=(op_handle, d_handle),
+                confidence="medium",
+            )
+        )
+
+    return relationships, unresolved_items
+
+
 def _impact_soap_repository(request: ImpactRequest, root: Path, database_path: Path) -> ImpactResult:
     connection = sqlite3.connect(database_path)
     try:
@@ -5290,18 +5739,12 @@ def _impact_soap_repository(request: ImpactRequest, root: Path, database_path: P
             return ImpactResult("ambiguous", target_name_str, None, candidates, (), (), (), snapshot)
 
         resolved_row = matched_rows[0]
-        f_kind, f_subject, f_target, f_value, f_path, f_start_line, f_end_line, f_namespace = resolved_row
-        target = candidates[0]
 
-        import_rows = connection.execute(
-            "SELECT subject, value, path, start_line, end_line FROM soap_facts WHERE kind = 'import' AND value IN ('remote_import', 'unresolvable_import')"
-        ).fetchall()
-        unresolved_items = []
-        for imp_subj, imp_val, imp_path, imp_sl, imp_el in import_rows:
-            msg = f"Remote or unresolvable WSDL/XSD import location: {imp_subj}"
-            unresolved_items.append(
-                _unresolved(msg, path=Path(imp_path), start_line=imp_sl, end_line=imp_el, evidence_kind="soap_wsdl")
-            )
+        payload_rels, payload_unresolved = _soap_payload_relationships(connection, wsdl_rel_path, target_port_type, target_operation)
+        endpoint_rels, endpoint_unresolved = _soap_endpoint_relationships(connection, target_port_type, target_operation, resolved_row, root, database_path)
+
+        all_rels = payload_rels + endpoint_rels
+        all_unresolved = payload_unresolved + endpoint_unresolved
 
         assumptions = (
             "SOAP analysis ground truth is established by repository-local WSDL 1.1 and XML Schema contract evidence.",
@@ -5311,11 +5754,11 @@ def _impact_soap_repository(request: ImpactRequest, root: Path, database_path: P
         return ImpactResult(
             "resolved",
             target_name_str,
-            target,
+            candidates[0],
             (),
-            (),
+            tuple(all_rels),
             assumptions,
-            tuple(unresolved_items),
+            tuple(all_unresolved),
             snapshot,
         )
     finally:
