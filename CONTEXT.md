@@ -5,7 +5,7 @@ ChangeScope explains the impact of a proposed code change before implementation 
 ## Language
 
 **Change Target**:
-The code element, API, or contract that a requested analysis treats as changed. In the first Java slice, a user may identify it as `Class#method`; if this matches multiple methods, the report records an ambiguity instead of selecting one.
+The code element, API, or contract that a requested analysis treats as changed. Java methods and the first VB.NET `Sub` or `Function` targets use `Class#member`; if this matches multiple members, the report records an ambiguity instead of selecting one.
 _Avoid_: Search query, changed file
 
 **Repository Index**:
@@ -27,6 +27,50 @@ _Avoid_: Live remote analysis, production discovery
 **Structural Java Analysis**:
 The JRE-free analysis of Java source using Tree-sitter from Python. It produces syntax and source-location evidence for declarations, invocations, imports, and annotations, but does not claim complete type, overload, classpath, or virtual-dispatch resolution.
 _Avoid_: Full semantic resolution
+
+**VB.NET 2003 WinForms Application Analysis**:
+The repository-local structural analysis of .NET Framework 1.1-era Visual Basic Windows Forms applications. It treats forms, controls, event wiring, handlers, business calls, configuration, and tests as one impact path without claiming that the application builds or runs.
+_Avoid_: VB6 analysis, generic Visual Basic support, runtime UI automation
+
+**Runtime-free VB.NET Analysis**:
+The analysis of VB.NET source, project files, designer evidence, resources, configuration, and local metadata without requiring Visual Studio, the .NET Framework, a compiler, MSBuild, application execution, or COM registration. Optional future build evidence may strengthen conclusions but is not a prerequisite.
+_Avoid_: Compiled semantic analysis, runtime inspection
+
+**VB.NET WinForms Local Impact Path**:
+The evidence-backed path from a WinForms control event through its handler and business calls to relevant application configuration, ADO.NET data-access boundaries, stored-procedure references, and tests within one repository.
+_Avoid_: Runtime UI trace, verified database execution
+
+**VB.NET Data Access Boundary**:
+Explicit local ADO.NET evidence that identifies a provider, connection-configuration key, command text, stored-procedure name, or parameter binding reached by the analyzed code. A matching repository-local SQL definition may strengthen the evidence, but the boundary does not claim complete procedure, table, trigger, dynamic-SQL, or runtime database impact.
+_Avoid_: Database dependency graph, verified SQL execution
+
+**COM Interop Boundary**:
+Repository-local VB.NET project, designer, type, and invocation evidence that identifies entry into a referenced COM or ActiveX component. Explicit early-bound interop calls may be reported, while `CreateObject`, `GetObject`, late binding, and behavior inside DLL or OCX binaries remain unresolved unless stronger local metadata proves a target.
+_Avoid_: Decompiled component behavior, name-matched COM call
+
+**Local Process Boundary**:
+Evidence that one locally indexed executable application launches another through an explicit process-start operation. A launch is connected to a target only when project output identity and the launch evidence establish a unique match; a Form or similarly named executable alone does not establish a process boundary.
+_Avoid_: Form navigation, executable-name guess, deployed process state
+
+**External Process Boundary**:
+An explicit process launch whose target executable cannot be uniquely resolved within the current repository or solution. The report retains its launch evidence and may expose a Registered Workspace candidate, but the first VB.NET capability does not automatically continue into another repository.
+_Avoid_: Missing call, verified cross-repository link
+
+**Manual Verification Surface**:
+An affected Form, control event, process launch, or external boundary that identifies where an engineer should manually verify a change when automated test evidence is absent or incomplete. It is reported separately and never represented as a test or proof of successful execution.
+_Avoid_: Manual test result, automated test evidence
+
+**WinForms Event Binding**:
+Source or designer evidence that connects a WinForms control event to a VB.NET handler through constructs such as `WithEvents`, `Handles`, or `AddHandler`. It is a first-class impact relationship rather than an ordinary direct method call.
+_Avoid_: Button-name match, runtime event dispatch
+
+**Source-controlled WinForms Designer Evidence**:
+WinForms designer-authored VB.NET source and `.resx` content committed within a repository's authoritative source tree. It participates in impact analysis with its generated provenance retained; `bin`, `obj`, and other build outputs remain non-authoritative.
+_Avoid_: Build output, disposable generated artifact
+
+**VB.NET Late-Bound Call**:
+A VB.NET invocation whose receiver type cannot be established from local structural evidence, including calls through `Object` under `Option Strict Off`. It remains an Unresolved Item while explicitly typed calls in the same file may still produce evidence-backed relationships.
+_Avoid_: Name-matched call, file-wide uncertainty
 
 **Confidence**:
 The strength of the evidence supporting a reported relationship. High means an unambiguous declaration and explicit indexed invocation; medium means strong structural evidence with an unresolved type, overload, or generated/framework detail; low means plausible but incomplete or non-unique evidence; unresolved means no specific relationship is asserted.
@@ -171,6 +215,26 @@ _Avoid_: Build output, opaque generated code
 **Workspace Catalog**:
 The authoritative local catalog of registered repositories, logical contract identities, verified cross-repository relationships, and their analysis provenance. It does not become a copy of application source code.
 _Avoid_: Architecture diagram, source mirror
+
+**Registered Workspace**:
+The bounded set of local repositories eligible for Workspace Reconciliation, identified through an explicitly selected workspace root or manifest. ChangeScope does not discover repositories by scanning an entire machine, company network, or remote source host.
+_Avoid_: Filesystem-wide scan, organization-wide discovery
+
+**Workspace Reconciliation**:
+The comparison of contract identities across registered Repository Index snapshots to maintain cross-repository relationships separately from repository indexing. An exact, unique contract identity may be linked automatically; incomplete or non-unique evidence remains a candidate for confirmation.
+_Avoid_: Repository indexing, manual mapping of every relationship
+
+**Verified Cross-Repository Link**:
+An evidence-backed mapping between registered repositories established by an exact, unique contract identity or explicit human confirmation. It permits code-level impact analysis to continue into another repository but does not prove that deployed instances communicate.
+_Avoid_: Production connection, name match, URL match
+
+**Contract Match Candidate**:
+A possible cross-repository relationship supported by meaningful but incomplete or non-unique contract evidence. It requires confirmation before analysis may traverse it; similar names, routes, or URLs alone do not qualify.
+_Avoid_: Verified link, guessed dependency
+
+**Deployment Reachability**:
+The environment-specific fact that one deployed application is routed to another deployed application through its effective configuration and infrastructure. A Verified Cross-Repository Link does not establish Deployment Reachability.
+_Avoid_: Repository relationship, contract compatibility
 
 **Declared Dependency**:
 An application or API relationship supplied by a catalog such as Backstage. It is useful context but is not proof of a code-level relationship until ChangeScope verifies it with evidence.

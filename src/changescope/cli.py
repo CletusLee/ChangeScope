@@ -177,8 +177,12 @@ def _render_index_result(result: IndexResult, output_format: str) -> None:
     print(f"Indexed repository: {report['snapshot']['repository_root']}")
     print(f"Source roots: {', '.join(report['source_roots']) or 'none'}")
     print(f"Indexed Java files: {len(report['indexed_files'])}")
+    if report.get("vbnet_files"):
+        print(f"Indexed VB.NET files: {len(report['vbnet_files'])}")
     print(f"Indexed configuration files: {len(report['configuration_files'])}")
     print(f"Java declarations: {report['declaration_count']}")
+    if report.get("vbnet_declaration_count"):
+        print(f"VB.NET declarations: {report['vbnet_declaration_count']}")
     print(f"Explicit invocation evidence: {report['invocation_count']}")
     print(f"Spring Configuration Evidence: {report['spring_configuration_evidence_count']}")
     print(f"Quarkus Build Evidence: {report['quarkus_build_evidence_count']}")
@@ -186,6 +190,10 @@ def _render_index_result(result: IndexResult, output_format: str) -> None:
     print("Included Java files:")
     for path in report["indexed_files"]:
         print(f"- {path}")
+    if report.get("vbnet_files"):
+        print("Included VB.NET files:")
+        for path in report["vbnet_files"]:
+            print(f"- {path}")
     if report["configuration_files"]:
         print("Included configuration files:")
         for path in report["configuration_files"]:
@@ -206,11 +214,15 @@ def _index_report(result: IndexResult) -> dict[str, object]:
     return {
         "source_roots": [_report_path(path) for path in result.source_roots],
         "indexed_files": [_report_path(path) for path in result.indexed_files],
+        "vbnet_files": [_report_path(path) for path in getattr(result, "vbnet_files", ())],
         "configuration_files": [_report_path(path) for path in result.configuration_files],
         "excluded_directories": [_report_path(path) for path in result.excluded_directories],
         "read_failures": [_report_path(path) for path in result.read_failures],
         "declaration_count": len(result.declarations),
         "invocation_count": len(result.invocations),
+        "vbnet_declaration_count": len(getattr(result, "vbnet_declarations", ())),
+        "vbnet_invocation_count": len(getattr(result, "vbnet_invocations", ())),
+        "vbnet_fact_count": len(getattr(result, "vbnet_facts", ())),
         "spring_configuration_evidence_count": len(result.spring_facts),
         "quarkus_build_evidence_count": len(result.quarkus_build_facts),
         "quarkus_configuration_evidence_count": len(result.quarkus_config_facts),
@@ -309,6 +321,10 @@ def _render_impact_result(result: ImpactResult, output_format: str) -> None:
     for item in report["unresolved_items"]:
         evidence = f" {item['evidence_handle']}" if item["evidence_handle"] else ""
         print(f"- {item['message']}{evidence}")
+    if report.get("manual_verification_surfaces"):
+        print("Manual verification surfaces:")
+        for surface in report["manual_verification_surfaces"]:
+            print(f"- {surface['description']} [{surface['kind']}] {surface['evidence_handle']}")
     if report["snapshot"] is not None:
         snapshot = report["snapshot"]
         print(
@@ -350,6 +366,17 @@ def _impact_report(result: ImpactResult) -> dict[str, object]:
                 "evidence_handle": item.evidence_handle,
             }
             for item in result.unresolved_items
+        ],
+        "manual_verification_surfaces": [
+            {
+                "kind": surface.kind,
+                "description": surface.description,
+                "path": _report_path(surface.path),
+                "start_line": surface.start_line,
+                "end_line": surface.end_line,
+                "evidence_handle": surface.evidence_handle,
+            }
+            for surface in getattr(result, "manual_verification_surfaces", ())
         ],
         "snapshot": _snapshot_report(result.snapshot),
     }

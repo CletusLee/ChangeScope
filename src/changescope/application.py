@@ -63,6 +63,7 @@ class JavaDeclaration:
     end_line: int
     is_test: bool
     is_private: bool
+    language: str = "java"
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,56 @@ class JavaInvocation:
     end_line: int
     is_test: bool
     argument_count: int | None = None
+    language: str = "java"
+
+
+@dataclass(frozen=True)
+class VBNETDeclaration:
+    kind: str
+    name: str
+    qualified_name: str
+    signature: str
+    path: Path
+    start_line: int
+    end_line: int
+    is_test: bool
+    is_private: bool
+    language: str = "vbnet"
+
+
+@dataclass(frozen=True)
+class VBNETInvocation:
+    name: str
+    receiver: str | None
+    caller: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    is_test: bool
+    argument_count: int | None = None
+    language: str = "vbnet"
+
+
+@dataclass(frozen=True)
+class VBNETFact:
+    kind: str
+    subject: str
+    target: str | None
+    value: str | None
+    path: Path
+    start_line: int
+    end_line: int
+    extra_info: str | None = None
+
+
+@dataclass(frozen=True)
+class ManualVerificationSurface:
+    kind: str
+    description: str
+    path: Path
+    start_line: int
+    end_line: int
+    evidence_handle: str
 
 
 @dataclass(frozen=True)
@@ -252,6 +303,10 @@ class IndexResult:
     quarkus_native_facts: tuple[QuarkusNativeFact, ...] = ()
     quarkus_boundary_facts: tuple[QuarkusBoundaryFact, ...] = ()
     soap_facts: tuple[SOAPFact, ...] = ()
+    vbnet_declarations: tuple[VBNETDeclaration, ...] = ()
+    vbnet_invocations: tuple[VBNETInvocation, ...] = ()
+    vbnet_facts: tuple[VBNETFact, ...] = ()
+    vbnet_files: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -309,6 +364,7 @@ class ImpactTarget:
     start_line: int
     end_line: int
     evidence_handle: str
+    language: str = "java"
 
 
 @dataclass(frozen=True)
@@ -324,6 +380,7 @@ class ImpactRelationship:
     profile: str | None = None
     evidence_chain: tuple[str, ...] = ()
     business_view: str | None = None
+    language: str = "java"
 
     def __post_init__(self) -> None:
         if not self.evidence_chain:
@@ -349,6 +406,7 @@ class ImpactResult:
     assumptions: tuple[str, ...]
     unresolved_items: tuple[UnresolvedItem, ...]
     snapshot: IndexSnapshot | None
+    manual_verification_surfaces: tuple[ManualVerificationSurface, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -434,7 +492,7 @@ class ChangeScopeApplication:
 
 
 def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
-    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|source|quarkus_build|quarkus_config|quarkus_cdi|quarkus_rest|quarkus_route|quarkus_security|quarkus_test|quarkus_native|quarkus_boundary|soap_wsdl):(.+):(\d+)-(\d+)", request.evidence_handle)
+    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|source|quarkus_build|quarkus_config|quarkus_cdi|quarkus_rest|quarkus_route|quarkus_security|quarkus_test|quarkus_native|quarkus_boundary|soap_wsdl|vbnet_declaration|vbnet_invocation|vbnet_fact|vbnet_surface):(.+):(\d+)-(\d+)", request.evidence_handle)
     if match is None:
         raise ValueError("Evidence handles must use kind:path:start-end form.")
     path = _validate_relative_path(Path(match.group(1)))
@@ -486,6 +544,15 @@ def _enclosing_symbol_range(root: Path, path: Path, start_line: int, end_line: i
             ORDER BY end_line - start_line, start_line LIMIT 1""",
             (str(path), start_line, end_line),
         ).fetchone()
+        if not row:
+            vb_has_table = connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vbnet_declarations'").fetchone() is not None
+            if vb_has_table:
+                row = connection.execute(
+                    """SELECT start_line, end_line FROM vbnet_declarations
+                    WHERE path = ? AND start_line <= ? AND end_line >= ?
+                    ORDER BY end_line - start_line, start_line LIMIT 1""",
+                    (str(path), start_line, end_line),
+                ).fetchone()
     finally:
         connection.close()
     return (row[0], row[1]) if row else None
@@ -498,7 +565,8 @@ def _read_bounded_source(
     if max_characters < 1:
         raise ValueError("The source size budget must be at least one character.")
     source_path = _resolve_indexed_source(root, path)
-    lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    text_content, _ = _read_file_text_with_encoding(source_path)
+    lines = text_content.splitlines(keepends=True)
     if start_line > len(lines):
         raise ValueError("The source range starts beyond the end of the file.")
     end_line = min(end_line, len(lines))
@@ -534,7 +602,8 @@ def _resolve_indexed_source(root: Path, path: Path) -> Path:
     connection = sqlite3.connect(database_path)
     try:
         row = connection.execute(
-            "SELECT 1 FROM source_files WHERE path = ? AND status = 'indexed'", (str(path),)
+            "SELECT 1 FROM source_files WHERE (path = ? OR path = ? OR path = ?) AND status = 'indexed'",
+            (str(path), path.as_posix(), str(path).replace("/", "\\")),
         ).fetchone()
     finally:
         connection.close()
@@ -593,6 +662,21 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
                 snapshot,
             )
         return _impact_soap_repository(request, root, database_path)
+
+    connection = sqlite3.connect(database_path)
+    try:
+        vb_has_table = connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vbnet_declarations'").fetchone() is not None
+        if vb_has_table:
+            target_lower = request.target.lower()
+            vb_decls = connection.execute(
+                "SELECT signature FROM vbnet_declarations WHERE LOWER(signature) = ? OR LOWER(name) = ? OR LOWER(qualified_name) = ?",
+                (target_lower, target_lower, target_lower),
+            ).fetchall()
+            if vb_decls:
+                snapshot = _read_index_snapshot(connection, root)
+                return _analyze_vbnet_impact(request, connection, snapshot)
+    finally:
+        connection.close()
 
     target_parts = request.target.split("#")
     if len(target_parts) != 2 or not all(target_parts):
@@ -2191,6 +2275,10 @@ def _index_repository(repository_root: Path) -> IndexResult:
     declarations, invocations, parse_failures = _analyze_java_files(
         contents_by_path, _test_source_roots(root, source_roots)
     )
+    vbnet_files, vbnet_read_failures, vbnet_contents = _discover_vbnet_files(root)
+    vbnet_declarations, vbnet_invocations, vbnet_facts, vbnet_parse_failures = _analyze_vbnet_files(
+        root, vbnet_files, vbnet_contents
+    )
     spring_facts = _analyze_spring_files(
         {**contents_by_path, **configuration_contents}, declarations
     )
@@ -2226,12 +2314,12 @@ def _index_repository(repository_root: Path) -> IndexResult:
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
-        indexed_files=indexed_files,
+        indexed_files=tuple(sorted(dict.fromkeys((*indexed_files, *vbnet_files)), key=str)),
         excluded_directories=excluded_directories,
-        read_failures=tuple(sorted(set(read_failures) | set(configuration_read_failures), key=str)),
+        read_failures=tuple(sorted(set(read_failures) | set(configuration_read_failures) | set(vbnet_read_failures), key=str)),
         declarations=declarations,
         invocations=invocations,
-        parse_failures=parse_failures,
+        parse_failures=tuple(sorted(set(parse_failures) | set(vbnet_parse_failures), key=lambda p: (str(p.path), p.start_line))),
         snapshot=snapshot,
         spring_facts=spring_facts,
         ejb_facts=ejb_facts,
@@ -2246,6 +2334,10 @@ def _index_repository(repository_root: Path) -> IndexResult:
         quarkus_native_facts=quarkus_native_facts,
         quarkus_boundary_facts=quarkus_boundary_facts,
         soap_facts=soap_facts,
+        vbnet_declarations=vbnet_declarations,
+        vbnet_invocations=vbnet_invocations,
+        vbnet_facts=vbnet_facts,
+        vbnet_files=vbnet_files,
     )
     _write_index(result)
     return result
@@ -4432,8 +4524,11 @@ def _replace_index_contents(
     connection.execute("DELETE FROM quarkus_native_facts")
     connection.execute("DELETE FROM quarkus_boundary_facts")
     connection.execute("DELETE FROM soap_facts")
+    connection.execute("DELETE FROM vbnet_declarations")
+    connection.execute("DELETE FROM vbnet_invocations")
+    connection.execute("DELETE FROM vbnet_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
-    indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *result.configuration_files)))
+    indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *getattr(result, "vbnet_files", ()), *result.configuration_files)))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         (
@@ -4458,6 +4553,12 @@ def _replace_index_contents(
     _insert_quarkus_native_facts(connection, result.quarkus_native_facts)
     _insert_quarkus_boundary_facts(connection, result.quarkus_boundary_facts)
     _insert_soap_facts(connection, result.soap_facts)
+    _insert_vbnet_facts(
+        connection,
+        getattr(result, "vbnet_declarations", ()),
+        getattr(result, "vbnet_invocations", ()),
+        getattr(result, "vbnet_facts", ()),
+    )
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
@@ -4484,6 +4585,9 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
     ).fetchone() is None
     soap_schema_missing = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'soap_facts'"
+    ).fetchone() is None
+    vbnet_schema_missing = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vbnet_declarations'"
     ).fetchone() is None
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -4668,6 +4772,45 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         namespace TEXT
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS vbnet_declarations (
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        qualified_name TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        is_test INTEGER NOT NULL,
+        is_private INTEGER NOT NULL DEFAULT 0,
+        language TEXT NOT NULL DEFAULT 'vbnet'
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS vbnet_invocations (
+        name TEXT NOT NULL,
+        receiver TEXT,
+        caller TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        is_test INTEGER NOT NULL,
+        argument_count INTEGER,
+        language TEXT NOT NULL DEFAULT 'vbnet'
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS vbnet_facts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        target TEXT,
+        value TEXT,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        extra_info TEXT
+        )"""
+    )
     declaration_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
     }
@@ -4704,6 +4847,7 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         or quarkus_rest_schema_missing
         or quarkus_route_schema_missing
         or soap_schema_missing
+        or vbnet_schema_missing
     )
 
 
@@ -10172,3 +10316,801 @@ def _catalog_resolve_mapping(request: CatalogResolveMappingRequest) -> CatalogRe
         return CatalogResult("resolved", mapping=resolved_mapping, snapshot=current_target_snapshot)
     finally:
         conn.close()
+
+
+def _insert_vbnet_facts(
+    connection: sqlite3.Connection,
+    declarations: tuple[VBNETDeclaration, ...],
+    invocations: tuple[VBNETInvocation, ...],
+    facts: tuple[VBNETFact, ...],
+) -> None:
+    connection.executemany(
+        """INSERT INTO vbnet_declarations(
+        kind, name, qualified_name, signature, path, start_line, end_line, is_test, is_private, language
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                d.kind, d.name, d.qualified_name, d.signature, str(d.path),
+                d.start_line, d.end_line, int(d.is_test), int(d.is_private), getattr(d, "language", "vbnet"),
+            )
+            for d in declarations
+        ),
+    )
+    connection.executemany(
+        """INSERT INTO vbnet_invocations(
+        name, receiver, caller, path, start_line, end_line, is_test, argument_count, language
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                i.name, i.receiver, i.caller, str(i.path), i.start_line, i.end_line,
+                int(i.is_test), i.argument_count, getattr(i, "language", "vbnet"),
+            )
+            for i in invocations
+        ),
+    )
+    connection.executemany(
+        """INSERT INTO vbnet_facts(
+        kind, subject, target, value, path, start_line, end_line, extra_info
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                f.kind, f.subject, f.target, f.value, str(f.path), f.start_line, f.end_line, f.extra_info,
+            )
+            for f in facts
+        ),
+    )
+
+
+def _read_file_text_with_encoding(path: Path) -> tuple[str, str | None]:
+    raw = path.read_bytes()
+    for enc in ("utf-8-sig", "utf-16", "cp950", "cp1252"):
+        try:
+            text = raw.decode(enc).replace("\r\n", "\n").replace("\r", "\n")
+            return text, None
+        except UnicodeDecodeError:
+            pass
+    return "", "Encoding decode failure"
+
+
+def _discover_vbnet_files(root: Path) -> tuple[tuple[Path, ...], tuple[Path, ...], dict[Path, str]]:
+    indexed_files: list[Path] = []
+    read_failures: list[Path] = []
+    contents_by_path: dict[Path, str] = {}
+
+    vb_extensions = {".vb", ".vbproj", ".sln", ".resx", ".config", ".sql"}
+    for current_dir, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRECTORY_NAMES]
+        rel_dir = Path(current_dir).relative_to(root)
+        for filename in filenames:
+            file_path = rel_dir / filename
+            ext = file_path.suffix.lower()
+            if ext in vb_extensions or filename.lower() in {"app.config", "web.config"}:
+                full_path = root / file_path
+                content, err = _read_file_text_with_encoding(full_path)
+                if err:
+                    read_failures.append(file_path)
+                else:
+                    indexed_files.append(file_path)
+                    contents_by_path[file_path] = content
+
+    return tuple(sorted(indexed_files, key=str)), tuple(sorted(read_failures, key=str)), contents_by_path
+
+
+def _analyze_vbnet_files(
+    root: Path,
+    indexed_files: tuple[Path, ...],
+    contents_by_path: dict[Path, str],
+) -> tuple[tuple[VBNETDeclaration, ...], tuple[VBNETInvocation, ...], tuple[VBNETFact, ...], tuple[ParseFailure, ...]]:
+    declarations: list[VBNETDeclaration] = []
+    invocations: list[VBNETInvocation] = []
+    facts: list[VBNETFact] = []
+    parse_failures: list[ParseFailure] = []
+
+    for path in indexed_files:
+        content = contents_by_path.get(path, "")
+        ext = path.suffix.lower()
+        if ext == ".vb":
+            decls, invs, fcts, errs = _parse_vb_source_file(path, content)
+            declarations.extend(decls)
+            invocations.extend(invs)
+            facts.extend(fcts)
+            parse_failures.extend(errs)
+        elif ext == ".vbproj":
+            facts.extend(_parse_vbproj_content(path, content))
+        elif ext == ".sln":
+            facts.extend(_parse_sln_content(path, content))
+        elif ext == ".resx":
+            facts.extend(_parse_resx_content(path, content))
+        elif ext == ".config" or path.name.lower() in {"app.config", "web.config"}:
+            facts.extend(_parse_config_content(path, content))
+        elif ext == ".sql":
+            facts.extend(_parse_sql_content(path, content))
+
+    return (
+        tuple(declarations),
+        tuple(invocations),
+        tuple(facts),
+        tuple(parse_failures),
+    )
+
+
+def _parse_vb_source_file(
+    path: Path, content: str
+) -> tuple[list[VBNETDeclaration], list[VBNETInvocation], list[VBNETFact], list[ParseFailure]]:
+    declarations: list[VBNETDeclaration] = []
+    invocations: list[VBNETInvocation] = []
+    facts: list[VBNETFact] = []
+    parse_failures: list[ParseFailure] = []
+
+    lines = content.splitlines()
+    is_test_file = "test" in path.name.lower() or "tests" in path.name.lower()
+
+    processed_lines: list[tuple[int, str]] = []
+    idx = 0
+    while idx < len(lines):
+        orig_line_no = idx + 1
+        current_line = lines[idx]
+        while current_line.rstrip().endswith(" _") and idx + 1 < len(lines):
+            idx += 1
+            current_line = current_line.rstrip()[:-2] + " " + lines[idx].lstrip()
+        processed_lines.append((orig_line_no, current_line))
+        idx += 1
+
+    scope_stack: list[str] = []
+    current_method_name: str | None = None
+    current_method_is_test: bool = is_test_file
+    in_designer_region: bool = False
+    in_option_strict_off: bool = False
+    pending_attributes: list[str] = []
+
+    for orig_line_no, raw_line in processed_lines:
+        line = raw_line.strip()
+        if not line or line.startswith("'") or line.lower().startswith("rem "):
+            continue
+
+        if re.match(r"(?i)^option\s+strict\s+off\b", line):
+            in_option_strict_off = True
+            continue
+
+        if re.match(r"(?i)^#region\s+[\"'].*designer.*[\"']", line):
+            in_designer_region = True
+            facts.append(VBNETFact(kind="designer_provenance", subject="designer_region_start", target=None, value=line, path=path, start_line=orig_line_no, end_line=orig_line_no))
+            continue
+        elif re.match(r"(?i)^#end\s+region\b", line):
+            in_designer_region = False
+            facts.append(VBNETFact(kind="designer_provenance", subject="designer_region_end", target=None, value=line, path=path, start_line=orig_line_no, end_line=orig_line_no))
+            continue
+
+        if line.startswith("#"):
+            continue
+
+        attr_match = re.findall(r"<([A-Za-z0-9_]+)(?:\(.*?\))?>", line)
+        if attr_match:
+            pending_attributes.extend(attr_match)
+
+        type_match = re.match(r"(?i)^(?:public|private|protected|friend|mustinherit|notinheritable|partial|\s)*\s*(class|module|structure|interface)\s+([a-z0-9_\[\]]+)", line)
+        if type_match:
+            kind = type_match.group(1).lower()
+            name = type_match.group(2).strip("[]")
+            scope_stack.append(name)
+            qual_name = ".".join(scope_stack)
+            decl = VBNETDeclaration(
+                kind=kind,
+                name=name,
+                qualified_name=qual_name,
+                signature=qual_name,
+                path=path,
+                start_line=orig_line_no,
+                end_line=orig_line_no,
+                is_test=is_test_file or any("test" in a.lower() for a in pending_attributes),
+                is_private="private" in line.lower(),
+            )
+            declarations.append(decl)
+            pending_attributes.clear()
+            continue
+
+        if re.match(r"(?i)^end\s+(class|module|structure|interface)\b", line):
+            if scope_stack:
+                scope_stack.pop()
+            continue
+
+        withevents_match = re.match(r"(?i)^(?:private|public|protected|friend|\s)*\s*withevents\s+([a-z0-9_\[\]]+)\s+as\s+([a-z0-9_\[\]\.]+)", line)
+        if withevents_match:
+            field_name = withevents_match.group(1).strip("[]")
+            field_type = withevents_match.group(2).strip("[]")
+            owner_class = scope_stack[-1] if scope_stack else "Global"
+            facts.append(VBNETFact(
+                kind="withevents_field",
+                subject=f"{owner_class}.{field_name}",
+                target=field_type,
+                value=field_type,
+                path=path,
+                start_line=orig_line_no,
+                end_line=orig_line_no,
+            ))
+            continue
+
+        method_match = re.match(r"(?i)^(?:public|private|protected|friend|shared|mustoverride|overridable|overrides|shadows|withevents|optional|\s)*\s*(sub|function|property)\s+([a-z0-9_\[\]]+)(?:\s*\((.*?)\))?(?:\s+as\s+([a-z0-9_\[\]\.]+))?(?:\s+handles\s+(.*?))?$", line)
+        if method_match:
+            m_kind = method_match.group(1).lower()
+            m_name = method_match.group(2).strip("[]")
+            handles_clause = method_match.group(5)
+            owner_class = scope_stack[-1] if scope_stack else "Global"
+            sig = f"{owner_class}#{m_name}"
+            current_method_name = sig
+            current_method_is_test = is_test_file or any("test" in a.lower() for a in pending_attributes)
+            var_type_map = {}
+
+            decl = VBNETDeclaration(
+                kind=m_kind,
+                name=m_name,
+                qualified_name=f"{owner_class}.{m_name}",
+                signature=sig,
+                path=path,
+                start_line=orig_line_no,
+                end_line=orig_line_no,
+                is_test=current_method_is_test,
+                is_private="private" in line.lower(),
+            )
+            declarations.append(decl)
+            pending_attributes.clear()
+
+            if in_designer_region or m_name.lower() == "initializecomponent":
+                facts.append(VBNETFact(
+                    kind="designer_provenance",
+                    subject=sig,
+                    target=None,
+                    value="InitializeComponent" if m_name.lower() == "initializecomponent" else "designer_region",
+                    path=path,
+                    start_line=orig_line_no,
+                    end_line=orig_line_no,
+                ))
+
+            if handles_clause:
+                for h_item in handles_clause.split(","):
+                    h_item = h_item.strip()
+                    if h_item:
+                        facts.append(VBNETFact(
+                            kind="event_wiring",
+                            subject=f"{owner_class}.{h_item}",
+                            target=sig,
+                            value=h_item,
+                            path=path,
+                            start_line=orig_line_no,
+                            end_line=orig_line_no,
+                        ))
+            continue
+
+        if re.match(r"(?i)^end\s+(sub|function|property)\b", line):
+            current_method_name = None
+            var_type_map = {}
+            continue
+
+        if current_method_name:
+            owner_class = scope_stack[-1] if scope_stack else "Global"
+
+            addhandler_match = re.match(r"(?i)^addhandler\s+([a-z0-9_\.\[\]]+)\s*,\s*addressof\s+([a-z0-9_\[\]]+)", line)
+            if addhandler_match:
+                evt_expr = addhandler_match.group(1).strip("[]")
+                handler = addhandler_match.group(2).strip("[]")
+                facts.append(VBNETFact(
+                    kind="event_wiring",
+                    subject=f"{owner_class}.{evt_expr}",
+                    target=f"{owner_class}#{handler}",
+                    value="AddHandler",
+                    path=path,
+                    start_line=orig_line_no,
+                    end_line=orig_line_no,
+                ))
+                continue
+
+            remhandler_match = re.match(r"(?i)^removehandler\s+([a-z0-9_\.\[\]]+)\s*,\s*addressof\s+([a-z0-9_\[\]]+)", line)
+            if remhandler_match:
+                evt_expr = remhandler_match.group(1).strip("[]")
+                handler = remhandler_match.group(2).strip("[]")
+                facts.append(VBNETFact(
+                    kind="event_wiring",
+                    subject=f"{owner_class}.{evt_expr}",
+                    target=f"{owner_class}#{handler}",
+                    value="RemoveHandler",
+                    path=path,
+                    start_line=orig_line_no,
+                    end_line=orig_line_no,
+                ))
+                continue
+
+            proc_match = re.search(r"(?i)(?:Process\.Start|Shell)\s*\(\s*[\"']([^\"']+)[\"']", line)
+            if proc_match:
+                exe_target = proc_match.group(1)
+                facts.append(VBNETFact(
+                    kind="process_launch",
+                    subject=current_method_name,
+                    target=exe_target,
+                    value="Process.Start",
+                    path=path,
+                    start_line=orig_line_no,
+                    end_line=orig_line_no,
+                ))
+
+            cfg_match = re.search(r"(?i)ConfigurationSettings\.AppSettings(?:\([\"']([^\"']+)[\"']\)|\[[\"']([^\"']+)[\"']\])", line)
+            if cfg_match:
+                key = cfg_match.group(1) or cfg_match.group(2)
+                facts.append(VBNETFact(
+                    kind="config_fact",
+                    subject=current_method_name,
+                    target=key,
+                    value="ConfigurationSettings.AppSettings",
+                    path=path,
+                    start_line=orig_line_no,
+                    end_line=orig_line_no,
+                ))
+
+            cmd_text_match = re.search(r"(?i)\.CommandText\s*=\s*[\"']([^\"']+)[\"']", line)
+            if cmd_text_match:
+                cmd_text = cmd_text_match.group(1)
+                facts.append(VBNETFact(
+                    kind="adonet_fact",
+                    subject=current_method_name,
+                    target=cmd_text,
+                    value="CommandText",
+                    path=path,
+                    start_line=orig_line_no,
+                    end_line=orig_line_no,
+                ))
+            if re.search(r"(?i)\.CommandType\s*=\s*(?:CommandType\.)?StoredProcedure", line):
+                facts.append(VBNETFact(
+                    kind="adonet_fact",
+                    subject=current_method_name,
+                    target="StoredProcedure",
+                    value="CommandType",
+                    path=path,
+                    start_line=orig_line_no,
+                    end_line=orig_line_no,
+                ))
+
+            co_match = re.search(r"(?i)CreateObject\s*\(\s*[\"']([^\"']+)[\"']\)", line)
+            if co_match:
+                prog_id = co_match.group(1)
+                facts.append(VBNETFact(
+                    kind="com_fact",
+                    subject=current_method_name,
+                    target=prog_id,
+                    value="CreateObject",
+                    path=path,
+                    start_line=orig_line_no,
+                    end_line=orig_line_no,
+                ))
+
+            dim_match = re.match(r"(?i)^\s*dim\s+([a-z0-9_\[\]]+)\s+as\s+(?:new\s+)?([a-z0-9_\[\]\.]+)", line)
+            if dim_match:
+                v_name = dim_match.group(1).strip("[]")
+                v_type = dim_match.group(2).strip("[]")
+                var_type_map[v_name.lower()] = v_type
+
+            inv_matches = re.finditer(r"(?:(?:\b([A-Za-z0-9_\[\]]+)\s*\.)|(?:\bCall\s+))?\b([A-Za-z0-9_\[\]]+)\s*\(", line)
+            for inv_m in inv_matches:
+                recv_var = inv_m.group(1)
+                method_name = inv_m.group(2)
+                if method_name.lower() in {"if", "while", "for", "select", "sub", "function", "synclock", "using", "typeof", "ctype", "directcast", "trycast", "createobject", "getobject", "process.start", "shell"}:
+                    continue
+                resolved_recv = None
+                if recv_var:
+                    recv_var_clean = recv_var.strip("[]").lower()
+                    if recv_var_clean in {"me", "mybase", "myclass"}:
+                        resolved_recv = owner_class
+                    elif recv_var_clean in var_type_map:
+                        resolved_recv = var_type_map[recv_var_clean]
+                    elif recv_var_clean == "object" or in_option_strict_off:
+                        resolved_recv = "Object"
+                    else:
+                        resolved_recv = recv_var.strip("[]")
+                else:
+                    resolved_recv = owner_class
+
+                invocations.append(VBNETInvocation(
+                    name=method_name.strip("[]"),
+                    receiver=resolved_recv,
+                    caller=current_method_name,
+                    path=path,
+                    start_line=orig_line_no,
+                    end_line=orig_line_no,
+                    is_test=current_method_is_test,
+                ))
+
+    return declarations, invocations, facts, parse_failures
+
+
+def _parse_vbproj_content(path: Path, content: str) -> list[VBNETFact]:
+    facts: list[VBNETFact] = []
+    asm_match = re.search(r"(?i)AssemblyName\s*=\s*[\"']([^\"']+)[\"']|<AssemblyName>([^<]+)</AssemblyName>", content)
+    asm_name = (asm_match.group(1) or asm_match.group(2)) if asm_match else path.stem
+
+    root_ns_match = re.search(r"(?i)RootNamespace\s*=\s*[\"']([^\"']+)[\"']|<RootNamespace>([^<]+)</RootNamespace>", content)
+    root_ns = (root_ns_match.group(1) or root_ns_match.group(2)) if root_ns_match else asm_name
+
+    startup_match = re.search(r"(?i)StartupObject\s*=\s*[\"']([^\"']+)[\"']|<StartupObject>([^<]+)</StartupObject>", content)
+    startup_obj = (startup_match.group(1) or startup_match.group(2)) if startup_match else None
+
+    facts.append(VBNETFact(
+        kind="project_fact",
+        subject=path.as_posix(),
+        target=asm_name,
+        value=root_ns,
+        path=path,
+        start_line=1,
+        end_line=1,
+        extra_info=startup_obj,
+    ))
+
+    ref_matches = re.finditer(r"(?i)<Reference\s+Name\s*=\s*[\"']([^\"']+)[\"'](?:\s+GUID\s*=\s*[\"']([^\"']+)[\"'])?", content)
+    for ref_m in ref_matches:
+        ref_name = ref_m.group(1)
+        ref_guid = ref_m.group(2)
+        if ref_guid or "interop" in ref_name.lower():
+            facts.append(VBNETFact(
+                kind="com_reference",
+                subject=ref_name,
+                target=ref_guid,
+                value="COM Reference",
+                path=path,
+                start_line=1,
+                end_line=1,
+            ))
+        else:
+            facts.append(VBNETFact(
+                kind="project_reference",
+                subject=path.as_posix(),
+                target=ref_name,
+                value="Reference",
+                path=path,
+                start_line=1,
+                end_line=1,
+            ))
+    return facts
+
+
+def _parse_sln_content(path: Path, content: str) -> list[VBNETFact]:
+    facts: list[VBNETFact] = []
+    proj_matches = re.finditer(r'Project\("\{[A-F0-9-]+\}"\)\s*=\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"(\{[A-F0-9-]+\})"', content, re.IGNORECASE)
+    for p_m in proj_matches:
+        p_name = p_m.group(1)
+        p_path = p_m.group(2)
+        facts.append(VBNETFact(
+            kind="solution_project",
+            subject=p_name,
+            target=p_path,
+            value=path.as_posix(),
+            path=path,
+            start_line=1,
+            end_line=1,
+        ))
+    return facts
+
+
+def _parse_resx_content(path: Path, content: str) -> list[VBNETFact]:
+    facts: list[VBNETFact] = []
+    try:
+        root_elem = ElementTree.fromstring(content)
+        for elem in root_elem.findall("data"):
+            name = elem.get("name")
+            if name:
+                facts.append(VBNETFact(
+                    kind="designer_provenance",
+                    subject=name,
+                    target=None,
+                    value="resx_data",
+                    path=path,
+                    start_line=1,
+                    end_line=1,
+                ))
+    except Exception:
+        pass
+    return facts
+
+
+def _parse_config_content(path: Path, content: str) -> list[VBNETFact]:
+    facts: list[VBNETFact] = []
+    try:
+        root_elem = ElementTree.fromstring(content)
+        app_settings = root_elem.find("appSettings")
+        if app_settings is not None:
+            for add_elem in app_settings.findall("add"):
+                key = add_elem.get("key")
+                val = add_elem.get("value")
+                if key:
+                    facts.append(VBNETFact(
+                        kind="config_definition",
+                        subject=key,
+                        target=val,
+                        value="appSettings",
+                        path=path,
+                        start_line=1,
+                        end_line=1,
+                    ))
+    except Exception:
+        pass
+    return facts
+
+
+def _parse_sql_content(path: Path, content: str) -> list[VBNETFact]:
+    facts: list[VBNETFact] = []
+    proc_matches = re.finditer(r"(?i)CREATE\s+(?:PROCEDURE|PROC)\s+([A-Za-z0-9_\.\[\]]+)", content)
+    for p_m in proc_matches:
+        proc_name = p_m.group(1).strip("[]")
+        facts.append(VBNETFact(
+            kind="sql_definition",
+            subject=proc_name,
+            target=proc_name,
+            value="StoredProcedure",
+            path=path,
+            start_line=1,
+            end_line=1,
+        ))
+    return facts
+
+
+def _analyze_vbnet_impact(request: ImpactRequest, connection: sqlite3.Connection, snapshot: IndexSnapshot) -> ImpactResult:
+    target_str = request.target or ""
+    rows = connection.execute(
+        "SELECT kind, name, qualified_name, signature, path, start_line, end_line, is_test, is_private FROM vbnet_declarations"
+    ).fetchall()
+
+    matching_decls = []
+    for r in rows:
+        kind, name, qual_name, sig, path_str, s_line, e_line, is_test, is_priv = r
+        if sig.lower() == target_str.lower() or name.lower() == target_str.lower():
+            matching_decls.append(r)
+
+    if not matching_decls:
+        for r in rows:
+            kind, name, qual_name, sig, path_str, s_line, e_line, is_test, is_priv = r
+            if qual_name.lower() == target_str.lower():
+                matching_decls.append(r)
+
+    if not matching_decls:
+        return ImpactResult(
+            outcome="not_found",
+            requested_target=target_str,
+            target=None,
+            candidates=(),
+            relationships=(),
+            assumptions=("Target signature not found in VB.NET index.",),
+            unresolved_items=(),
+            snapshot=snapshot,
+            manual_verification_surfaces=(),
+        )
+
+    if len(matching_decls) > 1:
+        candidates = tuple(
+            ImpactTarget(
+                signature=r[3],
+                path=Path(r[4]),
+                start_line=r[5],
+                end_line=r[6],
+                evidence_handle=f"vbnet_declaration:{r[4]}:{r[5]}-{r[6]}",
+                language="vbnet",
+            )
+            for r in matching_decls
+        )
+        return ImpactResult(
+            outcome="ambiguous",
+            requested_target=target_str,
+            target=None,
+            candidates=candidates,
+            relationships=(),
+            assumptions=("Multiple matching VB.NET declarations found for target.",),
+            unresolved_items=(),
+            snapshot=snapshot,
+            manual_verification_surfaces=(),
+        )
+
+    r = matching_decls[0]
+    kind, name, qual_name, sig, path_str, s_line, e_line, is_test, is_priv = r
+    resolved_target = ImpactTarget(
+        signature=sig,
+        path=Path(path_str),
+        start_line=s_line,
+        end_line=e_line,
+        evidence_handle=f"vbnet_declaration:{path_str}:{s_line}-{e_line}",
+        language="vbnet",
+    )
+
+    owner_class = sig.split("#")[0] if "#" in sig else qual_name
+    member_name = sig.split("#")[1] if "#" in sig else name
+
+    relationships: list[ImpactRelationship] = []
+    unresolved_items: list[UnresolvedItem] = []
+    manual_surfaces: list[ManualVerificationSurface] = []
+
+    inv_rows = connection.execute(
+        "SELECT name, receiver, caller, path, start_line, end_line, is_test FROM vbnet_invocations WHERE LOWER(name) = ?",
+        (member_name.lower(),),
+    ).fetchall()
+
+    for inv in inv_rows:
+        inv_name, inv_recv, inv_caller, inv_path_str, inv_s, inv_e, inv_test = inv
+        if inv_caller and inv_caller.lower() != sig.lower():
+            if inv_recv is None or inv_recv.lower() in {owner_class.lower(), "me", "mybase"}:
+                handle = f"vbnet_invocation:{inv_path_str}:{inv_s}-{inv_e}"
+                relationships.append(ImpactRelationship(
+                    kind="VB.NET Direct Call",
+                    caller=inv_caller,
+                    path=Path(inv_path_str),
+                    start_line=inv_s,
+                    end_line=inv_e,
+                    evidence_handle=handle,
+                    confidence="high",
+                    evidence_chain=(resolved_target.evidence_handle, handle),
+                    language="vbnet",
+                ))
+
+    callee_rows = connection.execute(
+        "SELECT name, receiver, caller, path, start_line, end_line FROM vbnet_invocations WHERE LOWER(caller) = ?",
+        (sig.lower(),),
+    ).fetchall()
+    for callee in callee_rows:
+        c_name, c_recv, c_caller, c_path_str, c_s, c_e = callee
+        if c_recv == "Object":
+            handle = f"vbnet_invocation:{c_path_str}:{c_s}-{c_e}"
+            unresolved_items.append(UnresolvedItem(
+                message=f"VB.NET Late-Bound Call: invocation '{c_name}' on Object or untyped receiver inside {sig}",
+                path=Path(c_path_str),
+                start_line=c_s,
+                end_line=c_e,
+                evidence_handle=handle,
+            ))
+        elif c_recv and c_recv.lower() not in {"me", "mybase"}:
+            handle = f"vbnet_invocation:{c_path_str}:{c_s}-{c_e}"
+            relationships.append(ImpactRelationship(
+                kind="VB.NET Direct Call",
+                caller=f"{sig} -> {c_recv}#{c_name}",
+                path=Path(c_path_str),
+                start_line=c_s,
+                end_line=c_e,
+                evidence_handle=handle,
+                confidence="high",
+                evidence_chain=(resolved_target.evidence_handle, handle),
+                language="vbnet",
+            ))
+
+    fact_rows = connection.execute(
+        "SELECT kind, subject, target, value, path, start_line, end_line, extra_info FROM vbnet_facts"
+    ).fetchall()
+
+    for f in fact_rows:
+        f_kind, f_sub, f_tgt, f_val, f_path_str, f_s, f_e, f_extra = f
+        handle = f"vbnet_fact:{f_kind}:{f_path_str}:{f_s}-{f_e}"
+        if f_kind == "event_wiring":
+            if f_tgt and f_tgt.lower() == sig.lower():
+                relationships.append(ImpactRelationship(
+                    kind="WinForms Event Wiring",
+                    caller=f_sub,
+                    path=Path(f_path_str),
+                    start_line=f_s,
+                    end_line=f_e,
+                    evidence_handle=handle,
+                    confidence="high",
+                    evidence_chain=(resolved_target.evidence_handle, handle),
+                    language="vbnet",
+                ))
+                manual_surfaces.append(ManualVerificationSurface(
+                    kind="winforms_event",
+                    description=f"WinForms control event '{f_sub}' reaches handler '{sig}'.",
+                    path=Path(f_path_str),
+                    start_line=f_s,
+                    end_line=f_e,
+                    evidence_handle=handle,
+                ))
+
+        elif f_kind == "process_launch":
+            if f_sub and f_sub.lower() == sig.lower():
+                target_exe = f_tgt
+                proj_matches = [
+                    pf for pf in fact_rows if pf[0] == "project_fact" and pf[2].lower() == target_exe.replace(".exe", "").lower()
+                ]
+                if len(proj_matches) == 1:
+                    match_proj = proj_matches[0]
+                    proj_handle = f"vbnet_fact:project_fact:{match_proj[4]}:{match_proj[5]}-{match_proj[6]}"
+                    relationships.append(ImpactRelationship(
+                        kind="Local Process Boundary",
+                        caller=f"{sig} -> {target_exe}",
+                        path=Path(f_path_str),
+                        start_line=f_s,
+                        end_line=f_e,
+                        evidence_handle=handle,
+                        confidence="high",
+                        evidence_chain=(resolved_target.evidence_handle, handle, proj_handle),
+                        language="vbnet",
+                    ))
+                else:
+                    unresolved_items.append(UnresolvedItem(
+                        message=f"External Process Boundary: process launch '{target_exe}' cannot be uniquely resolved to a local project.",
+                        path=Path(f_path_str),
+                        start_line=f_s,
+                        end_line=f_e,
+                        evidence_handle=handle,
+                    ))
+
+        elif f_kind == "config_fact":
+            if f_sub and f_sub.lower() == sig.lower():
+                cfg_key = f_tgt
+                cfg_defs = [
+                    cf for cf in fact_rows if cf[0] == "config_definition" and cf[1] == cfg_key
+                ]
+                if cfg_defs:
+                    match_cfg = cfg_defs[0]
+                    cfg_handle = f"vbnet_fact:config_definition:{match_cfg[4]}:{match_cfg[5]}-{match_cfg[6]}"
+                    relationships.append(ImpactRelationship(
+                        kind="AppSettings Configuration",
+                        caller=f"{sig} -> AppSettings['{cfg_key}']",
+                        path=Path(f_path_str),
+                        start_line=f_s,
+                        end_line=f_e,
+                        evidence_handle=handle,
+                        confidence="high",
+                        evidence_chain=(resolved_target.evidence_handle, handle, cfg_handle),
+                        language="vbnet",
+                    ))
+
+        elif f_kind == "adonet_fact":
+            if f_sub and f_sub.lower() == sig.lower():
+                relationships.append(ImpactRelationship(
+                    kind="VB.NET Data Access Boundary",
+                    caller=f"{sig} -> ADO.NET ({f_tgt})",
+                    path=Path(f_path_str),
+                    start_line=f_s,
+                    end_line=f_e,
+                    evidence_handle=handle,
+                    confidence="medium",
+                    evidence_chain=(resolved_target.evidence_handle, handle),
+                    language="vbnet",
+                ))
+                if f_tgt:
+                    sql_defs = [sf for sf in fact_rows if sf[0] == "sql_definition" and sf[1].lower() == f_tgt.lower()]
+                    if sql_defs:
+                        match_sql = sql_defs[0]
+                        sql_handle = f"vbnet_fact:sql_definition:{match_sql[4]}:{match_sql[5]}-{match_sql[6]}"
+                        relationships.append(ImpactRelationship(
+                            kind="StoredProcedure Reference",
+                            caller=f"ADO.NET Command -> {f_tgt}",
+                            path=Path(match_sql[4]),
+                            start_line=match_sql[5],
+                            end_line=match_sql[6],
+                            evidence_handle=sql_handle,
+                            confidence="high",
+                            evidence_chain=(resolved_target.evidence_handle, handle, sql_handle),
+                            language="vbnet",
+                        ))
+
+        elif f_kind == "com_fact":
+            if f_sub and f_sub.lower() == sig.lower():
+                unresolved_items.append(UnresolvedItem(
+                    message=f"COM Interop Boundary: dynamic COM call '{f_val}' with target '{f_tgt}' in {sig} remains unresolved.",
+                    path=Path(f_path_str),
+                    start_line=f_s,
+                    end_line=f_e,
+                    evidence_handle=handle,
+                ))
+
+    test_callers = [r for r in relationships if any(t_r[7] for t_r in rows if t_r[3].lower() == r.caller.lower())]
+    if not test_callers:
+        manual_surfaces.append(ManualVerificationSurface(
+            kind="manual_verification_surface",
+            description=f"Form or control logic '{sig}' requires manual verification surface testing.",
+            path=resolved_target.path,
+            start_line=resolved_target.start_line,
+            end_line=resolved_target.end_line,
+            evidence_handle=resolved_target.evidence_handle,
+        ))
+
+    return ImpactResult(
+        outcome="resolved",
+        requested_target=target_str,
+        target=resolved_target,
+        candidates=(),
+        relationships=tuple(relationships),
+        assumptions=("VB.NET WinForms local impact path assembled from inspectable source evidence.",),
+        unresolved_items=tuple(unresolved_items),
+        snapshot=snapshot,
+        manual_verification_surfaces=tuple(manual_surfaces),
+    )

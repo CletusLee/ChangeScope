@@ -1,34 +1,35 @@
 # ChangeScope
 
-Local-first, evidence-backed impact analysis for Java, Spring Boot, WildFly EJB, WildFly & JBoss SOAP, and Quarkus repositories.
+Local-first, evidence-backed impact analysis for Java, Spring Boot, WildFly EJB, WildFly & JBoss SOAP, Quarkus, and legacy VB.NET 2003 WinForms repositories.
 
 ## The problem
 
 Before changing legacy code, an engineer needs to know more than where a name appears in a text search. The useful question is:
 
-> If this method, component, configuration key, WSDL operation, or interface contract changes, what local code, services, configuration, and tests are affected—and what source evidence proves it?
+> If this method, component, configuration key, WSDL operation, WinForms event, or interface contract changes, what local code, services, configuration, and tests are affected—and what source evidence proves it?
 
-ChangeScope answers a deliberately smaller version of that question for checked-out repositories. It builds a local SQLite index, analyzes Java source structurally with Tree-sitter, parses WSDL/XSD contracts and framework descriptors, and produces a reviewable impact report containing:
+ChangeScope answers a deliberately smaller version of that question for checked-out repositories. It builds a local SQLite index, analyzes Java source structurally with Tree-sitter, parses legacy VB.NET 2003 WinForms source runtime-free, parses WSDL/XSD contracts and framework descriptors, and produces a reviewable impact report containing:
 
-- the interpreted change target (Java `Class#method` or SOAP WSDL operation);
+- the interpreted change target (Java `Class#method`, VB.NET `Class#method`, or SOAP WSDL operation);
 - affected relationships grouped by their evidence-backed kind;
 - source paths and line ranges;
 - confidence levels (high, medium, low);
-- assumptions and unresolved items; and
+- assumptions and unresolved items (including late-bound calls, process boundaries, and COM interop); and
 - the local Git snapshot and Workspace Catalog provenance used for the analysis.
 
 ChangeScope is not a generic code-search, code-memory, or full semantic call-graph product. Its primary design rule is conservative: an unsupported or ambiguous relationship is reported as unresolved instead of being guessed.
 
 ## Current status
 
-The current release is a JRE-free local-analysis capability covering Java, Spring/Spring Boot, annotation- and descriptor-backed WildFly EJB, Quarkus, WildFly & JBoss SOAP Web Services (JAX-WS / WSDL / XSD), and cross-repository analysis via the Workspace Catalog. The application service is exposed through a CLI; an MCP adapter is planned.
+The current release is a JRE-free local-analysis capability covering Java, Spring/Spring Boot, annotation- and descriptor-backed WildFly EJB, Quarkus, WildFly & JBoss SOAP Web Services (JAX-WS / WSDL / XSD), legacy VB.NET 2003 WinForms applications without requiring Visual Studio or the .NET runtime, and cross-repository analysis via the Workspace Catalog. The application service is exposed through a CLI; an MCP adapter is planned.
 
 ### Validation benchmarks
 
 - **Spring / Spring Boot**: Tested against four public Spring Boot applications: [Spring Petclinic](https://github.com/spring-projects/spring-petclinic), [Spring Petclinic REST](https://github.com/spring-spring-petclinic-rest), [Spring Petclinic Modulith](https://github.com/spring-petclinic/spring-petclinic-modulith), and [RealWorld Spring Boot](https://github.com/gothinkster/spring-boot-realworld-example-app).
 - **WildFly EJB**: Tested against five official WildFly EJB quickstarts: [`ejb-remote`](https://github.com/wildfly/quickstart/tree/main/ejb-remote), [`ejb-throws-exception`](https://github.com/wildfly/quickstart/tree/main/ejb-throws-exception), [`ejb-security-context-propagation`](https://github.com/wildfly/quickstart/tree/main/ejb-security-context-propagation), [`helloworld-mdb`](https://github.com/wildfly/quickstart/tree/main/helloworld-mdb), and [`ejb-timer`](https://github.com/wildfly/quickstart/tree/main/ejb-timer).
 - **Quarkus**: Tested against four official Quarkus quickstarts: [`getting-started`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/getting-started), [`rest-client-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/rest-client-quickstart), [`hibernate-orm-panache-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/hibernate-orm-panache-quickstart), and [`security-jpa-quickstart`](https://github.com/quarkusio/quarkus-quickstarts/tree/main/security-jpa-quickstart).
-- **WildFly & JBoss SOAP**: Validated against three representative official [WildFly quickstarts](https://github.com/wildfly/quickstart): [`helloworld-ws`](https://github.com/wildfly/quickstart/tree/main/helloworld-ws) (POJO Web Service), [`jaxws-ejb`](https://github.com/wildfly/quickstart/tree/main/jaxws-ejb) (EJB Session Bean SOAP Web Service with Remote Business Interfaces), and [`jaxws-retail`](https://github.com/wildfly/quickstart/tree/main/jaxws-retail) (Complex WSDL contract, XSD payload binding, and evidence navigation). All repositories indexed with zero parse failures and resolved 3-tier evidence graphs (`WSDL operation -> XSD schema element -> Endpoint implementation & Client caller`).
+- **WildFly & JBoss SOAP**: Validated against three representative official [WildFly quickstarts](https://github.com/wildfly/quickstart): [`helloworld-ws`](https://github.com/wildfly/quickstart/tree/main/helloworld-ws) (POJO Web Service), [`jaxws-ejb`](https://github.com/wildfly/quickstart/tree/main/jaxws-ejb) (EJB Session Bean SOAP Web Service with Remote Business Interfaces), and [`jaxws-retail`](https://github.com/wildfly/quickstart/tree/main/jaxws-retail) (Complex WSDL contract, XSD payload binding, and evidence navigation).
+- **VB.NET 2003 WinForms**: Validated against the open-source GitHub application [Fast-Food-Ordering-System-VB.Net](https://github.com/gauravpatil-06/Fast-Food-Ordering-System-VB.Net) with 23 source/project files, 34 declarations, 525 invocations, 141 facts, zero parse failures, and full WinForms event handler, direct call, and manual verification surface resolution.
 
 ## Key capabilities
 
@@ -99,6 +100,17 @@ Recognizes and connects:
 - `@HandlerChain` XML resolution (`handler-chain.xml`, `handlers.xml`) and JBossWS/CXF interceptors; and
 - WS-Policy attachments (`wsp:Policy`), WS-Security, WS-Addressing (`@Addressing`), MTOM (`@MTOM`), and SOAP 1.1/1.2 binding styles.
 
+### Legacy VB.NET 2003 WinForms evidence
+
+Recognizes and connects:
+- Multi-encoding file discovery (`.vb`, `.vbproj`, `.sln`, `.resx`, `.config`, `app.config`, `web.config`, `.sql`);
+- Line continuation (`_`), case-insensitive keyword parsing, and designer region `#region ... #end region` provenance tracking;
+- Local variable typing (`Dim dao As New OrderDAO()`) and `VB.NET Late-Bound Call` reporting on untyped `Object` / `Option Strict Off`;
+- WinForms control event wiring (`Handles Clause`, `AddHandler`, `RemoveHandler`) and `ManualVerificationSurface` reporting for un-automated form logic;
+- Multi-project solution assembly linking and `Process.Start(...)` / `Shell(...)` process launches (`Local Process Boundary` / `External Process Boundary`);
+- `ConfigurationSettings.AppSettings` reads and ADO.NET `CommandText` / `CommandType = StoredProcedure` data access boundaries linked to `.sql` definitions; and
+- COM interop references (`<Reference Name="..." GUID="...">`) and `CreateObject(...)` dynamic COM calls (`COM Interop Boundary`).
+
 ### Workspace Catalog and cross-repository continuation
 
 `changescope catalog` manages explicit repository registrations and typed contract mappings across repositories in `.changescope/catalog.sqlite`:
@@ -148,6 +160,9 @@ changescope index
 # Ask for a Java method target impact report.
 changescope impact GreetingResource#hello
 
+# Ask for a VB.NET method target impact report.
+changescope impact Form1#Button1_Click
+
 # Ask for a SOAP WSDL operation target impact report.
 changescope impact --soap-wsdl wsdl/order_service.wsdl --soap-port-type OrderPortType --soap-operation placeOrder
 
@@ -174,13 +189,14 @@ Run the full repository test suite with:
 python -m unittest discover -s tests -v
 ```
 
-The test suite contains **213 unit and integration tests (100% passing)** covering:
+The test suite contains **224 unit and integration tests (100% passing)** covering:
 - Repository discovery & Java AST parsing;
 - Spring Boot beans, properties, and XML;
 - WildFly EJB session beans, descriptors, and interfaces;
 - Quarkus CDI, REST, REST Client, Security, and Native Image boundaries;
-- Workspace Catalog repository registration and mapping resolution; and
-- WildFly & JBoss SOAP WSDL/XSD payload graphs, portable endpoints, EJB SOAP beans, handlers, policies, cross-repo continuation, and report parity.
+- Workspace Catalog repository registration and mapping resolution;
+- WildFly & JBoss SOAP WSDL/XSD payload graphs, portable endpoints, EJB SOAP beans, handlers, policies, cross-repo continuation, and report parity; and
+- Runtime-free VB.NET 2003 WinForms parser facade, case-insensitive symbol resolution, late-bound call reporting, WinForms event wiring, multi-project process launches, ADO.NET & appSettings config boundaries, COM interop boundaries, and affected tests.
 
 ## Design principles
 
