@@ -12,12 +12,17 @@ from .application import (
     CatalogMapping,
     CatalogSummaryRequest,
     ChangeScopeApplication,
+    ContractDiscoveryRequest,
+    ContractDiscoveryResult,
     EvidenceRequest,
     ImpactRequest,
     IndexRequest,
     IndexResult,
     RepositoryIndexStatus,
     RepositoryStatusRequest,
+    RESTChangeTarget,
+    RESTContractCandidate,
+    SOAPChangeTarget,
     SourceNavigation,
     SourceRequest,
     WorkspaceCatalogSummary,
@@ -114,6 +119,18 @@ class ChangeScopeMCPServer:
             if name == 'index_repository':
                 self._check_keys(arguments, {'repository_id'})
                 payload = self._index_repository(arguments, progress_token, progress_sink)
+            elif name == 'discover_contracts':
+                self._check_keys(
+                    arguments,
+                    {
+                        'repository_id', 'terms', 'search_terms', 'soap',
+                        'soap_wsdl', 'soap_port_type', 'soap_operation',
+                        'rest', 'rest_http_method', 'rest_path',
+                        'rest_consumes', 'rest_produces', 'rest_params', 'rest_headers',
+                        'limit', 'offset',
+                    },
+                )
+                payload = self._discover_contracts(arguments)
             elif name == 'analyze_impact':
                 self._check_keys(
                     arguments,
@@ -121,6 +138,8 @@ class ChangeScopeMCPServer:
                         'repository_id', 'target', 'soap', 'soap_wsdl',
                         'soap_port_type', 'soap_operation', 'profiles',
                         'build_profiles', 'runtime_profiles',
+                        'rest', 'rest_http_method', 'rest_path',
+                        'rest_consumes', 'rest_produces', 'rest_params', 'rest_headers',
                     },
                 )
                 payload = self._analyze_impact(arguments)
@@ -307,39 +326,210 @@ class ChangeScopeMCPServer:
         self._progress(progress_sink, progress_token, 1.0, 'complete')
         return {'repository_id': repository_id, 'outcome': 'indexed', **self._index_report(result)}
 
-    def _analyze_impact(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _discover_contracts(self, arguments: dict[str, Any]) -> dict[str, Any]:
         repository_id = self._repository_id(arguments)
         repository_root = self._resolve_repository(repository_id)
-        target = arguments.get('target')
+        if arguments.get('terms') is not None and arguments.get('search_terms') is not None:
+            raise MCPError(-32602, 'Specify either terms or search_terms, not both.')
+        terms_value = arguments.get('terms', arguments.get('search_terms'))
+        terms = self._string_tuple(terms_value, 'terms')
         soap = arguments.get('soap')
+        rest = arguments.get('rest')
+        flat_soap = any(
+            key in arguments
+            for key in ('soap_wsdl', 'soap_port_type', 'soap_operation')
+        )
+        flat_rest = any(
+            key in arguments
+            for key in ('rest_http_method', 'rest_path', 'rest_consumes', 'rest_produces', 'rest_params', 'rest_headers')
+        )
+        if soap is not None and flat_soap:
+            raise MCPError(-32602, 'Specify either soap or flat SOAP discovery filters, not both.')
+        if rest is not None and flat_rest:
+            raise MCPError(-32602, 'Specify either rest or flat REST discovery filters, not both.')
         soap_wsdl = arguments.get('soap_wsdl')
         soap_port_type = arguments.get('soap_port_type')
         soap_operation = arguments.get('soap_operation')
         if soap is not None:
             if not isinstance(soap, dict):
                 raise MCPError(-32602, 'soap must be an object.')
+            unexpected = sorted(set(soap) - {'wsdl', 'port_type', 'operation'})
+            if unexpected:
+                raise MCPError(-32602, f'Unsupported SOAP discovery field(s): {chr(44).join(unexpected)}.')
             soap_wsdl = soap.get('wsdl')
             soap_port_type = soap.get('port_type')
             soap_operation = soap.get('operation')
+        rest_http_method = arguments.get('rest_http_method')
+        rest_path = arguments.get('rest_path')
+        rest_consumes = self._string_tuple(arguments.get('rest_consumes'), 'rest_consumes')
+        rest_produces = self._string_tuple(arguments.get('rest_produces'), 'rest_produces')
+        rest_params = self._string_tuple(arguments.get('rest_params'), 'rest_params')
+        rest_headers = self._string_tuple(arguments.get('rest_headers'), 'rest_headers')
+        if rest is not None:
+            if not isinstance(rest, dict):
+                raise MCPError(-32602, 'rest must be an object.')
+            unexpected = sorted(set(rest) - {'http_method', 'path', 'consumes', 'produces', 'params', 'headers'})
+            if unexpected:
+                raise MCPError(-32602, f'Unsupported REST discovery field(s): {chr(44).join(unexpected)}.')
+            rest_http_method = rest.get('http_method')
+            rest_path = rest.get('path')
+            rest_consumes = self._string_tuple(rest.get('consumes'), 'rest.consumes')
+            rest_produces = self._string_tuple(rest.get('produces'), 'rest.produces')
+            rest_params = self._string_tuple(rest.get('params'), 'rest.params')
+            rest_headers = self._string_tuple(rest.get('headers'), 'rest.headers')
+        soap_exact = any(value is not None for value in (soap_wsdl, soap_port_type, soap_operation))
+        rest_exact = any(value not in (None, ()) for value in (
+            rest_http_method, rest_path, rest_consumes, rest_produces, rest_params, rest_headers,
+        ))
+        if soap_exact and rest_exact:
+            raise MCPError(-32602, 'Specify either REST or SOAP discovery filters, not both.')
+        if soap_exact and not (
+            isinstance(soap_port_type, str)
+            and soap_port_type
+            and isinstance(soap_operation, str)
+            and soap_operation
+        ):
+            raise MCPError(-32602, 'SOAP discovery filters require port_type and operation strings.')
+        if soap_exact and terms:
+            raise MCPError(-32602, 'Specify either search terms or exact SOAP filters, not both.')
+        if rest_exact and terms:
+            raise MCPError(-32602, 'Specify either search terms or exact REST filters, not both.')
+        for value, label in ((rest_http_method, 'rest_http_method'), (rest_path, 'rest_path')):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise MCPError(-32602, f'{label} must be a non-empty string.')
+        if rest_http_method is not None:
+            rest_http_method = rest_http_method.upper()
+        wsdl_path = self._relative_path(soap_wsdl, 'soap.wsdl') if soap_wsdl is not None else None
+        limit = self._integer(arguments, 'limit', 50, minimum=1)
+        if limit > 100:
+            raise MCPError(-32602, 'limit must be less than or equal to 100.')
+        offset = self._integer(arguments, 'offset', 0, minimum=0)
+        result = self.application.execute(
+            ContractDiscoveryRequest(
+                repository_root,
+                terms,
+                wsdl_path,
+                soap_port_type,
+                soap_operation,
+                limit,
+                offset,
+                rest_http_method,
+                rest_path,
+                rest_consumes,
+                rest_produces,
+                rest_params,
+                rest_headers,
+            )
+        )
+        if not isinstance(result, ContractDiscoveryResult):
+            raise MCPError(-32603, 'The application service returned an unexpected contract discovery result.')
+        payload = {
+            'repository_id': repository_id,
+            'scope': self.config.mode,
+            **self._contract_discovery_report(result),
+        }
+        if result.outcome == 'index_missing':
+            payload['next_action'] = {
+                'tool': 'index_repository',
+                'arguments': {'repository_id': repository_id},
+            }
+        return payload
+
+    def _analyze_impact(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        repository_id = self._repository_id(arguments)
+        repository_root = self._resolve_repository(repository_id)
+        target = arguments.get('target')
+        soap = arguments.get('soap')
+        rest = arguments.get('rest')
+        if isinstance(target, dict):
+            if soap is not None or rest is not None:
+                raise MCPError(-32602, 'Specify either target or a separate structured contract target, not both.')
+            if isinstance(target.get('soap'), dict):
+                soap = target['soap']
+            elif isinstance(target.get('rest'), dict):
+                rest = target['rest']
+            elif target.get('kind') == 'rest' or all(
+                key in target for key in ('http_method', 'path')
+            ):
+                rest = target
+            elif target.get('kind') == 'soap' or all(
+                key in target for key in ('wsdl', 'port_type', 'operation')
+            ):
+                soap = target
+            else:
+                raise MCPError(-32602, 'Structured targets must be REST or SOAP targets.')
+            target = None
+        soap_wsdl = arguments.get('soap_wsdl')
+        soap_port_type = arguments.get('soap_port_type')
+        soap_operation = arguments.get('soap_operation')
+        rest_http_method = arguments.get('rest_http_method')
+        rest_path = arguments.get('rest_path')
+        rest_consumes = self._string_tuple(arguments.get('rest_consumes'), 'rest_consumes')
+        rest_produces = self._string_tuple(arguments.get('rest_produces'), 'rest_produces')
+        rest_params = self._string_tuple(arguments.get('rest_params'), 'rest_params')
+        rest_headers = self._string_tuple(arguments.get('rest_headers'), 'rest_headers')
+        if soap is not None:
+            if not isinstance(soap, dict):
+                raise MCPError(-32602, 'soap must be an object.')
+            soap_wsdl = soap.get('wsdl')
+            soap_port_type = soap.get('port_type')
+            soap_operation = soap.get('operation')
+        if rest is not None:
+            if not isinstance(rest, dict):
+                raise MCPError(-32602, 'rest must be an object.')
+            unexpected = sorted(set(rest) - {'kind', 'http_method', 'path', 'consumes', 'produces', 'params', 'headers', 'route_shape'})
+            if unexpected:
+                raise MCPError(-32602, f'Unsupported REST target field(s): {chr(44).join(unexpected)}.')
+            rest_http_method = rest.get('http_method')
+            rest_path = rest.get('path')
+            rest_consumes = self._string_tuple(rest.get('consumes'), 'rest.consumes')
+            rest_produces = self._string_tuple(rest.get('produces'), 'rest.produces')
+            rest_params = self._string_tuple(rest.get('params'), 'rest.params')
+            rest_headers = self._string_tuple(rest.get('headers'), 'rest.headers')
         has_soap = any(value is not None for value in (soap_wsdl, soap_port_type, soap_operation))
+        has_rest = any(value not in (None, ()) for value in (
+            rest_http_method, rest_path, rest_consumes, rest_produces, rest_params, rest_headers,
+        ))
         if target is not None and not isinstance(target, str):
             raise MCPError(-32602, 'target must be a string.')
-        if target is not None and has_soap:
-            raise MCPError(-32602, 'Specify either target or soap, not both.')
-        if target is None and not has_soap:
-            raise MCPError(-32602, 'Specify a Java target or a complete SOAP target.')
+        if target is not None and (has_soap or has_rest):
+            raise MCPError(-32602, 'Specify either a Java target or a structured contract target, not both.')
+        if has_soap and has_rest:
+            raise MCPError(-32602, 'Specify either a REST or SOAP target, not both.')
+        if target is None and not has_soap and not has_rest:
+            raise MCPError(-32602, 'Specify a Java target or a complete REST or SOAP target.')
         if has_soap and not all(isinstance(value, str) and value for value in (soap_wsdl, soap_port_type, soap_operation)):
             raise MCPError(-32602, 'SOAP targets require wsdl, port_type, and operation strings.')
-        wsdl_path = self._relative_path(soap_wsdl, 'soap.wsdl') if target is None else None
+        if has_rest and not all(isinstance(value, str) and value for value in (rest_http_method, rest_path)):
+            raise MCPError(-32602, 'REST targets require http_method and path strings.')
+        if has_rest:
+            rest_http_method = rest_http_method.upper()
+        wsdl_path = self._relative_path(soap_wsdl, 'soap.wsdl') if has_soap else None
         request = ImpactRequest(
             repository_root,
             target,
             self._string_tuple(arguments.get('profiles'), 'profiles'),
             self._string_tuple(arguments.get('build_profiles'), 'build_profiles'),
             self._string_tuple(arguments.get('runtime_profiles'), 'runtime_profiles'),
-            wsdl_path,
-            soap_port_type,
-            soap_operation,
+            soap_target=(
+                SOAPChangeTarget(
+                    wsdl_path,
+                    soap_port_type,
+                    soap_operation,
+                )
+                if has_soap else None
+            ),
+            rest_target=(
+                RESTChangeTarget(
+                    rest_http_method,
+                    rest_path,
+                    rest_consumes,
+                    rest_produces,
+                    rest_params,
+                    rest_headers,
+                )
+                if has_rest else None
+            ),
         )
         result = self.application.execute(request)
         if result.outcome == 'index_missing':
@@ -623,9 +813,138 @@ class ChangeScopeMCPServer:
             'configuration_files': [path.as_posix() for path in result.configuration_files],
             'declaration_count': len(result.declarations) + len(result.vbnet_declarations),
             'invocation_count': len(result.invocations) + len(result.vbnet_invocations),
+            'rest_fact_count': len(result.rest_facts),
             'soap_fact_count': len(result.soap_facts),
             'parse_failure_count': len(result.parse_failures),
             'snapshot': ChangeScopeMCPServer._snapshot_report(result.snapshot),
+        }
+
+    @staticmethod
+    def _contract_discovery_report(result: ContractDiscoveryResult) -> dict[str, Any]:
+        candidates = [
+            ChangeScopeMCPServer._contract_candidate_report(candidate)
+            for candidate in result.candidates
+        ]
+        return {
+            'outcome': result.outcome,
+            'candidates': candidates,
+            'contracts': candidates,
+            'requested_terms': list(result.requested_terms),
+            'unresolved_terms': list(result.unresolved_terms),
+            'unresolved_items': [
+                {
+                    'message': item.message,
+                    'path': item.path.as_posix() if item.path else None,
+                    'start_line': item.start_line,
+                    'end_line': item.end_line,
+                    'evidence_handle': item.evidence_handle,
+                }
+                for item in result.unresolved_items
+            ],
+            'total_count': result.total_count,
+            'limit': result.limit,
+            'offset': result.offset,
+            'has_more': result.has_more,
+            'next_offset': result.next_offset,
+            'snapshot': ChangeScopeMCPServer._snapshot_report(result.snapshot),
+        }
+
+    @staticmethod
+    def _contract_candidate_report(candidate: Any) -> dict[str, Any]:
+        if isinstance(candidate, RESTContractCandidate):
+            rest_target = {
+                'kind': 'rest',
+                'http_method': candidate.target.http_method,
+                'path': candidate.target.path,
+                'consumes': list(candidate.target.consumes),
+                'produces': list(candidate.target.produces),
+                'params': list(candidate.target.params),
+                'headers': list(candidate.target.headers),
+                'route_shape': candidate.target.route_shape,
+            }
+            entry_points = [
+                ChangeScopeMCPServer._target_report(entry_point)
+                for entry_point in candidate.source_entry_points
+            ]
+            provenance = candidate.provenance
+            return {
+                'kind': 'rest',
+                'contract_key': candidate.contract_key,
+                'target': {**rest_target, 'rest': dict(rest_target)},
+                'change_target': {**rest_target, 'rest': dict(rest_target)},
+                'match_reasons': list(candidate.match_reasons),
+                'source_resolution': candidate.source_resolution,
+                'source_entry_points': entry_points,
+                'source_entry_point': entry_points[0] if len(entry_points) == 1 else None,
+                'evidence_handles': list(candidate.evidence_handles),
+                'provenance': {
+                    'application_paths': list(provenance.application_paths),
+                    'class_paths': list(provenance.class_paths),
+                    'method_path': provenance.method_path,
+                    'http_method': provenance.http_method,
+                    'consumes': list(provenance.consumes),
+                    'produces': list(provenance.produces),
+                    'headers': list(provenance.headers),
+                    'route_shape': provenance.route_shape,
+                    'flavors': list(provenance.flavors),
+                    'evidence_handles': list(provenance.evidence_handles),
+                },
+                'unresolved_items': [
+                    {
+                        'message': item.message,
+                        'path': item.path.as_posix() if item.path else None,
+                        'start_line': item.start_line,
+                        'end_line': item.end_line,
+                        'evidence_handle': item.evidence_handle,
+                    }
+                    for item in candidate.unresolved_items
+                ],
+            }
+        soap_target = {
+            'kind': 'soap',
+            'wsdl': candidate.target.wsdl.as_posix(),
+            'port_type': candidate.target.port_type,
+            'operation': candidate.target.operation,
+        }
+        entry_points = [
+            ChangeScopeMCPServer._target_report(entry_point)
+            for entry_point in candidate.source_entry_points
+        ]
+        provenance = candidate.provenance
+        return {
+            'kind': 'soap',
+            'contract_key': candidate.contract_key,
+            'target': {**soap_target, 'soap': dict(soap_target)},
+            'change_target': {**soap_target, 'soap': dict(soap_target)},
+            'match_reasons': list(candidate.match_reasons),
+            'source_resolution': candidate.source_resolution,
+            'source_entry_points': entry_points,
+            'source_entry_point': entry_points[0] if len(entry_points) == 1 else None,
+            'evidence_handles': list(candidate.evidence_handles),
+            'provenance': {
+                'wsdl': provenance.wsdl.as_posix(),
+                'port_type_qname': candidate.target.port_type,
+                'operation': candidate.target.operation,
+                'namespace': provenance.namespace,
+                'services': list(provenance.services),
+                'ports': list(provenance.ports),
+                'bindings': list(provenance.bindings),
+                'endpoint_addresses': list(provenance.endpoint_addresses),
+                'input_messages': list(provenance.input_messages),
+                'output_messages': list(provenance.output_messages),
+                'fault_messages': list(provenance.fault_messages),
+                'evidence_handles': list(provenance.evidence_handles),
+            },
+            'unresolved_items': [
+                {
+                    'message': item.message,
+                    'path': item.path.as_posix() if item.path else None,
+                    'start_line': item.start_line,
+                    'end_line': item.end_line,
+                    'evidence_handle': item.evidence_handle,
+                }
+                for item in candidate.unresolved_items
+            ],
         }
 
     @staticmethod
@@ -727,6 +1046,7 @@ class ChangeScopeMCPServer:
 def _tool_definitions() -> list[dict[str, Any]]:
     return [
         _index_tool_definition(),
+        _discover_tool_definition(),
         _impact_tool_definition(),
         _evidence_tool_definition(),
         _source_tool_definition(),
@@ -751,16 +1071,103 @@ def _index_tool_definition() -> dict[str, Any]:
     }
 
 
+def _discover_tool_definition() -> dict[str, Any]:
+    return {
+        'name': 'discover_contracts',
+        'description': 'List or search bounded REST and SOAP Contract Inventory items in a configured repository.',
+        'inputSchema': {
+            'type': 'object',
+            'additionalProperties': False,
+            'properties': {
+                'repository_id': {'type': 'string', 'description': 'Configured repository ID.'},
+                'terms': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'Optional deterministic lexical search terms.',
+                },
+                'search_terms': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'Alias for terms.',
+                },
+                'soap': {
+                    'type': 'object',
+                    'additionalProperties': False,
+                    'properties': {
+                        'wsdl': {'type': 'string'},
+                        'port_type': {'type': 'string'},
+                        'operation': {'type': 'string'},
+                    },
+                    'required': ['port_type', 'operation'],
+                },
+                'soap_wsdl': {'type': 'string'},
+                'soap_port_type': {'type': 'string'},
+                'soap_operation': {'type': 'string'},
+                'rest': {
+                    'type': 'object',
+                    'additionalProperties': False,
+                    'properties': {
+                        'http_method': {'type': 'string'},
+                        'path': {'type': 'string'},
+                        'consumes': {'type': 'array', 'items': {'type': 'string'}},
+                        'produces': {'type': 'array', 'items': {'type': 'string'}},
+                        'params': {'type': 'array', 'items': {'type': 'string'}},
+                        'headers': {'type': 'array', 'items': {'type': 'string'}},
+                    },
+                },
+                'rest_http_method': {'type': 'string'},
+                'rest_path': {'type': 'string'},
+                'rest_consumes': {'type': 'array', 'items': {'type': 'string'}},
+                'rest_produces': {'type': 'array', 'items': {'type': 'string'}},
+                'rest_params': {'type': 'array', 'items': {'type': 'string'}},
+                'rest_headers': {'type': 'array', 'items': {'type': 'string'}},
+                'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100},
+                'offset': {'type': 'integer', 'minimum': 0},
+            },
+            'required': ['repository_id'],
+        },
+    }
+
+
 def _impact_tool_definition() -> dict[str, Any]:
     return {
         'name': 'analyze_impact',
-        'description': 'Analyze a configured repository using a Java symbol or SOAP operation target.',
+        'description': 'Analyze a configured repository using a Java symbol or REST/SOAP contract target.',
         'inputSchema': {
             'type': 'object',
             'additionalProperties': False,
             'properties': {
                 'repository_id': {'type': 'string'},
-                'target': {'type': 'string', 'description': 'Java target in Class#method form.'},
+                'target': {
+                    'description': 'Java target in Class#method form or a structured discovery target.',
+                    'oneOf': [
+                        {'type': 'string'},
+                        {
+                            'type': 'object',
+                            'additionalProperties': False,
+                            'properties': {
+                                'kind': {'type': 'string', 'enum': ['rest', 'soap']},
+                                'wsdl': {'type': 'string'},
+                                'port_type': {'type': 'string'},
+                                'operation': {'type': 'string'},
+                                'http_method': {'type': 'string'},
+                                'path': {'type': 'string'},
+                                'consumes': {'type': 'array', 'items': {'type': 'string'}},
+                                'produces': {'type': 'array', 'items': {'type': 'string'}},
+                                'params': {'type': 'array', 'items': {'type': 'string'}},
+                                'headers': {'type': 'array', 'items': {'type': 'string'}},
+                                'rest': {'type': 'object'},
+                                'soap': {'type': 'object'},
+                            },
+                            'oneOf': [
+                                {'required': ['http_method', 'path']},
+                                {'required': ['rest']},
+                                {'required': ['wsdl', 'port_type', 'operation']},
+                                {'required': ['soap']},
+                            ],
+                        },
+                    ],
+                },
                 'soap': {
                     'type': 'object',
                     'additionalProperties': False,
@@ -774,6 +1181,25 @@ def _impact_tool_definition() -> dict[str, Any]:
                 'soap_wsdl': {'type': 'string'},
                 'soap_port_type': {'type': 'string'},
                 'soap_operation': {'type': 'string'},
+                'rest': {
+                    'type': 'object',
+                    'additionalProperties': False,
+                    'properties': {
+                        'http_method': {'type': 'string'},
+                        'path': {'type': 'string'},
+                        'consumes': {'type': 'array', 'items': {'type': 'string'}},
+                        'produces': {'type': 'array', 'items': {'type': 'string'}},
+                        'params': {'type': 'array', 'items': {'type': 'string'}},
+                        'headers': {'type': 'array', 'items': {'type': 'string'}},
+                    },
+                    'required': ['http_method', 'path'],
+                },
+                'rest_http_method': {'type': 'string'},
+                'rest_path': {'type': 'string'},
+                'rest_consumes': {'type': 'array', 'items': {'type': 'string'}},
+                'rest_produces': {'type': 'array', 'items': {'type': 'string'}},
+                'rest_params': {'type': 'array', 'items': {'type': 'string'}},
+                'rest_headers': {'type': 'array', 'items': {'type': 'string'}},
                 'profiles': {'type': 'array', 'items': {'type': 'string'}},
                 'build_profiles': {'type': 'array', 'items': {'type': 'string'}},
                 'runtime_profiles': {'type': 'array', 'items': {'type': 'string'}},

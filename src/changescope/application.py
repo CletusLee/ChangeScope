@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -314,6 +314,110 @@ class SOAPFact:
     namespace: str | None = None
 
 
+RESTFact = QuarkusRESTFact
+
+
+@dataclass(frozen=True)
+class RESTChangeTarget:
+    http_method: str
+    path: str
+    consumes: tuple[str, ...] = ()
+    produces: tuple[str, ...] = ()
+    params: tuple[str, ...] = ()
+    headers: tuple[str, ...] = ()
+    route_shape: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'http_method', self.http_method.strip().upper())
+        object.__setattr__(self, 'path', _normalize_rest_path(self.path))
+        object.__setattr__(self, 'consumes', _string_tuple(self.consumes))
+        object.__setattr__(self, 'produces', _string_tuple(self.produces))
+        object.__setattr__(self, 'params', _string_tuple(self.params))
+        object.__setattr__(self, 'headers', _string_tuple(self.headers))
+        object.__setattr__(self, 'route_shape', _rest_route_shape(self.path))
+
+    @property
+    def signature(self) -> str:
+        return f'{self.http_method} {self.path}'
+
+    @property
+    def contract_key(self) -> str:
+        conditions = []
+        if self.consumes:
+            conditions.append('consumes=' + ','.join(self.consumes))
+        if self.produces:
+            conditions.append('produces=' + ','.join(self.produces))
+        if self.params:
+            conditions.append('params=' + ','.join(self.params))
+        if self.headers:
+            conditions.append('headers=' + ','.join(self.headers))
+        return self.signature + ' [' + '; '.join(conditions) + ']' if conditions else self.signature
+
+    @property
+    def method(self) -> str:
+        return self.http_method
+
+    @property
+    def route(self) -> str:
+        return self.path
+
+
+@dataclass(frozen=True)
+class RESTContractProvenance:
+    application_paths: tuple[str, ...] = ()
+    class_paths: tuple[str, ...] = ()
+    method_path: str = ''
+    http_method: str = ''
+    consumes: tuple[str, ...] = ()
+    produces: tuple[str, ...] = ()
+    headers: tuple[str, ...] = ()
+    route_shape: str = '/'
+    flavors: tuple[str, ...] = ()
+    evidence_handles: tuple[str, ...] = ()
+
+@dataclass(frozen=True)
+class SOAPChangeTarget:
+    """Structured SOAP Change Target whose identity is PortType QName plus operation."""
+
+    wsdl: Path
+    port_type: str
+    operation: str
+
+    @property
+    def signature(self) -> str:
+        return f"{self.port_type}#{self.operation}"
+
+    @property
+    def contract_key(self) -> str:
+        return f"soap:{self.signature}"
+
+    @property
+    def wsdl_path(self) -> Path:
+        return self.wsdl
+
+    @property
+    def port_type_qname(self) -> str:
+        return self.port_type
+
+    @property
+    def operation_name(self) -> str:
+        return self.operation
+
+
+@dataclass(frozen=True)
+class SOAPContractProvenance:
+    wsdl: Path
+    namespace: str | None = None
+    services: tuple[str, ...] = ()
+    ports: tuple[str, ...] = ()
+    bindings: tuple[str, ...] = ()
+    endpoint_addresses: tuple[str, ...] = ()
+    input_messages: tuple[str, ...] = ()
+    output_messages: tuple[str, ...] = ()
+    fault_messages: tuple[str, ...] = ()
+    evidence_handles: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class IndexResult:
     source_roots: tuple[Path, ...]
@@ -343,6 +447,17 @@ class IndexResult:
     vbnet_files: tuple[Path, ...] = ()
     indexed_file_hashes: tuple[tuple[Path, str], ...] = ()
 
+    @property
+    def rest_facts(self) -> tuple[RESTFact, ...]:
+        return tuple(
+            RESTFact(
+                fact.kind, fact.subject, fact.target, fact.value, fact.path,
+                fact.start_line, fact.end_line,
+                fact.flavor if fact.flavor and fact.flavor != 'unknown' else 'jaxrs',
+            )
+            for fact in self.quarkus_rest_facts
+        )
+
 
 @dataclass(frozen=True)
 class IndexRequest:
@@ -359,6 +474,25 @@ class ImpactRequest:
     soap_wsdl: Path | None = None
     soap_port_type: str | None = None
     soap_operation: str | None = None
+    soap_target: SOAPChangeTarget | None = None
+    rest_target: RESTChangeTarget | None = None
+
+
+@dataclass(frozen=True)
+class ContractDiscoveryRequest:
+    repository_root: Path
+    terms: tuple[str, ...] = ()
+    soap_wsdl: Path | None = None
+    soap_port_type: str | None = None
+    soap_operation: str | None = None
+    limit: int = 50
+    offset: int = 0
+    rest_http_method: str | None = None
+    rest_path: str | None = None
+    rest_consumes: tuple[str, ...] = ()
+    rest_produces: tuple[str, ...] = ()
+    rest_params: tuple[str, ...] = ()
+    rest_headers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -429,6 +563,57 @@ class UnresolvedItem:
     start_line: int | None = None
     end_line: int | None = None
     evidence_handle: str | None = None
+
+
+@dataclass(frozen=True)
+class SOAPContractCandidate:
+    contract_key: str
+    target: SOAPChangeTarget
+    match_reasons: tuple[str, ...]
+    source_resolution: str
+    source_entry_points: tuple[ImpactTarget, ...]
+    evidence_handles: tuple[str, ...]
+    provenance: SOAPContractProvenance
+    unresolved_items: tuple[UnresolvedItem, ...] = ()
+
+    @property
+    def source_entry_point(self) -> ImpactTarget | None:
+        return self.source_entry_points[0] if len(self.source_entry_points) == 1 else None
+
+
+@dataclass(frozen=True)
+class RESTContractCandidate:
+    contract_key: str
+    target: RESTChangeTarget
+    match_reasons: tuple[str, ...]
+    source_resolution: str
+    source_entry_points: tuple[ImpactTarget, ...]
+    evidence_handles: tuple[str, ...]
+    provenance: RESTContractProvenance
+    unresolved_items: tuple[UnresolvedItem, ...] = ()
+
+    @property
+    def source_entry_point(self) -> ImpactTarget | None:
+        return self.source_entry_points[0] if len(self.source_entry_points) == 1 else None
+
+
+@dataclass(frozen=True)
+class ContractDiscoveryResult:
+    outcome: str
+    candidates: tuple[SOAPContractCandidate | RESTContractCandidate, ...]
+    requested_terms: tuple[str, ...]
+    unresolved_terms: tuple[str, ...]
+    unresolved_items: tuple[UnresolvedItem, ...]
+    snapshot: IndexSnapshot | None
+    total_count: int
+    limit: int
+    offset: int
+    has_more: bool
+    next_offset: int | None
+
+    @property
+    def contracts(self) -> tuple[SOAPContractCandidate, ...]:
+        return self.candidates
 
 
 @dataclass(frozen=True)
@@ -537,6 +722,7 @@ class ChangeScopeApplication:
         self,
         request: IndexRequest
         | ImpactRequest
+        | ContractDiscoveryRequest
         | EvidenceRequest
         | SourceRequest
         | CatalogRegisterRepositoryRequest
@@ -544,9 +730,11 @@ class ChangeScopeApplication:
         | CatalogResolveMappingRequest
         | RepositoryStatusRequest
         | CatalogSummaryRequest,
-    ) -> IndexResult | ImpactResult | SourceNavigation | CatalogResult | RepositoryIndexStatus | WorkspaceCatalogSummary:
+    ) -> IndexResult | ImpactResult | ContractDiscoveryResult | SourceNavigation | CatalogResult | RepositoryIndexStatus | WorkspaceCatalogSummary:
         if isinstance(request, IndexRequest):
             return _index_repository(request.repository_root)
+        if isinstance(request, ContractDiscoveryRequest):
+            return _discover_contracts(request)
         if isinstance(request, EvidenceRequest):
             return _evidence_context(request)
         if isinstance(request, SourceRequest):
@@ -602,6 +790,27 @@ def _validate_relative_path(path: Path) -> Path:
     if path.is_absolute() or ".." in path.parts:
         raise ValueError("Source paths must be relative to the repository root.")
     return path
+
+
+def _string_tuple(value: Iterable[str] | str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(item for item in value if item)
+
+
+def _normalize_rest_path(*parts: str) -> str:
+    segments: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        segments.extend(piece for piece in re.split(r'/+', str(part).replace('\\', '/').strip()) if piece)
+    return '/' + '/'.join(segments) if segments else '/'
+
+
+def _rest_route_shape(path: str) -> str:
+    return re.sub(r'\{[^}/]+\}', '{}', _normalize_rest_path(path))
 
 
 def _enclosing_symbol_range(root: Path, path: Path, start_line: int, end_line: int) -> tuple[int, int] | None:
@@ -685,6 +894,730 @@ def _resolve_indexed_source(root: Path, path: Path) -> Path:
     return source_path
 
 
+def _discover_contracts(request: ContractDiscoveryRequest) -> ContractDiscoveryResult:
+    rest_filter = any((
+        request.rest_http_method,
+        request.rest_path,
+        request.rest_consumes,
+        request.rest_produces,
+        request.rest_params,
+        request.rest_headers,
+    ))
+    soap_filter = any((request.soap_wsdl, request.soap_port_type, request.soap_operation))
+    if rest_filter and soap_filter:
+        raise ValueError('Specify either REST or SOAP discovery filters, not both.')
+    if rest_filter:
+        return _discover_rest_contracts(request)
+    if soap_filter:
+        return _discover_soap_contracts(request)
+    inventory_request = replace(request, limit=100, offset=0)
+    return _merge_contract_discovery(
+        _discover_soap_contracts(inventory_request),
+        _discover_rest_contracts(inventory_request),
+        request,
+    )
+
+
+def _discover_rest_contracts(request: ContractDiscoveryRequest) -> ContractDiscoveryResult:
+    root = request.repository_root.resolve()
+    database_path = root / '.changescope' / 'index.sqlite'
+    if request.limit < 1 or request.limit > 100:
+        raise ValueError('Contract discovery limit must be between 1 and 100.')
+    if request.offset < 0:
+        raise ValueError('Contract discovery offset cannot be negative.')
+    terms = tuple(term.strip() for term in request.terms if term.strip())
+    has_exact = any((
+        request.rest_http_method,
+        request.rest_path,
+        request.rest_consumes,
+        request.rest_produces,
+        request.rest_params,
+        request.rest_headers,
+    ))
+    if has_exact and terms:
+        raise ValueError('Use either lexical search terms or exact REST filters, not both.')
+    if request.rest_path is not None:
+        _normalize_rest_path(request.rest_path)
+    if not database_path.is_file():
+        return ContractDiscoveryResult(
+            'index_missing', (), terms, terms,
+            (_unresolved('No local Repository Index exists. Run changescope index first.'),),
+            None, 0, request.limit, request.offset, False, None,
+        )
+
+    _refresh_index_if_needed(root)
+    connection = sqlite3.connect(database_path)
+    try:
+        snapshot = _read_index_snapshot(connection, root)
+        rows = connection.execute(
+            '''SELECT kind, subject, target, value, path, start_line, end_line, flavor
+               FROM quarkus_rest_facts WHERE kind = 'rest_endpoint'
+               ORDER BY path, start_line, subject'''
+        ).fetchall()
+        app_paths = tuple(dict.fromkeys(
+            row[0] for row in connection.execute(
+                '''SELECT target FROM quarkus_rest_facts
+                   WHERE kind = 'rest_application' AND target IS NOT NULL
+                   ORDER BY path, start_line'''
+            ).fetchall()
+        ))
+        class_rows = connection.execute(
+            '''SELECT subject, target, value, path, start_line, end_line, flavor
+               FROM quarkus_rest_facts WHERE kind = 'rest_resource'
+               ORDER BY path, start_line, subject'''
+        ).fetchall()
+        class_facts = {row[0]: row for row in class_rows}
+        selected: list[tuple[tuple, RESTChangeTarget, tuple[str, ...]]] = []
+        for row in rows:
+            meta = _rest_json_object(row[3])
+            method = str(meta.get('http_method') or (row[2] or 'GET').split(' ', 1)[0]).upper()
+            subject_class = row[1].rsplit('#', 1)[0]
+            class_row = class_facts.get(subject_class)
+            class_path = class_row[1] if class_row and class_row[1] else ''
+            if not class_path and class_row and class_row[2]:
+                class_meta = _rest_json_object(class_row[2])
+                class_path = class_meta.get('path', '') or ''
+            method_path = meta.get('method_path', '') or ''
+            target = RESTChangeTarget(
+                method,
+                _normalize_rest_path(*app_paths, class_path, method_path),
+                _rest_metadata_values(meta.get('consumes')),
+                _rest_metadata_values(meta.get('produces')),
+                _rest_parameter_keys(meta.get('parameters')),
+                _rest_header_keys(meta.get('parameters')),
+            )
+            if request.rest_http_method and target.http_method != request.rest_http_method.strip().upper():
+                continue
+            if request.rest_path and target.path != _normalize_rest_path(request.rest_path):
+                continue
+            if request.rest_consumes and not set(_string_tuple(request.rest_consumes)).issubset(target.consumes):
+                continue
+            if request.rest_produces and not set(_string_tuple(request.rest_produces)).issubset(target.produces):
+                continue
+            if request.rest_params and not set(_string_tuple(request.rest_params)).issubset(target.params):
+                continue
+            if request.rest_headers and not set(_string_tuple(request.rest_headers)).issubset(target.headers):
+                continue
+            reasons = _rest_discovery_match_reasons(
+                row, target, class_row, app_paths, terms,
+            ) if terms else ()
+            if terms and not reasons:
+                continue
+            if has_exact:
+                reasons = _rest_exact_match_reasons(target, request)
+            selected.append((row, target, reasons))
+
+        unique: list[tuple[tuple, RESTChangeTarget, tuple[str, ...]]] = []
+        seen: set[tuple[str, str, str, int]] = set()
+        for item in selected:
+            row, target, _ = item
+            key = (target.contract_key, row[1], str(row[4]), row[5])
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        unique.sort(key=lambda item: (item[1].contract_key, str(item[0][4]), item[0][5]))
+        page = unique[request.offset:request.offset + request.limit]
+        candidates = tuple(
+            _rest_discovery_candidate(connection, row, target, reasons, app_paths, class_facts)
+            for row, target, reasons in page
+        )
+        unresolved_terms = tuple(
+            term for term in terms
+            if not any(term.lower() in ' '.join(reasons).lower() for _, _, reasons in unique)
+        )
+        unresolved_items = [
+            _unresolved('No REST Contract Inventory item matched search term ' + repr(term) + '.')
+            for term in unresolved_terms
+        ]
+        for candidate in candidates:
+            unresolved_items.extend(candidate.unresolved_items)
+        has_more = request.offset + len(page) < len(unique)
+        next_offset = request.offset + len(page) if has_more else None
+        if not unique:
+            outcome = 'not_found'
+            if has_exact:
+                unresolved_items.insert(
+                    0,
+                    _unresolved(
+                        'REST Contract Identity was not found for '
+                        + (request.rest_http_method or '*') + ' '
+                        + str(request.rest_path or '*') + '.'
+                    ),
+                )
+        elif has_exact and len(unique) > 1:
+            outcome = 'ambiguous'
+        elif has_more:
+            outcome = 'partial'
+        else:
+            outcome = 'resolved'
+        return ContractDiscoveryResult(
+            outcome, candidates, terms, unresolved_terms, tuple(unresolved_items),
+            snapshot, len(unique), request.limit, request.offset, has_more, next_offset,
+        )
+    finally:
+        connection.close()
+
+
+def _rest_json_object(value: str | None) -> dict[str, object]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _rest_metadata_values(value: object) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item) for item in value if item)
+    if isinstance(value, str) and value:
+        return (value,)
+    return ()
+
+
+def _rest_parameter_keys(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        str(item.get('key') or item.get('name'))
+        for item in value
+        if isinstance(item, dict) and (item.get('key') or item.get('name'))
+    )
+
+
+def _rest_header_keys(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        str(item.get('key') or item.get('name'))
+        for item in value
+        if (
+            isinstance(item, dict)
+            and item.get('role') == 'HeaderParam'
+            and (item.get('key') or item.get('name'))
+        )
+    )
+
+
+def _rest_exact_match_reasons(
+    target: RESTChangeTarget,
+    request: ContractDiscoveryRequest,
+) -> tuple[str, ...]:
+    reasons = []
+    if request.rest_http_method:
+        reasons.append('exact HTTP method matched: ' + target.http_method)
+    if request.rest_path:
+        reasons.append('exact normalized route matched: ' + target.path)
+    if request.rest_consumes:
+        reasons.append('exact consumes condition matched')
+    if request.rest_produces:
+        reasons.append('exact produces condition matched')
+    if request.rest_params:
+        reasons.append('exact request-parameter condition matched')
+    if request.rest_headers:
+        reasons.append('exact request-header condition matched')
+    return tuple(reasons)
+
+
+def _rest_discovery_match_reasons(
+    row: tuple,
+    target: RESTChangeTarget,
+    class_row: tuple | None,
+    app_paths: tuple[str, ...],
+    terms: tuple[str, ...],
+) -> tuple[str, ...]:
+    meta = _rest_json_object(row[3])
+    searchable = ' '.join(str(part) for part in (
+        target.http_method, target.path, target.route_shape,
+        target.contract_key, row[1], row[4], row[7],
+        meta.get('consumes'), meta.get('produces'),
+    ) if part)
+    if class_row:
+        searchable += ' ' + ' '.join(str(part) for part in class_row[:4] if part)
+    searchable += ' ' + ' '.join(app_paths)
+    reasons = []
+    for term in terms:
+        if term.lower() not in searchable.lower():
+            continue
+        lower = term.lower()
+        if lower in target.path.lower():
+            reason = 'term ' + repr(term) + ' matched REST route ' + repr(target.path)
+        elif lower in target.http_method.lower():
+            reason = 'term ' + repr(term) + ' matched HTTP method ' + target.http_method
+        elif lower in row[1].lower():
+            reason = 'term ' + repr(term) + ' matched Java handler ' + row[1]
+        else:
+            reason = 'term ' + repr(term) + ' matched REST contract metadata'
+        reasons.append(reason)
+    return tuple(dict.fromkeys(reasons))
+
+
+def _rest_discovery_candidate(
+    connection: sqlite3.Connection,
+    row: tuple,
+    target: RESTChangeTarget,
+    match_reasons: tuple[str, ...],
+    app_paths: tuple[str, ...],
+    class_facts: dict[str, tuple],
+) -> RESTContractCandidate:
+    subject = row[1]
+    subject_class, _, method_name = subject.partition('#')
+    class_row = class_facts.get(subject_class)
+    class_path_value = class_row[1] if class_row else ''
+    method_meta = _rest_json_object(row[3])
+    rest_flavor = row[7] if row[7] and row[7] != 'unknown' else 'jaxrs'
+    method_path = method_meta.get('method_path', '') or ''
+    entry_rows = connection.execute(
+        '''SELECT kind, qualified_name, signature, path, start_line, end_line
+           FROM java_declarations WHERE signature LIKE ? OR qualified_name = ?
+           ORDER BY path, start_line''',
+        (subject + '(%', subject),
+    ).fetchall()
+    if class_row:
+        class_meta = _rest_json_object(class_row[2])
+        if class_meta.get('kind') == 'interface':
+            implementation_classes = []
+            for candidate_class, candidate_row in class_facts.items():
+                candidate_meta = _rest_json_object(candidate_row[2])
+                interfaces = candidate_meta.get('implements', [])
+                if subject_class in interfaces or subject_class.rsplit('.', 1)[-1] in interfaces:
+                    implementation_classes.append(candidate_class)
+            implementation_rows = []
+            for implementation_class in implementation_classes:
+                implementation_rows.extend(connection.execute(
+                    '''SELECT kind, qualified_name, signature, path, start_line, end_line
+                       FROM java_declarations WHERE qualified_name LIKE ?
+                       AND name = ? ORDER BY path, start_line''',
+                    (implementation_class + '#%', method_name),
+                ).fetchall())
+            if implementation_rows:
+                entry_rows = implementation_rows
+
+    entry_points = tuple(
+        ImpactTarget(
+            decl[2], Path(decl[3]), decl[4], decl[5],
+            _evidence_handle('declaration', Path(decl[3]), decl[4], decl[5]),
+        )
+        for decl in entry_rows
+    )
+    endpoint_handle = _evidence_handle('quarkus_rest', Path(row[4]), row[5], row[6])
+    evidence_handles = [endpoint_handle]
+    if class_row:
+        evidence_handles.append(_evidence_handle('quarkus_rest', Path(class_row[3]), class_row[4], class_row[5]))
+    application_rows = connection.execute(
+        '''SELECT path, start_line, end_line FROM quarkus_rest_facts
+           WHERE kind = 'rest_application' ORDER BY path, start_line'''
+    ).fetchall()
+    evidence_handles.extend(
+        _evidence_handle('quarkus_rest', Path(path), start, end)
+        for path, start, end in application_rows
+    )
+    evidence_handles.extend(entry.evidence_handle for entry in entry_points)
+    if not entry_points:
+        source_resolution = 'unresolved'
+        unresolved = (_unresolved(
+            'REST operation ' + target.signature + ' has no repository-local implementation evidence.',
+            Path(row[4]), row[5], row[6], 'quarkus_rest',
+        ),)
+    elif len(entry_points) > 1:
+        source_resolution = 'ambiguous'
+        unresolved = (_unresolved(
+            'REST operation ' + target.signature + ' has multiple repository-local source entry points.',
+            Path(row[4]), row[5], row[6], 'quarkus_rest',
+        ),)
+    else:
+        source_resolution = 'resolved'
+        unresolved = ()
+    provenance = RESTContractProvenance(
+        tuple(app_paths),
+        (class_row[1],) if class_row and class_row[1] else (),
+        method_path,
+        target.http_method,
+        target.consumes,
+        target.produces,
+        target.headers,
+        target.route_shape or '/',
+        (rest_flavor,),
+        tuple(dict.fromkeys(evidence_handles)),
+    )
+    return RESTContractCandidate(
+        target.contract_key, target, match_reasons, source_resolution,
+        entry_points, tuple(dict.fromkeys(evidence_handles)), provenance, unresolved,
+    )
+
+
+def _merge_contract_discovery(
+    soap: ContractDiscoveryResult,
+    rest: ContractDiscoveryResult,
+    request: ContractDiscoveryRequest,
+) -> ContractDiscoveryResult:
+    if soap.outcome == 'index_missing' and rest.outcome == 'index_missing':
+        return ContractDiscoveryResult(
+            'index_missing', (), request.terms, request.terms,
+            soap.unresolved_items or rest.unresolved_items, None, 0,
+            request.limit, request.offset, False, None,
+        )
+    candidates = tuple(sorted(
+        (*soap.candidates, *rest.candidates),
+        key=lambda candidate: (candidate.contract_key, candidate.target.signature),
+    ))
+    page = candidates[request.offset:request.offset + request.limit]
+    unresolved_terms = tuple(
+        term for term in request.terms
+        if not any(term.lower() in ' '.join(candidate.match_reasons).lower() for candidate in candidates)
+    )
+    unresolved_items = [
+        _unresolved('No Contract Inventory item matched search term ' + repr(term) + '.')
+        for term in unresolved_terms
+    ]
+    for candidate in page:
+        unresolved_items.extend(candidate.unresolved_items)
+    has_more = request.offset + len(page) < len(candidates)
+    next_offset = request.offset + len(page) if has_more else None
+    outcome = 'partial' if has_more else 'resolved'
+    if not candidates:
+        outcome = 'not_found'
+    return ContractDiscoveryResult(
+        outcome, page, request.terms, unresolved_terms, tuple(unresolved_items),
+        soap.snapshot or rest.snapshot, len(candidates), request.limit,
+        request.offset, has_more, next_offset,
+    )
+
+def _discover_soap_contracts(request: ContractDiscoveryRequest) -> ContractDiscoveryResult:
+    root = request.repository_root.resolve()
+    database_path = root / ".changescope" / "index.sqlite"
+    if request.limit < 1 or request.limit > 100:
+        raise ValueError("Contract discovery limit must be between 1 and 100.")
+    if request.offset < 0:
+        raise ValueError("Contract discovery offset cannot be negative.")
+    terms = tuple(term.strip() for term in request.terms if term.strip())
+    exact_values = (request.soap_wsdl, request.soap_port_type, request.soap_operation)
+    has_exact = any(value is not None for value in exact_values)
+    if has_exact and not (request.soap_port_type and request.soap_operation):
+        raise ValueError("SOAP discovery filters require both port_type and operation.")
+    if has_exact and terms:
+        raise ValueError("Use either lexical search terms or exact SOAP filters, not both.")
+    if request.soap_wsdl is not None:
+        _validate_relative_path(request.soap_wsdl)
+
+    if not database_path.is_file():
+        return ContractDiscoveryResult(
+            "index_missing",
+            (),
+            terms,
+            terms,
+            (_unresolved("No local Repository Index exists. Run changescope index first."),),
+            None,
+            0,
+            request.limit,
+            request.offset,
+            False,
+            None,
+        )
+
+    _refresh_index_if_needed(root)
+    connection = sqlite3.connect(database_path)
+    try:
+        snapshot = _read_index_snapshot(connection, root)
+        operation_rows = connection.execute(
+            """SELECT kind, subject, target, value, path, start_line, end_line, namespace
+            FROM soap_facts WHERE kind = 'operation'
+            ORDER BY target, subject, path, start_line"""
+        ).fetchall()
+        selected_rows: list[tuple] = []
+        reasons_by_identity: dict[tuple[str, str, str], tuple[str, ...]] = {}
+        for row in operation_rows:
+            _, operation, port_type, _, path_value, _, _, _ = row
+            path = Path(path_value)
+            if request.soap_wsdl is not None and path.as_posix() != request.soap_wsdl.as_posix():
+                continue
+            if has_exact:
+                if operation != request.soap_operation:
+                    continue
+                if not _matches_port_type(port_type or "", request.soap_port_type or ""):
+                    continue
+                selected_rows.append(row)
+                reasons_by_identity[(port_type, operation, path.as_posix())] = (
+                    f"exact PortType QName matched: {port_type}",
+                    f"exact operation matched: {operation}",
+                )
+                continue
+
+            if terms:
+                reasons = _soap_discovery_match_reasons(connection, row, terms)
+                if not reasons:
+                    continue
+                selected_rows.append(row)
+                reasons_by_identity[(port_type, operation, path.as_posix())] = reasons
+            else:
+                selected_rows.append(row)
+                reasons_by_identity[(port_type, operation, path.as_posix())] = ()
+
+        unique_rows: list[tuple] = []
+        seen_rows: set[tuple[str, str, str]] = set()
+        for row in selected_rows:
+            identity = (row[2], row[1], Path(row[4]).as_posix())
+            if identity in seen_rows:
+                continue
+            seen_rows.add(identity)
+            unique_rows.append(row)
+
+        unresolved_terms = tuple(
+            term for term in terms
+            if not any(term.lower() in " ".join(reasons).lower() for reasons in reasons_by_identity.values())
+        )
+        total_count = len(unique_rows)
+        page_rows = unique_rows[request.offset:request.offset + request.limit]
+        candidates = tuple(
+            _soap_discovery_candidate(
+                connection,
+                row,
+                reasons_by_identity[(row[2], row[1], Path(row[4]).as_posix())],
+            )
+            for row in page_rows
+        )
+        has_more = request.offset + len(page_rows) < total_count
+        next_offset = request.offset + len(page_rows) if has_more else None
+        unresolved_items = [
+            _unresolved(
+                f"No SOAP Contract Inventory item matched search term '{term}'."
+            )
+            for term in unresolved_terms
+        ]
+        for candidate in candidates:
+            unresolved_items.extend(candidate.unresolved_items)
+
+        if not unique_rows:
+            outcome = "not_found"
+            if has_exact:
+                unresolved_items.insert(
+                    0,
+                    _unresolved(
+                        f"SOAP Contract Identity was not found for PortType '{request.soap_port_type}' and operation '{request.soap_operation}'."
+                    ),
+                )
+        elif has_exact and len(unique_rows) > 1:
+            outcome = "ambiguous"
+        elif has_more:
+            outcome = "partial"
+        else:
+            outcome = "resolved"
+
+        return ContractDiscoveryResult(
+            outcome,
+            candidates,
+            terms,
+            unresolved_terms,
+            tuple(unresolved_items),
+            snapshot,
+            total_count,
+            request.limit,
+            request.offset,
+            has_more,
+            next_offset,
+        )
+    finally:
+        connection.close()
+
+
+def _soap_discovery_match_reasons(
+    connection: sqlite3.Connection,
+    operation_row: tuple,
+    terms: tuple[str, ...],
+) -> tuple[str, ...]:
+    _, operation, port_type, value, path, _, _, namespace = operation_row
+    related_rows = connection.execute(
+        """SELECT kind, subject, target, value FROM soap_facts
+        WHERE path = ? AND kind IN ('port_type', 'binding', 'binding_operation', 'service', 'port',
+                                   'message', 'operation_input', 'operation_output', 'operation_fault')""",
+        (path,),
+    ).fetchall()
+    searchable = " ".join(
+        str(part)
+        for part in (operation, port_type, value, namespace, path)
+        if part
+    )
+    searchable += " " + " ".join(
+        str(part)
+        for row in related_rows
+        for part in row
+        if part
+    )
+    reasons: list[str] = []
+    for term in terms:
+        if term.lower() not in searchable.lower():
+            continue
+        lower_term = term.lower()
+        if lower_term in str(operation).lower():
+            reason = f"term '{term}' matched SOAP operation '{operation}'"
+        elif lower_term in str(port_type).lower():
+            reason = f"term '{term}' matched SOAP PortType QName '{port_type}'"
+        elif lower_term in str(path).lower():
+            reason = f"term '{term}' matched WSDL provenance '{path}'"
+        else:
+            reason = f"term '{term}' matched SOAP contract metadata"
+        reasons.append(reason)
+    return tuple(dict.fromkeys(reasons))
+
+
+def _soap_discovery_candidate(
+    connection: sqlite3.Connection,
+    operation_row: tuple,
+    match_reasons: tuple[str, ...],
+) -> SOAPContractCandidate:
+    _, operation, port_type, _, wsdl_path_value, start_line, end_line, namespace = operation_row
+    wsdl_path = Path(wsdl_path_value)
+    operation_handle = f"soap_wsdl:{wsdl_path.as_posix()}:{start_line}-{end_line}"
+    bindings_rows = connection.execute(
+        """SELECT subject, target, path, start_line, end_line
+        FROM soap_facts WHERE kind = 'binding' AND target = ? ORDER BY subject, path""",
+        (port_type,),
+    ).fetchall()
+    binding_names = tuple(dict.fromkeys(row[0] for row in bindings_rows))
+    service_rows = connection.execute(
+        """SELECT subject, target, value, path, start_line, end_line
+        FROM soap_facts WHERE kind = 'port' ORDER BY subject, value, path"""
+    ).fetchall()
+    service_names: list[str] = []
+    port_names: list[str] = []
+    addresses: list[str] = []
+    provenance_handles: list[str] = [operation_handle]
+    for binding in bindings_rows:
+        provenance_handles.append(f"soap_wsdl:{Path(binding[2]).as_posix()}:{binding[3]}-{binding[4]}")
+    for service, binding, port_value, path_value, fact_start, fact_end in service_rows:
+        if binding not in binding_names:
+            continue
+        service_names.append(service)
+        port_name, _, address = (port_value or "").partition("|")
+        if port_name:
+            port_names.append(port_name)
+        if address:
+            addresses.append(address)
+        provenance_handles.append(f"soap_wsdl:{Path(path_value).as_posix()}:{fact_start}-{fact_end}")
+
+    message_rows = connection.execute(
+        """SELECT kind, value, path, start_line, end_line
+        FROM soap_facts WHERE subject = ? AND target = ?
+          AND kind IN ('operation_input', 'operation_output', 'operation_fault')
+        ORDER BY kind, path""",
+        (operation, port_type),
+    ).fetchall()
+    input_messages = tuple(dict.fromkeys(row[1] for row in message_rows if row[0] == "operation_input" and row[1]))
+    output_messages = tuple(dict.fromkeys(row[1] for row in message_rows if row[0] == "operation_output" and row[1]))
+    fault_messages = tuple(dict.fromkeys(row[1] for row in message_rows if row[0] == "operation_fault" and row[1]))
+    for _, _, path_value, fact_start, fact_end in message_rows:
+        provenance_handles.append(f"soap_wsdl:{Path(path_value).as_posix()}:{fact_start}-{fact_end}")
+
+    all_method_rows = connection.execute(
+        """SELECT subject, path, start_line, end_line, namespace
+        FROM soap_facts WHERE kind = 'java_method' AND target = ?
+        ORDER BY subject, path, start_line""",
+        (operation,),
+    ).fetchall()
+    endpoint_subjects = {
+        row[0]
+        for row in connection.execute(
+            "SELECT subject FROM soap_facts WHERE kind = 'java_endpoint'"
+        ).fetchall()
+    }
+    concrete_endpoint_subjects = {
+        row[0]
+        for row in connection.execute(
+            "SELECT qualified_name FROM java_declarations WHERE kind = 'class'"
+        ).fetchall()
+        if row[0] in endpoint_subjects
+    }
+    method_rows = [
+        row for row in all_method_rows
+        if row[0].rsplit('#', 1)[0] in concrete_endpoint_subjects
+        and (not namespace or not row[4] or row[4] == namespace)
+    ] or [
+        row for row in all_method_rows
+        if not namespace or not row[4] or row[4] == namespace
+    ]
+    entry_points: list[ImpactTarget] = []
+    seen_entries: set[tuple[str, str, int, int]] = set()
+    for subject, method_path, method_start, method_end, _method_namespace in method_rows:
+        declaration_rows = connection.execute(
+            """SELECT signature, path, start_line, end_line
+            FROM java_declarations
+            WHERE signature = ? OR signature LIKE ?
+            ORDER BY path, start_line""",
+            (subject, subject + "(%"),
+        ).fetchall()
+        if not declaration_rows:
+            declaration_rows = ((subject + "()", method_path, method_start, method_end),)
+        for signature, source_path, source_start, source_end in declaration_rows:
+            entry_key = (signature, source_path, source_start, source_end)
+            if entry_key in seen_entries:
+                continue
+            seen_entries.add(entry_key)
+            entry_points.append(
+                ImpactTarget(
+                    signature,
+                    Path(source_path),
+                    source_start,
+                    source_end,
+                    f"declaration:{Path(source_path).as_posix()}:{source_start}-{source_end}",
+                )
+            )
+
+    if not entry_points:
+        source_resolution = "unresolved"
+        unresolved_items = (
+            _unresolved(
+                f"SOAP operation '{operation}' has no repository-local implementation evidence.",
+                path=wsdl_path,
+                start_line=start_line,
+                end_line=end_line,
+                evidence_kind="soap_wsdl",
+            ),
+        )
+    elif len(entry_points) > 1:
+        source_resolution = "ambiguous"
+        unresolved_items = (
+            _unresolved(
+                f"SOAP operation '{operation}' has {len(entry_points)} possible repository-local source entry points.",
+                path=wsdl_path,
+                start_line=start_line,
+                end_line=end_line,
+                evidence_kind="soap_wsdl",
+            ),
+        )
+    else:
+        source_resolution = "resolved"
+        unresolved_items = ()
+
+    evidence_handles = tuple(dict.fromkeys((
+        *provenance_handles,
+        *(entry.evidence_handle for entry in entry_points),
+    )))
+    provenance = SOAPContractProvenance(
+        wsdl_path,
+        namespace,
+        tuple(dict.fromkeys(service_names)),
+        tuple(dict.fromkeys(port_names)),
+        binding_names,
+        tuple(dict.fromkeys(addresses)),
+        input_messages,
+        output_messages,
+        fault_messages,
+        evidence_handles,
+    )
+    target = SOAPChangeTarget(wsdl_path, port_type, operation)
+    return SOAPContractCandidate(
+        target.contract_key,
+        target,
+        match_reasons,
+        source_resolution,
+        tuple(entry_points),
+        evidence_handles,
+        provenance,
+        unresolved_items,
+    )
+
+
 def _impact_repository(request: ImpactRequest) -> ImpactResult:
     root = request.repository_root.resolve()
     database_path = root / ".changescope" / "index.sqlite"
@@ -695,10 +1628,20 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
         )
     _refresh_index_if_needed(root)
 
-    has_soap_args = any(
+    has_flat_soap_args = any(
         arg is not None
         for arg in (request.soap_wsdl, request.soap_port_type, request.soap_operation)
     )
+    has_soap_args = request.soap_target is not None or has_flat_soap_args
+    has_rest_args = request.rest_target is not None
+    if has_rest_args and (request.target is not None or has_soap_args):
+        snapshot = _read_index_snapshot(database_path, root)
+        return ImpactResult(
+            'invalid_target', request.rest_target.signature, None, (), (), (),
+            (_unresolved('Cannot mix a REST Change Target with a Java or SOAP target.'),), snapshot,
+        )
+    if has_rest_args:
+        return _impact_rest_repository(request, root, database_path)
     if request.target is not None and has_soap_args:
         conn = sqlite3.connect(database_path)
         try:
@@ -715,6 +1658,25 @@ def _impact_repository(request: ImpactRequest) -> ImpactResult:
             (_unresolved("Cannot mix Java target ('Class#method') and SOAP target arguments (--soap-wsdl, --soap-port-type, --soap-operation)."),),
             snapshot,
         )
+
+    if request.soap_target is not None:
+        if has_flat_soap_args:
+            conn = sqlite3.connect(database_path)
+            try:
+                snapshot = _read_index_snapshot(conn, root)
+            finally:
+                conn.close()
+            return ImpactResult(
+                "invalid_target",
+                request.soap_target.signature,
+                None,
+                (),
+                (),
+                (),
+                (_unresolved("Cannot mix a structured SOAP Change Target with flat SOAP target arguments."),),
+                snapshot,
+            )
+        return _impact_soap_repository(request, root, database_path)
 
     if has_soap_args or request.target is None:
         if not (request.soap_wsdl and request.soap_port_type and request.soap_operation):
@@ -5928,13 +6890,158 @@ def _soap_endpoint_relationships(
     return relationships, unresolved_items
 
 
+def _impact_rest_repository(request: ImpactRequest, root: Path, database_path: Path) -> ImpactResult:
+    rest_target = request.rest_target
+    if rest_target is None:
+        raise ValueError('A REST impact request requires a REST Change Target.')
+    connection = sqlite3.connect(database_path)
+    try:
+        snapshot = _read_index_snapshot(connection, root)
+        app_paths = tuple(dict.fromkeys(
+            row[0] for row in connection.execute(
+                '''SELECT target FROM quarkus_rest_facts
+                   WHERE kind = 'rest_application' AND target IS NOT NULL
+                   ORDER BY path, start_line'''
+            ).fetchall()
+        ))
+        class_rows = connection.execute(
+            '''SELECT subject, target, value, path, start_line, end_line, flavor
+               FROM quarkus_rest_facts WHERE kind = 'rest_resource'
+               ORDER BY path, start_line, subject'''
+        ).fetchall()
+        class_facts = {row[0]: row for row in class_rows}
+        endpoint_rows = connection.execute(
+            '''SELECT kind, subject, target, value, path, start_line, end_line, flavor
+               FROM quarkus_rest_facts WHERE kind = 'rest_endpoint'
+               ORDER BY path, start_line, subject'''
+        ).fetchall()
+        matched_rows = []
+        for row in endpoint_rows:
+            meta = _rest_json_object(row[3])
+            method = str(meta.get('http_method') or (row[2] or 'GET').split(' ', 1)[0]).upper()
+            subject_class = row[1].rsplit('#', 1)[0]
+            class_row = class_facts.get(subject_class)
+            class_path = class_row[1] if class_row and class_row[1] else ''
+            method_path = meta.get('method_path', '') or ''
+            candidate_target = RESTChangeTarget(
+                method,
+                _normalize_rest_path(*app_paths, class_path, method_path),
+                _rest_metadata_values(meta.get('consumes')),
+                _rest_metadata_values(meta.get('produces')),
+                _rest_parameter_keys(meta.get('parameters')),
+                _rest_header_keys(meta.get('parameters')),
+            )
+            if _rest_target_matches(rest_target, candidate_target):
+                matched_rows.append((row, candidate_target))
+    finally:
+        connection.close()
+
+    if not matched_rows:
+        return ImpactResult(
+            'not_found', rest_target.contract_key, None, (), (), (),
+            (_unresolved('REST target ' + rest_target.contract_key + ' was not found.'),), snapshot,
+        )
+    candidates = tuple(
+        ImpactTarget(
+            candidate_target.signature, Path(row[4]), row[5], row[6],
+            _evidence_handle('quarkus_rest', Path(row[4]), row[5], row[6]),
+        )
+        for row, candidate_target in matched_rows
+    )
+    if len(matched_rows) > 1:
+        return ImpactResult('ambiguous', rest_target.contract_key, None, candidates, (), (), (), snapshot)
+
+    row, matched_target = matched_rows[0]
+    connection = sqlite3.connect(database_path)
+    try:
+        class_rows = connection.execute(
+            '''SELECT subject, target, value, path, start_line, end_line, flavor
+               FROM quarkus_rest_facts WHERE kind = 'rest_resource'
+               ORDER BY path, start_line, subject'''
+        ).fetchall()
+        class_facts = {class_row[0]: class_row for class_row in class_rows}
+        app_paths = tuple(dict.fromkeys(
+            app_row[0] for app_row in connection.execute(
+                '''SELECT target FROM quarkus_rest_facts
+                   WHERE kind = 'rest_application' AND target IS NOT NULL
+                   ORDER BY path, start_line'''
+            ).fetchall()
+        ))
+        contract = _rest_discovery_candidate(
+            connection, row, matched_target, (), app_paths, class_facts,
+        )
+    finally:
+        connection.close()
+    if contract.source_resolution == 'ambiguous':
+        return ImpactResult(
+            'ambiguous', rest_target.contract_key, None,
+            contract.source_entry_points, (), (), contract.unresolved_items, snapshot,
+        )
+    route_target = candidates[0]
+    relationships = [
+        ImpactRelationship(
+            'rest_contract', rest_target.signature, route_target.path,
+            route_target.start_line, route_target.end_line, route_target.evidence_handle,
+            'high' if row[7] and row[7] != 'unknown' else 'medium',
+            evidence_chain=tuple(contract.evidence_handles),
+            business_view=json.dumps({
+                'http_method': matched_target.http_method,
+                'route': matched_target.path,
+                'route_shape': matched_target.route_shape,
+                'consumes': matched_target.consumes,
+                'produces': matched_target.produces,
+                'headers': matched_target.headers,
+                'flavor': row[7],
+            }),
+        )
+    ]
+    unresolved_items = list(contract.unresolved_items)
+    source = contract.source_entry_point
+    if source is not None:
+        direct, direct_unresolved = _direct_relationships(
+            database_path, source, request.profiles, request.build_profiles, request.runtime_profiles,
+        )
+        relationships.extend(direct)
+        unresolved_items.extend(direct_unresolved)
+        rest_relationships, rest_unresolved = _quarkus_rest_relationships(
+            database_path, source.signature.split('#', 1)[0], source,
+        )
+        relationships.extend(rest_relationships)
+        unresolved_items.extend(rest_unresolved)
+    return ImpactResult(
+        'resolved', rest_target.contract_key, route_target, (), tuple(relationships),
+        ('REST Contract Identity resolved from local JAX-RS route and handler evidence.',),
+        tuple(unresolved_items), snapshot,
+    )
+
+
+def _rest_target_matches(requested: RESTChangeTarget, candidate: RESTChangeTarget) -> bool:
+    if requested.http_method and requested.http_method != candidate.http_method:
+        return False
+    if requested.path and requested.path != candidate.path:
+        return False
+    if requested.consumes and requested.consumes != candidate.consumes:
+        return False
+    if requested.produces and requested.produces != candidate.produces:
+        return False
+    if requested.params and requested.params != candidate.params:
+        return False
+    if requested.headers and requested.headers != candidate.headers:
+        return False
+    return True
+
 def _impact_soap_repository(request: ImpactRequest, root: Path, database_path: Path) -> ImpactResult:
     connection = sqlite3.connect(database_path)
     try:
         snapshot = _read_index_snapshot(connection, root)
-        wsdl_rel_path = request.soap_wsdl.as_posix() if request.soap_wsdl else ""
-        target_port_type = request.soap_port_type or ""
-        target_operation = request.soap_operation or ""
+        soap_target = request.soap_target
+        wsdl_rel_path = (
+            soap_target.wsdl.as_posix()
+            if soap_target is not None
+            else request.soap_wsdl.as_posix() if request.soap_wsdl else ""
+        )
+        target_port_type = soap_target.port_type if soap_target is not None else request.soap_port_type or ""
+        target_operation = soap_target.operation if soap_target is not None else request.soap_operation or ""
 
         rows = connection.execute(
             """SELECT kind, subject, target, value, path, start_line, end_line, namespace
@@ -7646,7 +8753,13 @@ def _extract_build_profile_conditions(snippet: str) -> list[str]:
 
 
 def _get_class_snippet(lines: list[str], decl: JavaDeclaration) -> str:
-    raw_lines = lines[max(0, decl.start_line - 6) : decl.end_line]
+    annotation_start = max(0, decl.start_line - 1)
+    while annotation_start > 0 and (
+        lines[annotation_start - 1].strip().startswith('@')
+        or not lines[annotation_start - 1].strip()
+    ):
+        annotation_start -= 1
+    raw_lines = lines[annotation_start : decl.end_line]
     header_lines = []
     for line in raw_lines:
         header_lines.append(line)
@@ -7664,6 +8777,18 @@ def _get_method_snippet(lines: list[str], decl: JavaDeclaration) -> str:
             if re.search(r'\b(class|interface|enum|record)\b', line) or line.strip() == "}":
                 start_idx = idx + 1
     return "\n".join(raw_lines[start_idx:])
+
+
+def _rest_annotation_value(snippet: str, name: str) -> str | list[str] | None:
+    match = re.search(r'@' + re.escape(name) + r'\s*\(\s*([^)]*)\)', snippet, re.DOTALL)
+    if not match:
+        return None
+    quote_chars = chr(34) + chr(39)
+    values = re.findall('[' + quote_chars + ']([^' + quote_chars + ']+)[' + quote_chars + ']', match.group(1))
+    if not values:
+        value = match.group(1).strip()
+        return value or None
+    return values[0] if len(values) == 1 else values
 
 
 def _analyze_quarkus_rest_files(
@@ -7829,10 +8954,10 @@ def _analyze_quarkus_rest_files(
                     prof_conds = _extract_build_profile_conditions(method_snippet)
 
                     produces_match = re.search(r'@Produces\s*\(\s*(?:\{[^}]*\}|["\']([^"\']+)["\']|([A-Za-z0-9_$.]+))\s*\)', method_snippet)
-                    produces_val = (produces_match.group(1) or produces_match.group(2)) if produces_match else None
+                    produces_val = _rest_annotation_value(method_snippet, 'Produces')
 
                     consumes_match = re.search(r'@Consumes\s*\(\s*(?:\{[^}]*\}|["\']([^"\']+)["\']|([A-Za-z0-9_$.]+))\s*\)', method_snippet)
-                    consumes_val = (consumes_match.group(1) or consumes_match.group(2)) if consumes_match else None
+                    consumes_val = _rest_annotation_value(method_snippet, 'Consumes')
 
                     params = []
                     has_servlet_ctx = False
