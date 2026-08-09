@@ -374,6 +374,7 @@ class RESTContractProvenance:
     route_shape: str = '/'
     flavors: tuple[str, ...] = ()
     evidence_handles: tuple[str, ...] = ()
+    params: tuple[str, ...] = ()
 
 @dataclass(frozen=True)
 class SOAPChangeTarget:
@@ -753,7 +754,13 @@ class ChangeScopeApplication:
 
 
 def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
-    match = re.fullmatch(r"(?:declaration|invocation|spring|ejb|source|quarkus_build|quarkus_config|quarkus_cdi|quarkus_rest|quarkus_route|quarkus_security|quarkus_test|quarkus_native|quarkus_boundary|soap_wsdl|vbnet_declaration|vbnet_invocation|vbnet_fact|vbnet_surface):(.+):(\d+)-(\d+)", request.evidence_handle)
+    original_handle = request.evidence_handle
+    if original_handle.startswith('spring_mvc:'):
+        request = replace(
+            request,
+            evidence_handle='quarkus_rest:' + original_handle[len('spring_mvc:'):],
+        )
+    match = re.fullmatch(r"(?:declaration|invocation|spring|spring_mvc|ejb|source|quarkus_build|quarkus_config|quarkus_cdi|quarkus_rest|quarkus_route|quarkus_security|quarkus_test|quarkus_native|quarkus_boundary|soap_wsdl|vbnet_declaration|vbnet_invocation|vbnet_fact|vbnet_surface):(.+):(\d+)-(\d+)", request.evidence_handle)
     if match is None:
         raise ValueError("Evidence handles must use kind:path:start-end form.")
     path = _validate_relative_path(Path(match.group(1)))
@@ -767,10 +774,11 @@ def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
         enclosing_range = _enclosing_symbol_range(request.repository_root.resolve(), path, evidence_start_line, evidence_end_line)
         if enclosing_range is not None:
             start_line, end_line = enclosing_range
-    return _read_bounded_source(
+    navigation = _read_bounded_source(
         request.repository_root.resolve(), path, start_line, end_line,
         request.evidence_handle, request.max_characters,
     )
+    return replace(navigation, evidence_handle=original_handle)
 
 
 def _source_range(request: SourceRequest) -> SourceNavigation:
@@ -966,46 +974,46 @@ def _discover_rest_contracts(request: ContractDiscoveryRequest) -> ContractDisco
                FROM quarkus_rest_facts WHERE kind = 'rest_resource'
                ORDER BY path, start_line, subject'''
         ).fetchall()
-        class_facts = {row[0]: row for row in class_rows}
+        class_facts = {}
+        for class_row in class_rows:
+            previous = class_facts.get(class_row[0])
+            if previous is None or class_row[6] == 'spring_mvc' or previous[6] != 'spring_mvc':
+                class_facts[class_row[0]] = class_row
         selected: list[tuple[tuple, RESTChangeTarget, tuple[str, ...]]] = []
         for row in rows:
             meta = _rest_json_object(row[3])
             method = str(meta.get('http_method') or (row[2] or 'GET').split(' ', 1)[0]).upper()
             subject_class = row[1].rsplit('#', 1)[0]
             class_row = class_facts.get(subject_class)
-            class_path = class_row[1] if class_row and class_row[1] else ''
-            if not class_path and class_row and class_row[2]:
-                class_meta = _rest_json_object(class_row[2])
-                class_path = class_meta.get('path', '') or ''
-            method_path = meta.get('method_path', '') or ''
-            target = RESTChangeTarget(
-                method,
-                _normalize_rest_path(*app_paths, class_path, method_path),
-                _rest_metadata_values(meta.get('consumes')),
-                _rest_metadata_values(meta.get('produces')),
-                _rest_parameter_keys(meta.get('parameters')),
-                _rest_header_keys(meta.get('parameters')),
-            )
-            if request.rest_http_method and target.http_method != request.rest_http_method.strip().upper():
-                continue
-            if request.rest_path and target.path != _normalize_rest_path(request.rest_path):
-                continue
-            if request.rest_consumes and not set(_string_tuple(request.rest_consumes)).issubset(target.consumes):
-                continue
-            if request.rest_produces and not set(_string_tuple(request.rest_produces)).issubset(target.produces):
-                continue
-            if request.rest_params and not set(_string_tuple(request.rest_params)).issubset(target.params):
-                continue
-            if request.rest_headers and not set(_string_tuple(request.rest_headers)).issubset(target.headers):
-                continue
-            reasons = _rest_discovery_match_reasons(
-                row, target, class_row, app_paths, terms,
-            ) if terms else ()
-            if terms and not reasons:
-                continue
-            if has_exact:
-                reasons = _rest_exact_match_reasons(target, request)
-            selected.append((row, target, reasons))
+            for endpoint_path in _rest_endpoint_paths(row, class_row, app_paths):
+                target = RESTChangeTarget(
+                    method,
+                    endpoint_path,
+                    _rest_metadata_values(meta.get('consumes')),
+                    _rest_metadata_values(meta.get('produces')),
+                    _rest_parameter_keys(meta.get('parameters')),
+                    _rest_header_keys(meta.get('parameters')),
+                )
+                if request.rest_http_method and target.http_method != request.rest_http_method.strip().upper():
+                    continue
+                if request.rest_path and target.path != _normalize_rest_path(request.rest_path):
+                    continue
+                if request.rest_consumes and not set(_string_tuple(request.rest_consumes)).issubset(target.consumes):
+                    continue
+                if request.rest_produces and not set(_string_tuple(request.rest_produces)).issubset(target.produces):
+                    continue
+                if request.rest_params and not set(_string_tuple(request.rest_params)).issubset(target.params):
+                    continue
+                if request.rest_headers and not set(_string_tuple(request.rest_headers)).issubset(target.headers):
+                    continue
+                reasons = _rest_discovery_match_reasons(
+                    row, target, class_row, app_paths, terms,
+                ) if terms else ()
+                if terms and not reasons:
+                    continue
+                if has_exact:
+                    reasons = _rest_exact_match_reasons(target, request)
+                selected.append((row, target, reasons))
 
         unique: list[tuple[tuple, RESTChangeTarget, tuple[str, ...]]] = []
         seen: set[tuple[str, str, str, int]] = set()
@@ -1082,7 +1090,9 @@ def _rest_parameter_keys(value: object) -> tuple[str, ...]:
     return tuple(
         str(item.get('key') or item.get('name'))
         for item in value
-        if isinstance(item, dict) and (item.get('key') or item.get('name'))
+        if isinstance(item, dict)
+        and item.get('role') not in {'HeaderParam', 'SpringRequestHeader'}
+        and (item.get('key') or item.get('name'))
     )
 
 
@@ -1094,10 +1104,41 @@ def _rest_header_keys(value: object) -> tuple[str, ...]:
         for item in value
         if (
             isinstance(item, dict)
-            and item.get('role') == 'HeaderParam'
+            and item.get('role') in {'HeaderParam', 'SpringRequestHeader'}
             and (item.get('key') or item.get('name'))
         )
     )
+
+
+def _rest_class_paths(class_row: tuple | None) -> tuple[str, ...]:
+    if not class_row:
+        return ()
+    metadata = _rest_json_object(class_row[2])
+    paths = _rest_metadata_values(metadata.get('paths'))
+    if paths:
+        return paths
+    return (class_row[1],) if class_row[1] else ()
+
+
+def _rest_endpoint_paths(
+    row: tuple,
+    class_row: tuple | None,
+    app_paths: tuple[str, ...],
+) -> tuple[str, ...]:
+    metadata = _rest_json_object(row[3])
+    full_paths = _rest_metadata_values(metadata.get('full_paths'))
+    if full_paths:
+        return tuple(_normalize_rest_path(path) for path in full_paths)
+    class_paths = _rest_class_paths(class_row) or ('',)
+    method_path = str(metadata.get('method_path') or '')
+    return tuple(
+        _normalize_rest_path(*app_paths, class_path, method_path)
+        for class_path in class_paths
+    )
+
+
+def _rest_evidence_kind(flavor: str | None) -> str:
+    return 'quarkus_rest' if flavor != 'spring_mvc' else 'spring_mvc'
 
 
 def _rest_exact_match_reasons(
@@ -1167,6 +1208,7 @@ def _rest_discovery_candidate(
     class_path_value = class_row[1] if class_row else ''
     method_meta = _rest_json_object(row[3])
     rest_flavor = row[7] if row[7] and row[7] != 'unknown' else 'jaxrs'
+    evidence_kind = _rest_evidence_kind(rest_flavor)
     method_path = method_meta.get('method_path', '') or ''
     entry_rows = connection.execute(
         '''SELECT kind, qualified_name, signature, path, start_line, end_line
@@ -1201,16 +1243,18 @@ def _rest_discovery_candidate(
         )
         for decl in entry_rows
     )
-    endpoint_handle = _evidence_handle('quarkus_rest', Path(row[4]), row[5], row[6])
+    endpoint_handle = _evidence_handle(evidence_kind, Path(row[4]), row[5], row[6])
     evidence_handles = [endpoint_handle]
     if class_row:
-        evidence_handles.append(_evidence_handle('quarkus_rest', Path(class_row[3]), class_row[4], class_row[5]))
-    application_rows = connection.execute(
-        '''SELECT path, start_line, end_line FROM quarkus_rest_facts
-           WHERE kind = 'rest_application' ORDER BY path, start_line'''
-    ).fetchall()
+        evidence_handles.append(_evidence_handle(evidence_kind, Path(class_row[3]), class_row[4], class_row[5]))
+    application_rows = ()
+    if rest_flavor != 'spring_mvc':
+        application_rows = connection.execute(
+            '''SELECT path, start_line, end_line FROM quarkus_rest_facts
+               WHERE kind = 'rest_application' ORDER BY path, start_line'''
+        ).fetchall()
     evidence_handles.extend(
-        _evidence_handle('quarkus_rest', Path(path), start, end)
+        _evidence_handle(evidence_kind, Path(path), start, end)
         for path, start, end in application_rows
     )
     evidence_handles.extend(entry.evidence_handle for entry in entry_points)
@@ -1218,20 +1262,21 @@ def _rest_discovery_candidate(
         source_resolution = 'unresolved'
         unresolved = (_unresolved(
             'REST operation ' + target.signature + ' has no repository-local implementation evidence.',
-            Path(row[4]), row[5], row[6], 'quarkus_rest',
+            Path(row[4]), row[5], row[6], evidence_kind,
         ),)
     elif len(entry_points) > 1:
         source_resolution = 'ambiguous'
         unresolved = (_unresolved(
             'REST operation ' + target.signature + ' has multiple repository-local source entry points.',
-            Path(row[4]), row[5], row[6], 'quarkus_rest',
+            Path(row[4]), row[5], row[6], evidence_kind,
         ),)
     else:
         source_resolution = 'resolved'
         unresolved = ()
+    provenance_application_paths = () if rest_flavor == 'spring_mvc' else tuple(app_paths)
     provenance = RESTContractProvenance(
-        tuple(app_paths),
-        (class_row[1],) if class_row and class_row[1] else (),
+        provenance_application_paths,
+        _rest_class_paths(class_row),
         method_path,
         target.http_method,
         target.consumes,
@@ -1240,6 +1285,7 @@ def _rest_discovery_candidate(
         target.route_shape or '/',
         (rest_flavor,),
         tuple(dict.fromkeys(evidence_handles)),
+        params=target.params,
     )
     return RESTContractCandidate(
         target.contract_key, target, match_reasons, source_resolution,
@@ -6909,7 +6955,11 @@ def _impact_rest_repository(request: ImpactRequest, root: Path, database_path: P
                FROM quarkus_rest_facts WHERE kind = 'rest_resource'
                ORDER BY path, start_line, subject'''
         ).fetchall()
-        class_facts = {row[0]: row for row in class_rows}
+        class_facts = {}
+        for class_row in class_rows:
+            previous = class_facts.get(class_row[0])
+            if previous is None or class_row[6] == 'spring_mvc' or previous[6] != 'spring_mvc':
+                class_facts[class_row[0]] = class_row
         endpoint_rows = connection.execute(
             '''SELECT kind, subject, target, value, path, start_line, end_line, flavor
                FROM quarkus_rest_facts WHERE kind = 'rest_endpoint'
@@ -6921,18 +6971,17 @@ def _impact_rest_repository(request: ImpactRequest, root: Path, database_path: P
             method = str(meta.get('http_method') or (row[2] or 'GET').split(' ', 1)[0]).upper()
             subject_class = row[1].rsplit('#', 1)[0]
             class_row = class_facts.get(subject_class)
-            class_path = class_row[1] if class_row and class_row[1] else ''
-            method_path = meta.get('method_path', '') or ''
-            candidate_target = RESTChangeTarget(
-                method,
-                _normalize_rest_path(*app_paths, class_path, method_path),
-                _rest_metadata_values(meta.get('consumes')),
-                _rest_metadata_values(meta.get('produces')),
-                _rest_parameter_keys(meta.get('parameters')),
-                _rest_header_keys(meta.get('parameters')),
-            )
-            if _rest_target_matches(rest_target, candidate_target):
-                matched_rows.append((row, candidate_target))
+            for endpoint_path in _rest_endpoint_paths(row, class_row, app_paths):
+                candidate_target = RESTChangeTarget(
+                    method,
+                    endpoint_path,
+                    _rest_metadata_values(meta.get('consumes')),
+                    _rest_metadata_values(meta.get('produces')),
+                    _rest_parameter_keys(meta.get('parameters')),
+                    _rest_header_keys(meta.get('parameters')),
+                )
+                if _rest_target_matches(rest_target, candidate_target):
+                    matched_rows.append((row, candidate_target))
     finally:
         connection.close()
 
@@ -6944,7 +6993,7 @@ def _impact_rest_repository(request: ImpactRequest, root: Path, database_path: P
     candidates = tuple(
         ImpactTarget(
             candidate_target.signature, Path(row[4]), row[5], row[6],
-            _evidence_handle('quarkus_rest', Path(row[4]), row[5], row[6]),
+            _evidence_handle(_rest_evidence_kind(row[7]), Path(row[4]), row[5], row[6]),
         )
         for row, candidate_target in matched_rows
     )
@@ -6959,7 +7008,11 @@ def _impact_rest_repository(request: ImpactRequest, root: Path, database_path: P
                FROM quarkus_rest_facts WHERE kind = 'rest_resource'
                ORDER BY path, start_line, subject'''
         ).fetchall()
-        class_facts = {class_row[0]: class_row for class_row in class_rows}
+        class_facts = {}
+        for class_row in class_rows:
+            previous = class_facts.get(class_row[0])
+            if previous is None or class_row[6] == 'spring_mvc' or previous[6] != 'spring_mvc':
+                class_facts[class_row[0]] = class_row
         app_paths = tuple(dict.fromkeys(
             app_row[0] for app_row in connection.execute(
                 '''SELECT target FROM quarkus_rest_facts
@@ -6992,6 +7045,7 @@ def _impact_rest_repository(request: ImpactRequest, root: Path, database_path: P
                 'produces': matched_target.produces,
                 'headers': matched_target.headers,
                 'flavor': row[7],
+                'params': matched_target.params,
             }),
         )
     ]
@@ -7010,7 +7064,7 @@ def _impact_rest_repository(request: ImpactRequest, root: Path, database_path: P
         unresolved_items.extend(rest_unresolved)
     return ImpactResult(
         'resolved', rest_target.contract_key, route_target, (), tuple(relationships),
-        ('REST Contract Identity resolved from local JAX-RS route and handler evidence.',),
+        ('REST Contract Identity resolved from local ' + ('Spring MVC' if row[7] == 'spring_mvc' else 'JAX-RS') + ' route and handler evidence.',),
         tuple(unresolved_items), snapshot,
     )
 
@@ -9187,6 +9241,249 @@ def _analyze_quarkus_rest_files(
                             )
                         )
 
+    spring_facts: list[QuarkusRESTFact] = []
+    for path, content in sorted(contents_by_path.items(), key=lambda item: str(item[0])):
+        spring_facts.extend(_spring_rest_facts(path, content, declarations))
+    return tuple((*facts, *spring_facts))
+
+
+_SPRING_REST_SHORTCUTS = {
+    'GetMapping': 'GET',
+    'PostMapping': 'POST',
+    'PutMapping': 'PUT',
+    'DeleteMapping': 'DELETE',
+    'PatchMapping': 'PATCH',
+}
+_SPRING_REST_METHODS = ('GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE')
+
+
+def _split_spring_annotation_arguments(value: str) -> tuple[str, ...]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    quote = ''
+    escaped = False
+    for index, character in enumerate(value):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == '\\':
+                escaped = True
+            elif character == quote:
+                quote = ''
+            continue
+        if character in chr(34) + chr(39):
+            quote = character
+        elif character in '({[':
+            depth += 1
+        elif character in ')}]':
+            depth = max(0, depth - 1)
+        elif character == ',' and depth == 0:
+            parts.append(value[start:index].strip())
+            start = index + 1
+    tail = value[start:].strip()
+    if tail:
+        parts.append(tail)
+    return tuple(parts)
+
+
+def _spring_annotation_arguments(annotation: str) -> dict[str, str]:
+    start = annotation.find('(')
+    if start < 0:
+        return {}
+    body = annotation[start + 1:]
+    if body.endswith(')'):
+        body = body[:-1]
+    arguments: dict[str, str] = {}
+    for part in _split_spring_annotation_arguments(body):
+        key, separator, raw = part.partition('=')
+        if separator:
+            arguments[key.strip()] = raw.strip()
+        elif part:
+            arguments.setdefault('value', part.strip())
+    return arguments
+
+
+def _spring_annotation_values(arguments: dict[str, str], key: str, *, symbolic: bool = False) -> tuple[str, ...]:
+    raw = arguments.get(key)
+    if raw is None:
+        return ()
+    raw = raw.strip()
+    if raw.startswith('{') and raw.endswith('}'):
+        raw = raw[1:-1]
+    quote_chars = chr(34) + chr(39)
+    values: list[str] = []
+    for part in _split_spring_annotation_arguments(raw):
+        quoted = re.findall('[' + quote_chars + ']([^' + quote_chars + ']*)[' + quote_chars + ']', part)
+        if quoted:
+            values.extend(quoted)
+        elif symbolic and part.strip():
+            values.append(part.strip())
+    return tuple(dict.fromkeys(values))
+
+
+def _spring_mapping_specs(annotations: Iterable[str]) -> tuple[dict[str, object], ...]:
+    specs: list[dict[str, object]] = []
+    for annotation in annotations:
+        name = _simple_annotation_name(annotation)
+        if name not in _SPRING_REST_SHORTCUTS and name != 'RequestMapping':
+            continue
+        arguments = _spring_annotation_arguments(annotation)
+        paths = _spring_annotation_values(arguments, 'path') or _spring_annotation_values(arguments, 'value') or ('/',)
+        if name in _SPRING_REST_SHORTCUTS:
+            methods = (_SPRING_REST_SHORTCUTS[name],)
+        else:
+            method_tokens = _spring_annotation_values(arguments, 'method', symbolic=True)
+            methods = tuple(
+                token.rsplit('.', 1)[-1].upper()
+                for token in method_tokens
+                if token.rsplit('.', 1)[-1].upper() in _SPRING_REST_METHODS
+            )
+        specs.append({
+            'paths': paths,
+            'methods': tuple(dict.fromkeys(methods)),
+            'consumes': _spring_annotation_values(arguments, 'consumes', symbolic=True),
+            'produces': _spring_annotation_values(arguments, 'produces', symbolic=True),
+            'params': _spring_annotation_values(arguments, 'params', symbolic=True),
+            'headers': _spring_annotation_values(arguments, 'headers', symbolic=True),
+        })
+    return tuple(specs)
+
+
+def _spring_declaration_annotations(
+    annotations: dict[tuple[str, int, int], tuple[tuple[str, int, int], ...]],
+    declaration: JavaDeclaration,
+) -> tuple[str, ...]:
+    preferred = 'method_declaration' if declaration.kind == 'method' else 'class_declaration'
+    direct = annotations.get((preferred, declaration.start_line, declaration.end_line))
+    if direct:
+        return tuple(annotation for annotation, _, _ in direct)
+    for (region, start_line, end_line), values in annotations.items():
+        if region.endswith('_declaration') and start_line == declaration.start_line and end_line == declaration.end_line:
+            return tuple(annotation for annotation, _, _ in values)
+    return ()
+
+
+def _spring_rest_facts(
+    path: Path,
+    source: bytes,
+    declarations: tuple[JavaDeclaration, ...],
+) -> tuple[QuarkusRESTFact, ...]:
+    if path.suffix.lower() != '.java':
+        return ()
+    annotations = _spring_ast_annotations(source)
+    lines = source.decode('utf-8', errors='replace').splitlines()
+    type_declarations = tuple(
+        declaration for declaration in declarations
+        if declaration.path == path and declaration.kind in {'class', 'interface'}
+    )
+    facts: list[QuarkusRESTFact] = []
+    for type_declaration in type_declarations:
+        class_specs = _spring_mapping_specs(
+            _spring_declaration_annotations(annotations, type_declaration)
+        )
+        methods = tuple(
+            method for method in declarations
+            if method.path == path
+            and method.kind == 'method'
+            and type_declaration.start_line <= method.start_line <= method.end_line <= type_declaration.end_line
+        )
+        method_specs = {
+            method.qualified_name: _spring_mapping_specs(
+                _spring_declaration_annotations(annotations, method)
+            )
+            for method in methods
+        }
+        if not class_specs and not any(method_specs.values()):
+            continue
+
+        class_paths = tuple(dict.fromkeys(
+            path_value
+            for spec in class_specs
+            for path_value in spec['paths']
+        ))
+        snippet = _get_class_snippet(lines, type_declaration)
+        implements_match = re.search(r'\bimplements\s+([A-Za-z0-9_$,\s]+?)(?:\{|implements|extends)', snippet)
+        implements = tuple(
+            value.strip() for value in (implements_match.group(1).split(',') if implements_match else ())
+            if value.strip()
+        )
+        class_meta = {
+            'kind': type_declaration.kind,
+            'implements': list(implements),
+            'paths': list(class_paths),
+            'spring_mvc': True,
+        }
+        facts.append(
+            QuarkusRESTFact(
+                'rest_resource',
+                type_declaration.qualified_name,
+                class_paths[0] if class_paths else '',
+                json.dumps(class_meta),
+                path,
+                type_declaration.start_line,
+                type_declaration.end_line,
+                flavor='spring_mvc',
+            )
+        )
+
+        for method in methods:
+            specs = method_specs[method.qualified_name]
+            if not specs:
+                continue
+            effective_class_specs = class_specs or ({'paths': ('/',), 'methods': (), 'consumes': (), 'produces': (), 'params': (), 'headers': ()},)
+            for class_spec in effective_class_specs:
+                for method_spec in specs:
+                    class_methods = tuple(class_spec['methods'])
+                    method_methods = tuple(method_spec['methods'])
+                    if class_methods and method_methods:
+                        methods_for_route = tuple(method_name for method_name in method_methods if method_name in class_methods)
+                    else:
+                        methods_for_route = method_methods or class_methods or _SPRING_REST_METHODS
+                    if not methods_for_route:
+                        continue
+                    class_paths_for_route = tuple(class_spec['paths'])
+                    method_paths = tuple(method_spec['paths'])
+                    full_paths = tuple(
+                        _normalize_rest_path(class_path, method_path)
+                        for class_path in class_paths_for_route
+                        for method_path in method_paths
+                    )
+                    consumes = tuple(dict.fromkeys((*class_spec['consumes'], *method_spec['consumes'])))
+                    produces = tuple(dict.fromkeys((*class_spec['produces'], *method_spec['produces'])))
+                    params = tuple(dict.fromkeys((*class_spec['params'], *method_spec['params'])))
+                    headers = tuple(dict.fromkeys((*class_spec['headers'], *method_spec['headers'])))
+                    parameters = [
+                        {'role': 'SpringRequestParam', 'key': value, 'name': value}
+                        for value in params
+                    ] + [
+                        {'role': 'SpringRequestHeader', 'key': value, 'name': value}
+                        for value in headers
+                    ]
+                    for http_method in methods_for_route:
+                        for full_path in full_paths:
+                            metadata = {
+                                'http_method': http_method,
+                                'method_path': method_paths[0] if len(method_paths) == 1 else '',
+                                'full_paths': [full_path],
+                                'class_paths': list(class_paths_for_route),
+                                'produces': list(produces),
+                                'consumes': list(consumes),
+                                'parameters': parameters,
+                                'spring_mvc': True,
+                            }
+                            facts.append(
+                                QuarkusRESTFact(
+                                    'rest_endpoint',
+                                    method.qualified_name,
+                                    http_method + ' ' + full_path,
+                                    json.dumps(metadata),
+                                    path,
+                                    method.start_line,
+                                    method.end_line,
+                                    flavor='spring_mvc',
+                                )
+                            )
     return tuple(facts)
 
 
@@ -9600,6 +9897,9 @@ def _quarkus_rest_relationships(
     for f in rest_facts:
         if f.kind == "rest_resource":
             resource_by_class[f.subject] = f
+    for f in rest_facts:
+        if f.kind == 'rest_resource' and f.flavor == 'spring_mvc':
+            resource_by_class[f.subject] = f
 
     impls_by_interface: dict[str, list[QuarkusRESTFact]] = {}
     for cls_name, r_fact in resource_by_class.items():
@@ -9708,11 +10008,17 @@ def _quarkus_rest_relationships(
 
             handle = f"quarkus_rest:{f.path.as_posix()}:{f.start_line}-{f.end_line}"
             chain = [handle]
+            if flavor == 'spring_mvc':
+                handle = _evidence_handle('spring_mvc', f.path, f.start_line, f.end_line)
+                chain[0] = handle
             if class_facts:
                 chain.append(f"quarkus_rest:{class_facts[0].path.as_posix()}:{class_facts[0].start_line}-{class_facts[0].end_line}")
             for ih in interface_handles:
                 if ih not in chain:
                     chain.append(ih)
+            if meta.get('full_paths'):
+                full_path = _normalize_rest_path(str(tuple(meta['full_paths'])[0]))
+            route_identity = f'{http_method} {full_path}'
 
             prof_conds = meta.get("build_profile_conditions", [])
             if class_facts:

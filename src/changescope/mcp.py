@@ -884,6 +884,7 @@ class ChangeScopeMCPServer:
                     'http_method': provenance.http_method,
                     'consumes': list(provenance.consumes),
                     'produces': list(provenance.produces),
+                    'params': list(provenance.params),
                     'headers': list(provenance.headers),
                     'route_shape': provenance.route_shape,
                     'flavors': list(provenance.flavors),
