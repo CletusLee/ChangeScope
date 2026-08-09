@@ -44,6 +44,40 @@ EXCLUDED_DIRECTORY_NAMES = frozenset(
     }
 )
 
+_INDEX_SCHEMA_VERSION = "1"
+_INDEX_SCHEMA_COLUMNS = {
+    "metadata": frozenset({"key", "value"}),
+    "source_files": frozenset({"path", "status", "content_hash"}),
+    "java_declarations": frozenset(
+        {"kind", "name", "qualified_name", "signature", "path", "start_line", "end_line", "is_test", "is_private"}
+    ),
+    "java_invocations": frozenset(
+        {"name", "receiver", "caller", "path", "start_line", "end_line", "is_test", "argument_count"}
+    ),
+    "parse_failures": frozenset({"path", "start_line", "start_column", "message"}),
+    "spring_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line", "profile"}),
+    "ejb_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line"}),
+    "quarkus_build_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line", "profile"}),
+    "quarkus_config_facts": frozenset(
+        {"kind", "subject", "target", "value", "path", "start_line", "end_line", "profile", "is_build_time"}
+    ),
+    "quarkus_cdi_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line", "scope"}),
+    "quarkus_rest_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line", "flavor"}),
+    "quarkus_route_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line", "flavor"}),
+    "quarkus_security_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line", "policy"}),
+    "quarkus_test_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line", "flavor"}),
+    "quarkus_native_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line", "scope"}),
+    "quarkus_boundary_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line", "category"}),
+    "soap_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line", "namespace"}),
+    "vbnet_declarations": frozenset(
+        {"kind", "name", "qualified_name", "signature", "path", "start_line", "end_line", "is_test", "is_private", "language"}
+    ),
+    "vbnet_invocations": frozenset(
+        {"name", "receiver", "caller", "path", "start_line", "end_line", "is_test", "argument_count", "language"}
+    ),
+    "vbnet_facts": frozenset({"kind", "subject", "target", "value", "path", "start_line", "end_line", "extra_info"}),
+}
+
 
 @dataclass(frozen=True)
 class IndexSnapshot:
@@ -307,6 +341,7 @@ class IndexResult:
     vbnet_invocations: tuple[VBNETInvocation, ...] = ()
     vbnet_facts: tuple[VBNETFact, ...] = ()
     vbnet_files: tuple[Path, ...] = ()
+    indexed_file_hashes: tuple[tuple[Path, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2275,7 +2310,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
     declarations, invocations, parse_failures = _analyze_java_files(
         contents_by_path, _test_source_roots(root, source_roots)
     )
-    vbnet_files, vbnet_read_failures, vbnet_contents = _discover_vbnet_files(root)
+    vbnet_files, vbnet_read_failures, vbnet_contents, vbnet_file_hashes = _discover_vbnet_files(root)
     vbnet_declarations, vbnet_invocations, vbnet_facts, vbnet_parse_failures = _analyze_vbnet_files(
         root, vbnet_files, vbnet_contents
     )
@@ -2311,6 +2346,13 @@ def _index_repository(repository_root: Path) -> IndexResult:
     soap_facts = _analyze_soap_files(
         {**contents_by_path, **configuration_contents}, root
     )
+    indexed_file_hashes = {
+        **{
+            path: _content_hash(content)
+            for path, content in {**contents_by_path, **configuration_contents}.items()
+        },
+        **vbnet_file_hashes,
+    }
     snapshot = _snapshot(root)
     result = IndexResult(
         source_roots=source_roots,
@@ -2338,6 +2380,7 @@ def _index_repository(repository_root: Path) -> IndexResult:
         vbnet_invocations=vbnet_invocations,
         vbnet_facts=vbnet_facts,
         vbnet_files=vbnet_files,
+        indexed_file_hashes=tuple(sorted(indexed_file_hashes.items(), key=lambda item: str(item[0]))),
     )
     _write_index(result)
     return result
@@ -2357,115 +2400,80 @@ def _analyze_quarkus_config_files(
 
 
 def _refresh_index_if_needed(root: Path) -> None:
-    """Refresh changed Java paths, or all paths when test-root classification changes."""
+    """Plan a complete replacement before applying a new Repository Index snapshot."""
     database_path = root / ".changescope" / "index.sqlite"
-    source_roots = _discover_source_roots(root)
-    indexed_files, read_failures, contents_by_path = _java_files(root, source_roots)
-    configuration_files, configuration_read_failures, configuration_contents = _configuration_files(
-        root, source_roots
-    )
-    current_files = {
-        str(path): ("indexed", _content_hash(contents_by_path[path]))
-        for path in indexed_files
-    }
-    current_files.update({
-        str(path): ("indexed", _content_hash(configuration_contents[path]))
-        for path in configuration_files
-    })
-    current_files.update({
-        str(path): ("unreadable", "")
-        for path in (*read_failures, *configuration_read_failures)
-    })
+    source_roots, current_files = _current_index_inputs(root)
+    current_test_roots = _test_source_roots(root, source_roots)
+    refresh_required = False
     connection = sqlite3.connect(database_path)
     try:
-        with connection:
-            declaration_schema_changed = _initialize_index_schema(connection)
+        if not _index_schema_is_current(connection):
+            refresh_required = True
+            previous_files: dict[str, tuple[str, str]] = {}
+            previous_metadata: dict[str, str] = {}
+        else:
             previous_files = {
                 path: (status, content_hash)
                 for path, status, content_hash in connection.execute(
                     "SELECT path, status, content_hash FROM source_files"
                 )
             }
-            previous_test_roots = connection.execute(
-                "SELECT value FROM metadata WHERE key = 'test_source_roots'"
-            ).fetchone()
-            current_test_roots = _test_source_roots(root, source_roots)
-            changed_paths = {
-                path for path in set(previous_files) | set(current_files)
-                if previous_files.get(path) != current_files.get(path)
-            }
-            if declaration_schema_changed:
-                changed_paths.update(current_files)
-            if previous_test_roots is None or previous_test_roots[0] != _root_list_value(current_test_roots):
-                changed_paths.update(current_files)
-            if changed_paths:
-                changed_contents = {
-                    path: source for path, source in contents_by_path.items()
-                    if str(path) in changed_paths
-                }
-                declarations, invocations, parse_failures = _analyze_java_files(
-                    changed_contents, current_test_roots
-                )
-                changed_configuration_contents = {
-                    path: source for path, source in configuration_contents.items()
-                    if str(path) in changed_paths
-                }
-                spring_facts = _analyze_spring_files(
-                    {**changed_contents, **changed_configuration_contents}, declarations
-                )
-                refresh_all_ejb_facts = any(
-                    Path(path).suffix.lower() == ".java"
-                    or Path(path).name.lower() in {"ejb-jar.xml", "jboss-ejb3.xml"}
-                    for path in changed_paths
-                )
-                ejb_inputs = (
-                    {**contents_by_path, **configuration_contents}
-                    if refresh_all_ejb_facts
-                    else {**changed_contents, **changed_configuration_contents}
-                )
-                ejb_facts = _analyze_ejb_files(ejb_inputs)
-                quarkus_build_facts = _analyze_quarkus_build_files(
-                    {**contents_by_path, **configuration_contents}
-                )
-                quarkus_route_facts = _analyze_quarkus_route_files(
-                    contents_by_path, declarations, quarkus_build_facts
-                )
-                quarkus_security_facts = _analyze_quarkus_security_files(
-                    contents_by_path, declarations
-                )
-                quarkus_test_facts = _analyze_quarkus_test_files(
-                    contents_by_path, declarations
-                )
-                quarkus_native_facts = _analyze_quarkus_native_files(
-                    {**contents_by_path, **configuration_contents}, declarations
-                )
-                quarkus_boundary_facts = _analyze_quarkus_boundary_files(
-                    {**contents_by_path, **configuration_contents}, declarations
-                )
-                soap_facts = _analyze_soap_files(
-                    {**contents_by_path, **configuration_contents}, root
-                )
-                _replace_changed_source_records(
-                    connection,
-                    changed_paths,
-                    current_files,
-                    declarations,
-                    invocations,
-                    parse_failures,
-                    spring_facts,
-                    ejb_facts,
-                    quarkus_build_facts,
-                    quarkus_route_facts=quarkus_route_facts,
-                    quarkus_security_facts=quarkus_security_facts,
-                    quarkus_test_facts=quarkus_test_facts,
-                    quarkus_native_facts=quarkus_native_facts,
-                    quarkus_boundary_facts=quarkus_boundary_facts,
-                    soap_facts=soap_facts,
-                    replace_all_ejb_facts=refresh_all_ejb_facts,
-                )
-            _write_metadata(connection, _snapshot(root), source_roots)
+            previous_metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            refresh_required = (
+                previous_metadata.get("schema_version") != _INDEX_SCHEMA_VERSION
+                or previous_files != current_files
+                or previous_metadata.get("source_roots") != _root_list_value(source_roots)
+                or previous_metadata.get("test_source_roots") != _root_list_value(current_test_roots)
+            )
+
+        if not refresh_required:
+            current_snapshot = _snapshot(root)
+            stored_snapshot = IndexSnapshot(
+                root,
+                previous_metadata.get("git_commit") or None,
+                previous_metadata.get("working_tree_state", "unknown"),
+            )
+            if current_snapshot != stored_snapshot:
+                with connection:
+                    _write_metadata(connection, current_snapshot, source_roots)
     finally:
         connection.close()
+
+    if refresh_required:
+        # _index_repository builds every fact family before opening the write
+        # transaction. A failed analysis therefore leaves the prior snapshot
+        # untouched, and _write_index replaces the complete snapshot atomically.
+        _index_repository(root)
+
+
+def _current_index_inputs(
+    root: Path,
+) -> tuple[tuple[Path, ...], dict[str, tuple[str, str]]]:
+    source_roots = _discover_source_roots(root)
+    indexed_java_files, java_read_failures, _ = _java_files(root, source_roots)
+    configuration_files, configuration_read_failures, _ = _configuration_files(root, source_roots)
+    vbnet_files, vbnet_read_failures, _, _ = _discover_vbnet_files(root)
+    indexed_files = (*indexed_java_files, *configuration_files, *vbnet_files)
+    current_files = {
+        str(path): ("indexed", _file_content_hash(root / path))
+        for path in indexed_files
+    }
+    current_files.update({
+        str(path): ("unreadable", "")
+        for path in (*java_read_failures, *configuration_read_failures, *vbnet_read_failures)
+    })
+    return source_roots, current_files
+
+
+def _index_schema_is_current(connection: sqlite3.Connection) -> bool:
+    for table, required_columns in _INDEX_SCHEMA_COLUMNS.items():
+        columns = {
+            row[1]
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if not required_columns.issubset(columns):
+            return False
+    return True
 
 
 def _discover_source_roots(root: Path) -> tuple[Path, ...]:
@@ -4529,10 +4537,17 @@ def _replace_index_contents(
     connection.execute("DELETE FROM vbnet_facts")
     _write_metadata(connection, result.snapshot, result.source_roots)
     indexed_paths = tuple(dict.fromkeys((*result.indexed_files, *getattr(result, "vbnet_files", ()), *result.configuration_files)))
+    indexed_file_hashes = dict(getattr(result, "indexed_file_hashes", ()))
     connection.executemany(
         "INSERT INTO source_files(path, status, content_hash) VALUES (?, ?, ?)",
         (
-            (str(path), "indexed", _file_content_hash(result.snapshot.repository_root / path))
+            (
+                str(path),
+                "indexed",
+                indexed_file_hashes[path]
+                if path in indexed_file_hashes
+                else _file_content_hash(result.snapshot.repository_root / path),
+            )
             for path in indexed_paths
         ),
     )
@@ -4562,33 +4577,7 @@ def _replace_index_contents(
 
 
 def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
-    spring_schema_missing = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spring_facts'"
-    ).fetchone() is None
-    ejb_schema_missing = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ejb_facts'"
-    ).fetchone() is None
-    quarkus_schema_missing = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_build_facts'"
-    ).fetchone() is None
-    quarkus_config_schema_missing = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_config_facts'"
-    ).fetchone() is None
-    quarkus_cdi_schema_missing = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_cdi_facts'"
-    ).fetchone() is None
-    quarkus_rest_schema_missing = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_rest_facts'"
-    ).fetchone() is None
-    quarkus_route_schema_missing = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quarkus_route_facts'"
-    ).fetchone() is None
-    soap_schema_missing = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'soap_facts'"
-    ).fetchone() is None
-    vbnet_schema_missing = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vbnet_declarations'"
-    ).fetchone() is None
+    schema_was_current = _index_schema_is_current(connection)
     connection.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
@@ -4811,44 +4800,13 @@ def _initialize_index_schema(connection: sqlite3.Connection) -> bool:
         extra_info TEXT
         )"""
     )
-    declaration_columns = {
-        row[1] for row in connection.execute("PRAGMA table_info(java_declarations)")
-    }
-    if "signature" not in declaration_columns:
-        connection.execute(
-            "ALTER TABLE java_declarations ADD COLUMN signature TEXT NOT NULL DEFAULT ''"
-        )
-    declaration_schema_changed = "is_private" not in declaration_columns
-    if declaration_schema_changed:
-        connection.execute(
-            "ALTER TABLE java_declarations ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0"
-        )
-    invocation_columns = {
-        row[1] for row in connection.execute("PRAGMA table_info(java_invocations)")
-    }
-    invocation_schema_changed = "argument_count" not in invocation_columns
-    if invocation_schema_changed:
-        connection.execute(
-            "ALTER TABLE java_invocations ADD COLUMN argument_count INTEGER"
-        )
-    source_file_columns = {row[1] for row in connection.execute("PRAGMA table_info(source_files)")}
-    if "content_hash" not in source_file_columns:
-        connection.execute(
-            "ALTER TABLE source_files ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
-        )
-    return (
-        declaration_schema_changed
-        or invocation_schema_changed
-        or spring_schema_missing
-        or ejb_schema_missing
-        or quarkus_schema_missing
-        or quarkus_config_schema_missing
-        or quarkus_cdi_schema_missing
-        or quarkus_rest_schema_missing
-        or quarkus_route_schema_missing
-        or soap_schema_missing
-        or vbnet_schema_missing
-    )
+    for table, required_columns in _INDEX_SCHEMA_COLUMNS.items():
+        existing_columns = {
+            row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        for column in sorted(required_columns - existing_columns):
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+    return not schema_was_current
 
 
 def _write_metadata(
@@ -4858,6 +4816,7 @@ def _write_metadata(
     connection.executemany(
         "INSERT INTO metadata(key, value) VALUES (?, ?)",
         (
+            ("schema_version", _INDEX_SCHEMA_VERSION),
             ("repository_root", str(snapshot.repository_root)),
             ("git_commit", snapshot.git_commit or ""),
             ("working_tree_state", snapshot.working_tree_state),
@@ -10363,6 +10322,10 @@ def _insert_vbnet_facts(
 
 def _read_file_text_with_encoding(path: Path) -> tuple[str, str | None]:
     raw = path.read_bytes()
+    return _decode_file_text(raw)
+
+
+def _decode_file_text(raw: bytes) -> tuple[str, str | None]:
     for enc in ("utf-8-sig", "utf-16", "cp950", "cp1252"):
         try:
             text = raw.decode(enc).replace("\r\n", "\n").replace("\r", "\n")
@@ -10372,10 +10335,13 @@ def _read_file_text_with_encoding(path: Path) -> tuple[str, str | None]:
     return "", "Encoding decode failure"
 
 
-def _discover_vbnet_files(root: Path) -> tuple[tuple[Path, ...], tuple[Path, ...], dict[Path, str]]:
+def _discover_vbnet_files(
+    root: Path,
+) -> tuple[tuple[Path, ...], tuple[Path, ...], dict[Path, str], dict[Path, str]]:
     indexed_files: list[Path] = []
     read_failures: list[Path] = []
     contents_by_path: dict[Path, str] = {}
+    file_hashes_by_path: dict[Path, str] = {}
 
     vb_extensions = {".vb", ".vbproj", ".sln", ".resx", ".config", ".sql"}
     for current_dir, dirnames, filenames in os.walk(root):
@@ -10384,16 +10350,28 @@ def _discover_vbnet_files(root: Path) -> tuple[tuple[Path, ...], tuple[Path, ...
         for filename in filenames:
             file_path = rel_dir / filename
             ext = file_path.suffix.lower()
-            if ext in vb_extensions or filename.lower() in {"app.config", "web.config"}:
-                full_path = root / file_path
-                content, err = _read_file_text_with_encoding(full_path)
-                if err:
-                    read_failures.append(file_path)
-                else:
-                    indexed_files.append(file_path)
-                    contents_by_path[file_path] = content
+            if ext not in vb_extensions and filename.lower() not in {"app.config", "web.config"}:
+                continue
+            full_path = root / file_path
+            try:
+                raw = full_path.read_bytes()
+                content, err = _decode_file_text(raw)
+            except OSError:
+                read_failures.append(file_path)
+                continue
+            if err:
+                read_failures.append(file_path)
+            else:
+                indexed_files.append(file_path)
+                contents_by_path[file_path] = content
+                file_hashes_by_path[file_path] = _content_hash(raw)
 
-    return tuple(sorted(indexed_files, key=str)), tuple(sorted(read_failures, key=str)), contents_by_path
+    return (
+        tuple(sorted(indexed_files, key=str)),
+        tuple(sorted(read_failures, key=str)),
+        contents_by_path,
+        file_hashes_by_path,
+    )
 
 
 def _analyze_vbnet_files(
