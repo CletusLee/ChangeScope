@@ -498,6 +498,38 @@ class CatalogResult:
     snapshot: IndexSnapshot | None = None
 
 
+@dataclass(frozen=True)
+class RepositoryStatusRequest:
+    repository_root: Path
+
+
+@dataclass(frozen=True)
+class RepositoryIndexStatus:
+    outcome: str
+    repository_root: Path
+    index_exists: bool
+    schema_version: str | None
+    indexed_file_count: int
+    declaration_count: int
+    invocation_count: int
+    soap_fact_count: int
+    snapshot: IndexSnapshot | None
+
+
+@dataclass(frozen=True)
+class CatalogSummaryRequest:
+    catalog_root: Path
+
+
+@dataclass(frozen=True)
+class WorkspaceCatalogSummary:
+    outcome: str
+    catalog_root: Path
+    catalog_exists: bool
+    repositories: tuple[CatalogRepository, ...] = ()
+    mappings: tuple[CatalogMapping, ...] = ()
+
+
 class ChangeScopeApplication:
     """The application-service seam shared by CLI, tests, and future adapters."""
 
@@ -509,8 +541,10 @@ class ChangeScopeApplication:
         | SourceRequest
         | CatalogRegisterRepositoryRequest
         | CatalogRegisterMappingRequest
-        | CatalogResolveMappingRequest,
-    ) -> IndexResult | ImpactResult | SourceNavigation | CatalogResult:
+        | CatalogResolveMappingRequest
+        | RepositoryStatusRequest
+        | CatalogSummaryRequest,
+    ) -> IndexResult | ImpactResult | SourceNavigation | CatalogResult | RepositoryIndexStatus | WorkspaceCatalogSummary:
         if isinstance(request, IndexRequest):
             return _index_repository(request.repository_root)
         if isinstance(request, EvidenceRequest):
@@ -523,6 +557,10 @@ class ChangeScopeApplication:
             return _catalog_register_mapping(request)
         if isinstance(request, CatalogResolveMappingRequest):
             return _catalog_resolve_mapping(request)
+        if isinstance(request, RepositoryStatusRequest):
+            return _repository_index_status(request.repository_root)
+        if isinstance(request, CatalogSummaryRequest):
+            return _workspace_catalog_summary(request.catalog_root)
         return _impact_repository(request)
 
 
@@ -9988,6 +10026,49 @@ def _quarkus_extension_status(artifact_id: str) -> str:
     return "legacy" if artifact_id in legacy_extensions else "current"
 
 
+def _repository_index_status(repository_root: Path) -> RepositoryIndexStatus:
+    root = repository_root.resolve()
+    database_path = root / '.changescope' / 'index.sqlite'
+    if not database_path.is_file():
+        return RepositoryIndexStatus('missing', root, False, None, 0, 0, 0, 0, None)
+
+    try:
+        connection = sqlite3.connect(database_path)
+        try:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    'SELECT name FROM sqlite_master WHERE type = \'table\''
+                )
+            }
+            if 'metadata' not in tables:
+                return RepositoryIndexStatus('unreadable', root, True, None, 0, 0, 0, 0, None)
+
+            metadata = dict(connection.execute('SELECT key, value FROM metadata'))
+
+            def count(table: str) -> int:
+                if table not in tables:
+                    return 0
+                return int(connection.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0])
+
+            snapshot = _read_index_snapshot(connection, root)
+            return RepositoryIndexStatus(
+                'ready',
+                root,
+                True,
+                metadata.get('schema_version'),
+                count('source_files'),
+                count('java_declarations') + count('vbnet_declarations'),
+                count('java_invocations') + count('vbnet_invocations'),
+                count('soap_facts'),
+                snapshot,
+            )
+        finally:
+            connection.close()
+    except sqlite3.DatabaseError:
+        return RepositoryIndexStatus('unreadable', root, True, None, 0, 0, 0, 0, None)
+
+
 def _quarkus_build_impact_evidence(
     database_path: Path, target_path: Path
 ) -> tuple[list[str], list[UnresolvedItem]]:
@@ -10065,6 +10146,62 @@ def _quarkus_build_impact_evidence(
         )
 
     return assumptions, unresolved
+
+
+def _workspace_catalog_summary(catalog_root: Path) -> WorkspaceCatalogSummary:
+    root = catalog_root.resolve()
+    database_path = root / '.changescope' / 'catalog.sqlite'
+    if not database_path.is_file():
+        return WorkspaceCatalogSummary('missing', root, False)
+
+    try:
+        connection = sqlite3.connect(database_path)
+        try:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    'SELECT name FROM sqlite_master WHERE type = ?', ('table',)
+                )
+            }
+            repositories: tuple[CatalogRepository, ...] = ()
+            mappings: tuple[CatalogMapping, ...] = ()
+            if 'catalog_repositories' in tables:
+                repositories = tuple(
+                    CatalogRepository(
+                        repository_id,
+                        Path(repository_path),
+                        git_commit or None,
+                        working_tree_state,
+                    )
+                    for repository_id, repository_path, git_commit, working_tree_state in connection.execute(
+                        'SELECT repository_id, repository_path, git_commit, working_tree_state '
+                        'FROM catalog_repositories ORDER BY repository_id'
+                    )
+                )
+            if 'catalog_mappings' in tables:
+                mappings = tuple(
+                    CatalogMapping(
+                        source_repository_id,
+                        contract_kind,
+                        contract_key,
+                        target_repository_id,
+                        target_contract_key,
+                        provenance,
+                    )
+                    for source_repository_id, contract_kind, contract_key,
+                    target_repository_id, target_contract_key, provenance in connection.execute(
+                        'SELECT source_repository_id, contract_kind, contract_key, '
+                        'target_repository_id, target_contract_key, provenance '
+                        'FROM catalog_mappings '
+                        'ORDER BY source_repository_id, contract_kind, contract_key, '
+                        'target_repository_id, target_contract_key'
+                    )
+                )
+            return WorkspaceCatalogSummary('ready', root, True, repositories, mappings)
+        finally:
+            connection.close()
+    except sqlite3.DatabaseError:
+        return WorkspaceCatalogSummary('unreadable', root, True)
 
 
 def _catalog_db_path(catalog_root: Path) -> Path:

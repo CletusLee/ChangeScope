@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Sequence
 
+from changescope.mcp import run_stdio_server
 from changescope.application import (
     CatalogRegisterMappingRequest,
     CatalogRegisterRepositoryRequest,
@@ -89,7 +90,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
     resolve_cmd.add_argument("--key", required=True, help="logical contract key")
     resolve_cmd.add_argument("--format", choices=("text", "json"), default="text")
 
+    mcp_command = subcommands.add_parser('mcp', help='run the local stdio MCP server')
+    mcp_mode = mcp_command.add_mutually_exclusive_group(required=True)
+    mcp_mode.add_argument('--repository-root', '--repository', dest='repository_root', type=Path)
+    mcp_mode.add_argument('--workspace-root', '--workspace', dest='workspace_root', type=Path)
+
     parsed = parser.parse_args(arguments)
+
+    if parsed.command == 'mcp':
+        run_stdio_server(
+            repository_root=parsed.repository_root,
+            workspace_root=parsed.workspace_root,
+        )
+        return 0
 
     if parsed.command == "index":
         result = ChangeScopeApplication().execute(IndexRequest(Path.cwd()))

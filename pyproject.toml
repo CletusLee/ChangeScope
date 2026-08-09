@@ -13,6 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
+changescope-mcp = 'changescope.mcp:main'
 changescope = "changescope.cli:main"
 
 [tool.setuptools.packages.find]
