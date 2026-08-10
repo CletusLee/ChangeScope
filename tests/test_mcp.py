@@ -34,7 +34,7 @@ class MCPIntegrationTests(unittest.TestCase):
             server = ChangeScopeMCPServer(MCPServerConfig(repository_root=root))
             self.assertEqual(
                 [tool['name'] for tool in server.list_tools()],
-                ['index_repository', 'analyze_impact', 'get_evidence', 'read_source_range'],
+            ['index_repository', 'discover_contracts', 'analyze_impact', 'get_evidence', 'read_source_range'],
             )
             self.assertEqual(len(server.list_resources()), 3)
             response = server.handle_request(
@@ -125,7 +125,7 @@ class MCPIntegrationTests(unittest.TestCase):
             )
             message = json.loads(output.getvalue())
             self.assertEqual(message['id'], 4)
-            self.assertEqual(len(message['result']['tools']), 4)
+        self.assertEqual(len(message['result']['tools']), 5)
 
     def test_workspace_mode_reads_only_registered_repository_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

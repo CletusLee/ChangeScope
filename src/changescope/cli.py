@@ -53,6 +53,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
         "--runtime-profile", dest="runtime_profiles", action="append", default=[],
         help="select a Quarkus runtime profile; repeat for multiple profiles",
     )
+    impact_command.add_argument(
+        "--traversal-mode", choices=("repository_only", "verified_workspace"),
+        default="repository_only", help="scope for contract-driven continuation",
+    )
+    impact_command.add_argument("--workspace-root", "--workspace", type=Path, default=None,
+                                help="Workspace Catalog root for verified traversal")
+    impact_command.add_argument("--repository-id", default=None,
+                                help="registered source repository ID for workspace traversal")
+    impact_command.add_argument("--repository-limit", type=int, default=10)
+    impact_command.add_argument("--depth-limit", type=int, default=2)
+    impact_command.add_argument("--relationship-limit", type=int, default=100)
+    impact_command.add_argument("--response-limit", type=int, default=100)
     evidence_command = subcommands.add_parser("evidence", help="retrieve bounded source evidence")
     evidence_command.add_argument("evidence_handle")
     evidence_command.add_argument("--context-lines", type=int, default=2)
@@ -128,6 +140,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed.soap_wsdl,
                 parsed.soap_port_type,
                 parsed.soap_operation,
+                traversal_mode=parsed.traversal_mode,
+                workspace_root=parsed.workspace_root,
+                repository_id=parsed.repository_id,
+                repository_limit=parsed.repository_limit,
+                depth_limit=parsed.depth_limit,
+                relationship_limit=parsed.relationship_limit,
+                response_limit=parsed.response_limit,
             )
         )
         _render_impact_result(result, parsed.format)
@@ -334,6 +353,9 @@ def _render_impact_result(result: ImpactResult, output_format: str) -> None:
     for item in report["unresolved_items"]:
         evidence = f" {item['evidence_handle']}" if item["evidence_handle"] else ""
         print(f"- {item['message']}{evidence}")
+        if item.get("next_action"):
+            arguments = json.dumps(item["next_action"].get("arguments", {}), sort_keys=True)
+            print(f"  Next action: {item['next_action']['command']} {arguments}")
     if report.get("manual_verification_surfaces"):
         print("Manual verification surfaces:")
         for surface in report["manual_verification_surfaces"]:
@@ -366,6 +388,8 @@ def _impact_report(result: ImpactResult) -> dict[str, object]:
                 "conditional": relationship.conditional,
                 "profile": relationship.profile,
                 "business_view": relationship.business_view,
+                "repository_id": getattr(relationship, "repository_id", None),
+                "catalog_provenance": getattr(relationship, "catalog_provenance", None),
             }
             for relationship in result.relationships
         ],
@@ -377,6 +401,7 @@ def _impact_report(result: ImpactResult) -> dict[str, object]:
                 "start_line": item.start_line,
                 "end_line": item.end_line,
                 "evidence_handle": item.evidence_handle,
+                "next_action": item.next_action,
             }
             for item in result.unresolved_items
         ],
@@ -392,6 +417,46 @@ def _impact_report(result: ImpactResult) -> dict[str, object]:
             for surface in getattr(result, "manual_verification_surfaces", ())
         ],
         "snapshot": _snapshot_report(result.snapshot),
+        "repository_id": getattr(result, "repository_id", None),
+        "snapshots": {
+            repository_id: _snapshot_report(snapshot)
+            for repository_id, snapshot in getattr(result, "repository_snapshots", ())
+        },
+        "traversal": {
+            "mode": getattr(result, "traversal_mode", "repository_only"),
+            "repositories": list(getattr(result, "traversed_repositories", ())),
+            "depth": getattr(result, "traversal_depth", 0),
+            "limited": getattr(result, "traversal_limited", False),
+            "limit_reason": getattr(result, "traversal_limit_reason", None),
+            "verified_links": [
+                {
+                    "source_repository_id": mapping.source_repository_id,
+                    "contract_kind": mapping.contract_kind,
+                    "contract_key": mapping.contract_key,
+                    "target_repository_id": mapping.target_repository_id,
+                    "target_contract_key": mapping.target_contract_key,
+                    "provenance": mapping.provenance,
+                }
+                for mapping in getattr(result, "verified_links", ())
+            ],
+        },
+        "authority": _authority_report(getattr(result, "traversal_mode", "repository_only")),
+    }
+
+
+def _authority_report(traversal_mode: str) -> dict[str, object]:
+    if traversal_mode == "verified_workspace":
+        return {
+            "kind": "workspace_catalog",
+            "read_only": True,
+            "verified_links_only": True,
+            "description": "Cross-repository continuation is authorized only by explicit Workspace Catalog mappings.",
+        }
+    return {
+        "kind": "repository_index",
+        "read_only": True,
+        "verified_links_only": False,
+        "description": "Repository-only impact is grounded in the local Repository Index.",
     }
 
 
@@ -449,6 +514,7 @@ def _render_catalog_result(result, output_format: str) -> None:
                 "start_line": item.start_line,
                 "end_line": item.end_line,
                 "evidence_handle": item.evidence_handle,
+                "next_action": item.next_action,
             } for item in result.unresolved_items
         ],
         "snapshot": _snapshot_report(result.snapshot),

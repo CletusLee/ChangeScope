@@ -477,6 +477,42 @@ class ImpactRequest:
     soap_operation: str | None = None
     soap_target: SOAPChangeTarget | None = None
     rest_target: RESTChangeTarget | None = None
+    traversal_mode: str = "repository_only"
+    scope: str | None = None
+    workspace_root: Path | None = None
+    repository_id: str | None = None
+    repository_limit: int = 10
+    depth_limit: int = 2
+    relationship_limit: int = 100
+    response_limit: int = 100
+    max_repositories: int | None = None
+    max_depth: int | None = None
+    max_relationships: int | None = None
+    max_items: int | None = None
+
+    def __post_init__(self) -> None:
+        aliases = (
+            ("repository_limit", "max_repositories"),
+            ("depth_limit", "max_depth"),
+            ("relationship_limit", "max_relationships"),
+            ("response_limit", "max_items"),
+        )
+        for canonical, alias in aliases:
+            value = getattr(self, alias)
+            if value is not None:
+                object.__setattr__(self, canonical, value)
+        mode = (self.scope or self.traversal_mode).strip().lower().replace("-", "_")
+        if mode in {"repository", "repo", "repository_only"}:
+            mode = "repository_only"
+        elif mode in {"workspace", "verified_workspace", "verified_workspace_only"}:
+            mode = "verified_workspace"
+        else:
+            raise ValueError("Traversal mode must be repository_only or verified_workspace.")
+        object.__setattr__(self, "traversal_mode", mode)
+        if self.repository_limit < 1 or self.depth_limit < 0:
+            raise ValueError("Repository limit must be positive and depth limit cannot be negative.")
+        if self.relationship_limit < 1 or self.response_limit < 1:
+            raise ValueError("Relationship and response limits must be positive.")
 
 
 @dataclass(frozen=True)
@@ -551,6 +587,8 @@ class ImpactRelationship:
     evidence_chain: tuple[str, ...] = ()
     business_view: str | None = None
     language: str = "java"
+    repository_id: str | None = None
+    catalog_provenance: str | None = None
 
     def __post_init__(self) -> None:
         if not self.evidence_chain:
@@ -564,6 +602,7 @@ class UnresolvedItem:
     start_line: int | None = None
     end_line: int | None = None
     evidence_handle: str | None = None
+    next_action: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -628,6 +667,18 @@ class ImpactResult:
     unresolved_items: tuple[UnresolvedItem, ...]
     snapshot: IndexSnapshot | None
     manual_verification_surfaces: tuple[ManualVerificationSurface, ...] = ()
+    repository_id: str | None = None
+    repository_snapshots: tuple[tuple[str, IndexSnapshot], ...] = ()
+    traversal_mode: str = "repository_only"
+    traversed_repositories: tuple[str, ...] = ()
+    traversal_depth: int = 0
+    traversal_limited: bool = False
+    traversal_limit_reason: str | None = None
+    verified_links: tuple[CatalogMapping, ...] = ()
+
+    @property
+    def snapshots(self) -> dict[str, IndexSnapshot]:
+        return dict(self.repository_snapshots)
 
 
 @dataclass(frozen=True)
@@ -750,6 +801,8 @@ class ChangeScopeApplication:
             return _repository_index_status(request.repository_root)
         if isinstance(request, CatalogSummaryRequest):
             return _workspace_catalog_summary(request.catalog_root)
+        if isinstance(request, ImpactRequest) and request.traversal_mode == "verified_workspace":
+            return _impact_workspace(request)
         return _impact_repository(request)
 
 
@@ -7067,6 +7120,588 @@ def _impact_rest_repository(request: ImpactRequest, root: Path, database_path: P
         ('REST Contract Identity resolved from local ' + ('Spring MVC' if row[7] == 'spring_mvc' else 'JAX-RS') + ' route and handler evidence.',),
         tuple(unresolved_items), snapshot,
     )
+
+
+def _impact_workspace(request: ImpactRequest) -> ImpactResult:
+    """Continue a contract impact only through explicit Workspace Catalog mappings."""
+    local_request = replace(request, traversal_mode="repository_only", workspace_root=None)
+    local_result = _impact_repository(local_request)
+    workspace_root = request.workspace_root.resolve() if request.workspace_root else None
+    if workspace_root is None:
+        return _workspace_result(
+            local_result,
+            request,
+            request.repository_id,
+            (request.repository_id,) if request.repository_id else (),
+            (),
+            (),
+            (),
+            False,
+            None,
+            _with_next_action(
+                _unresolved("Verified workspace traversal requires a configured Workspace Catalog."),
+                {"command": "changescope catalog register-repo", "arguments": {}},
+            ),
+        )
+
+    summary = _workspace_catalog_summary(workspace_root)
+    source_repository_id = request.repository_id or _catalog_repository_id_for_root(summary, request.repository_root)
+    source_repository = next(
+        (repository for repository in summary.repositories if repository.repository_id == source_repository_id),
+        None,
+    )
+    if source_repository is None:
+        return _workspace_result(
+            local_result,
+            request,
+            source_repository_id,
+            (source_repository_id,) if source_repository_id else (),
+            (),
+            (),
+            (),
+            False,
+            None,
+            _with_next_action(
+                _unresolved(
+                    "The source repository is not registered in the Workspace Catalog; traversal stopped after local impact."
+                ),
+                {
+                    "command": "changescope catalog register-repo",
+                    "arguments": {"id": source_repository_id or "<source-repository-id>"},
+                },
+            ),
+        )
+    if source_repository.repository_path.resolve() != request.repository_root.resolve():
+        return _workspace_result(
+            local_result,
+            request,
+            None,
+            (),
+            (),
+            (),
+            (),
+            False,
+            None,
+            _with_next_action(
+                _unresolved(
+                    f"Repository ID '{source_repository_id}' does not identify the requested repository root; traversal stopped after local impact."
+                ),
+                {
+                    "command": "changescope catalog register-repo",
+                    "arguments": {
+                        "id": source_repository_id,
+                        "path": request.repository_root.as_posix(),
+                    },
+                },
+            ),
+        )
+
+    kind, contract_key = _impact_contract_identity(request)
+    if local_result.outcome != "resolved" or kind is None or contract_key is None:
+        return _workspace_result(
+            local_result,
+            request,
+            source_repository_id,
+            (source_repository_id,),
+            ((source_repository_id, local_result.snapshot),) if local_result.snapshot else (),
+            (),
+            (),
+            False,
+            None,
+        )
+
+    relationships = [replace(relationship, repository_id=source_repository_id) for relationship in local_result.relationships]
+    unresolved_items = list(local_result.unresolved_items)
+    assumptions = list(local_result.assumptions)
+    snapshots: list[tuple[str, IndexSnapshot]] = []
+    if local_result.snapshot is not None:
+        snapshots.append((source_repository_id, local_result.snapshot))
+    traversed = [source_repository_id]
+    verified_links: list[CatalogMapping] = []
+    visited = {source_repository_id}
+    frontier = [(source_repository_id, request, local_result, 0, kind, contract_key)]
+    traversal_limited = False
+    traversal_failed = False
+    limit_reason: str | None = None
+    max_depth_reached = 0
+
+    def stop(reason: str, message: str) -> None:
+        nonlocal traversal_limited, limit_reason
+        traversal_limited = True
+        if limit_reason is None:
+            limit_reason = reason
+        unresolved_items.append(
+            _with_next_action(
+                _unresolved(message),
+                {
+                    "command": "changescope impact",
+                    "arguments": {
+                        "traversal_mode": "verified_workspace",
+                        "repository_limit": request.repository_limit,
+                        "depth_limit": request.depth_limit,
+                        "relationship_limit": request.relationship_limit,
+                        "response_limit": request.response_limit,
+                    },
+                },
+            )
+        )
+
+    while frontier:
+        current_repository_id, current_request, current_result, depth, current_kind, current_key = frontier.pop(0)
+        max_depth_reached = max(max_depth_reached, depth)
+        if depth >= request.depth_limit:
+            stop(
+                "depth_limit",
+                f"Verified workspace traversal depth limit ({request.depth_limit}) reached at repository '{current_repository_id}'.",
+            )
+            continue
+        if len(traversed) >= request.repository_limit:
+            stop(
+                "repository_limit",
+                f"Verified workspace traversal repository limit ({request.repository_limit}) reached.",
+            )
+            continue
+        if len(relationships) >= min(request.relationship_limit, request.response_limit):
+            stop(
+                "relationship_limit" if request.relationship_limit <= request.response_limit else "response_limit",
+                "Verified workspace traversal stopped at the configured relationship or response limit; confirmed local impact was retained.",
+            )
+            continue
+
+        mapping_result = _catalog_resolve_mapping_variants(
+            workspace_root,
+            current_repository_id,
+            current_kind,
+            current_key,
+            current_request.repository_root,
+        )
+        if mapping_result.outcome == "missing":
+            for unresolved in _unverified_workspace_candidates(
+                summary, current_repository_id, current_kind, current_request, current_key,
+                request.response_limit,
+            ):
+                unresolved_items.append(unresolved)
+            continue
+        if mapping_result.outcome != "resolved" or mapping_result.mapping is None:
+            traversal_failed = True
+            message = "Verified workspace traversal stopped because the Workspace Catalog link is " + mapping_result.outcome + "."
+            unresolved_items.extend(
+                _with_next_action(item, _mapping_next_action(current_repository_id, current_kind, current_key))
+                for item in mapping_result.unresolved_items
+            )
+            if not mapping_result.unresolved_items:
+                unresolved_items.append(
+                    _with_next_action(_unresolved(message), _mapping_next_action(current_repository_id, current_kind, current_key))
+                )
+            continue
+
+        mapping = mapping_result.mapping
+        target_repository_id = mapping.target_repository_id
+        target_repository = next(
+            (repository for repository in summary.repositories if repository.repository_id == target_repository_id),
+            None,
+        )
+        if target_repository is None:
+            traversal_failed = True
+            unresolved_items.append(
+                _with_next_action(
+                    _unresolved(f"Target repository '{target_repository_id}' is not registered in the Workspace Catalog."),
+                    _mapping_next_action(current_repository_id, current_kind, current_key),
+                )
+            )
+            continue
+        if target_repository_id in visited:
+            traversal_failed = True
+            unresolved_items.append(
+                _with_next_action(
+                    _unresolved(f"Verified workspace traversal stopped at a cycle involving repository '{target_repository_id}'."),
+                    _mapping_next_action(current_repository_id, current_kind, current_key),
+                )
+            )
+            continue
+
+        target_request = _target_request_from_mapping(
+            current_request,
+            mapping,
+            target_repository.repository_path,
+        )
+        if target_request is None:
+            traversal_failed = True
+            unresolved_items.append(
+                _with_next_action(
+                    _unresolved(f"The verified {current_kind.upper()} mapping target '{mapping.target_contract_key}' could not be resolved in repository '{target_repository_id}'."),
+                    _mapping_next_action(current_repository_id, current_kind, current_key),
+                )
+            )
+            continue
+
+        target_result = _impact_repository(target_request)
+        if target_result.snapshot is not None:
+            snapshots.append((target_repository_id, target_result.snapshot))
+        if target_result.outcome != "resolved" or target_result.target is None:
+            traversal_failed = True
+            unresolved_items.extend(
+                _with_next_action(
+                    item,
+                    _mapping_next_action(current_repository_id, current_kind, current_key),
+                )
+                for item in target_result.unresolved_items
+            )
+            if not target_result.unresolved_items:
+                unresolved_items.append(
+                    _with_next_action(
+                        _unresolved(f"Verified target repository '{target_repository_id}' returned outcome '{target_result.outcome}'."),
+                        _mapping_next_action(current_repository_id, current_kind, current_key),
+                    )
+                )
+            continue
+
+        verified_links.append(mapping)
+        link_target = target_result.target
+        relationships.append(
+            ImpactRelationship(
+                "verified_cross_repository_link",
+                f"{current_repository_id}:{current_key} -> {target_repository_id}:{mapping.target_contract_key}",
+                link_target.path,
+                link_target.start_line,
+                link_target.end_line,
+                link_target.evidence_handle,
+                "high",
+                evidence_chain=(link_target.evidence_handle,),
+                repository_id=target_repository_id,
+                catalog_provenance=mapping.provenance or "Workspace Catalog explicit mapping",
+            )
+        )
+        remaining = min(request.relationship_limit, request.response_limit) - len(relationships)
+        if remaining < 0:
+            relationships.pop()
+            stop(
+                "relationship_limit" if request.relationship_limit <= request.response_limit else "response_limit",
+                "Verified workspace traversal stopped at the configured relationship or response limit; confirmed local impact was retained.",
+            )
+            continue
+        target_relationships = target_result.relationships[:remaining]
+        relationships.extend(
+            replace(
+                relationship,
+                repository_id=target_repository_id,
+                evidence_chain=(link_target.evidence_handle, *relationship.evidence_chain),
+            )
+            for relationship in target_relationships
+        )
+        unresolved_items.extend(target_result.unresolved_items)
+        assumptions.extend(target_result.assumptions)
+        if len(target_result.relationships) > remaining:
+            stop(
+                "relationship_limit" if request.relationship_limit <= request.response_limit else "response_limit",
+                "Verified workspace traversal stopped at the configured relationship or response limit; confirmed local impact was retained.",
+            )
+            continue
+
+        visited.add(target_repository_id)
+        traversed.append(target_repository_id)
+        max_depth_reached = max(max_depth_reached, depth + 1)
+        next_kind, next_key = _impact_contract_identity(target_request)
+        if next_kind and next_key and depth + 1 < request.depth_limit:
+            frontier.append((target_repository_id, target_request, target_result, depth + 1, next_kind, next_key))
+
+    outcome = local_result.outcome
+    if (traversal_limited or traversal_failed) and outcome == "resolved":
+        outcome = "partial"
+    if len(unresolved_items) > request.response_limit:
+        unresolved_items = unresolved_items[:request.response_limit]
+    if len(verified_links) > request.response_limit:
+        verified_links = verified_links[:request.response_limit]
+    return replace(
+        local_result,
+        outcome=outcome,
+        relationships=tuple(relationships),
+        assumptions=tuple(dict.fromkeys(assumptions)),
+        unresolved_items=tuple(unresolved_items),
+        repository_id=source_repository_id,
+        repository_snapshots=tuple(snapshots),
+        traversal_mode="verified_workspace",
+        traversed_repositories=tuple(traversed),
+        traversal_depth=max_depth_reached,
+        traversal_limited=traversal_limited,
+        traversal_limit_reason=limit_reason,
+        verified_links=tuple(verified_links),
+    )
+
+
+def _workspace_result(
+    result: ImpactResult,
+    request: ImpactRequest,
+    repository_id: str | None,
+    traversed: tuple[str, ...],
+    snapshots: tuple[tuple[str, IndexSnapshot], ...],
+    relationships: tuple[ImpactRelationship, ...],
+    assumptions: tuple[str, ...],
+    limited: bool,
+    limit_reason: str | None,
+    *extra_unresolved: UnresolvedItem,
+) -> ImpactResult:
+    local_relationships = tuple(
+        replace(relationship, repository_id=repository_id)
+        for relationship in (relationships or result.relationships)
+    )
+    return replace(
+        result,
+        outcome="partial" if limited and result.outcome == "resolved" else result.outcome,
+        relationships=local_relationships,
+        assumptions=tuple(assumptions or result.assumptions),
+        unresolved_items=tuple(result.unresolved_items) + extra_unresolved,
+        repository_id=repository_id,
+        repository_snapshots=snapshots,
+        traversal_mode="verified_workspace",
+        traversed_repositories=traversed,
+        traversal_limited=limited,
+        traversal_limit_reason=limit_reason,
+    )
+
+
+def _impact_contract_identity(request: ImpactRequest) -> tuple[str | None, str | None]:
+    if request.rest_target is not None:
+        return "rest", request.rest_target.contract_key
+    if request.soap_target is not None:
+        return "soap", request.soap_target.contract_key
+    if request.soap_port_type and request.soap_operation:
+        return "soap", f"soap:{request.soap_port_type}#{request.soap_operation}"
+    return None, None
+
+
+def _catalog_repository_id_for_root(summary: WorkspaceCatalogSummary, root: Path) -> str | None:
+    resolved = root.resolve()
+    for repository in summary.repositories:
+        if repository.repository_path.resolve() == resolved:
+            return repository.repository_id
+    return None
+
+
+def _catalog_resolve_mapping_variants(
+    catalog_root: Path,
+    source_repository_id: str,
+    contract_kind: str,
+    contract_key: str,
+    repository_root: Path | None = None,
+) -> CatalogResult:
+    first_result: CatalogResult | None = None
+    variants = list(_contract_key_variants(contract_kind, contract_key))
+    if contract_kind == "soap" and repository_root is not None:
+        parsed = _soap_target_identity(contract_key)
+        database_path = repository_root.resolve() / ".changescope" / "index.sqlite"
+        if parsed is not None and database_path.is_file():
+            connection = sqlite3.connect(database_path)
+            try:
+                rows = connection.execute(
+                    "SELECT target, subject FROM soap_facts WHERE kind = 'operation' AND subject = ?",
+                    (parsed[1],),
+                ).fetchall()
+            finally:
+                connection.close()
+            variants.extend(
+                f"{target}#{operation}"
+                for target, operation in rows
+                if target
+            )
+    for variant in dict.fromkeys(variants):
+        result = _catalog_resolve_mapping(
+            CatalogResolveMappingRequest(catalog_root, source_repository_id, contract_kind, variant)
+        )
+        first_result = first_result or result
+        if result.outcome != "missing":
+            return result
+    return first_result or CatalogResult("missing")
+
+
+def _contract_key_variants(contract_kind: str, contract_key: str) -> tuple[str, ...]:
+    variants = [contract_key]
+    if contract_kind == "soap":
+        without_prefix = contract_key[5:] if contract_key.startswith("soap:") else contract_key
+        variants.extend((without_prefix, f"soap:{without_prefix}"))
+    return tuple(dict.fromkeys(variants))
+
+
+def _target_request_from_mapping(
+    base_request: ImpactRequest,
+    mapping: CatalogMapping,
+    target_root: Path,
+) -> ImpactRequest | None:
+    if mapping.contract_kind == "rest":
+        target = _rest_target_from_contract_key(mapping.target_contract_key)
+        if target is None:
+            return None
+        return replace(
+            base_request,
+            repository_root=target_root,
+            target=None,
+            soap_wsdl=None,
+            soap_port_type=None,
+            soap_operation=None,
+            soap_target=None,
+            rest_target=target,
+            traversal_mode="repository_only",
+            workspace_root=None,
+            repository_id=mapping.target_repository_id,
+        )
+    if mapping.contract_kind == "soap":
+        parsed = _soap_target_identity(mapping.target_contract_key)
+        if parsed is None:
+            return None
+        port_type, operation = parsed
+        database_path = target_root.resolve() / ".changescope" / "index.sqlite"
+        if not database_path.is_file():
+            return None
+        connection = sqlite3.connect(database_path)
+        try:
+            rows = connection.execute(
+                "SELECT path FROM soap_facts WHERE kind = 'operation' AND subject = ?",
+                (operation,),
+            ).fetchall()
+            paths = tuple(
+                Path(row[0])
+                for row in rows
+                if _soap_operation_row_matches(connection, row[0], port_type, operation)
+            )
+        finally:
+            connection.close()
+        if len(paths) != 1:
+            return None
+        return replace(
+            base_request,
+            repository_root=target_root,
+            target=None,
+            soap_wsdl=None,
+            soap_port_type=None,
+            soap_operation=None,
+            soap_target=SOAPChangeTarget(paths[0], port_type, operation),
+            rest_target=None,
+            traversal_mode="repository_only",
+            workspace_root=None,
+            repository_id=mapping.target_repository_id,
+        )
+    return None
+
+
+def _rest_target_from_contract_key(contract_key: str) -> RESTChangeTarget | None:
+    signature, _, conditions = contract_key.partition(" [")
+    method, separator, path = signature.strip().partition(" ")
+    if not separator or not method or not path:
+        return None
+    values: dict[str, tuple[str, ...]] = {}
+    if conditions.endswith("]"):
+        for condition in conditions[:-1].split("; "):
+            name, separator, value = condition.partition("=")
+            if separator:
+                values[name] = tuple(item for item in value.split(",") if item)
+    return RESTChangeTarget(
+        method,
+        path,
+        values.get("consumes", ()),
+        values.get("produces", ()),
+        values.get("params", ()),
+        values.get("headers", ()),
+    )
+
+
+def _soap_target_identity(contract_key: str) -> tuple[str, str] | None:
+    value = contract_key[5:] if contract_key.startswith("soap:") else contract_key
+    parts = value.rsplit("#", 2)
+    if len(parts) == 3 and parts[0].lower().endswith((".wsdl", ".xml")):
+        parts = parts[1:]
+    if len(parts) != 2 or not all(parts):
+        return None
+    return parts[0], parts[1]
+
+
+def _soap_operation_row_matches(
+    connection: sqlite3.Connection,
+    path: str,
+    port_type: str,
+    operation: str,
+) -> bool:
+    rows = connection.execute(
+        "SELECT target FROM soap_facts WHERE kind = 'operation' AND path = ? AND subject = ?",
+        (path, operation),
+    ).fetchall()
+    return any(_matches_port_type(row[0] or "", port_type) for row in rows)
+
+
+def _unverified_workspace_candidates(
+    summary: WorkspaceCatalogSummary,
+    source_repository_id: str,
+    contract_kind: str,
+    request: ImpactRequest,
+    contract_key: str,
+    response_limit: int,
+) -> tuple[UnresolvedItem, ...]:
+    candidates: list[UnresolvedItem] = []
+    for repository in summary.repositories:
+        if repository.repository_id == source_repository_id:
+            continue
+        discovery = _discover_contracts(
+            ContractDiscoveryRequest(repository.repository_path, limit=100, offset=0)
+        )
+        for candidate in discovery.candidates:
+            if len(candidates) >= response_limit:
+                return tuple(candidates)
+            if contract_kind == "rest" and isinstance(candidate, RESTContractCandidate):
+                requested = request.rest_target
+                if requested is None or candidate.target.http_method != requested.http_method:
+                    continue
+                if candidate.target.path != requested.path and candidate.target.route_shape != requested.route_shape:
+                    continue
+            elif contract_kind == "soap" and isinstance(candidate, SOAPContractCandidate):
+                requested_identity = _soap_target_identity(contract_key)
+                if requested_identity is None:
+                    continue
+                requested_port, requested_operation = requested_identity
+                if candidate.target.operation != requested_operation or not _matches_port_type(candidate.target.port_type, requested_port):
+                    continue
+            else:
+                continue
+            candidates.append(
+                _with_next_action(
+                    _unresolved(
+                        f"Unresolved cross-repository candidate: repository '{repository.repository_id}' exposes '{candidate.contract_key}', but no Verified Cross-Repository Link is registered. Similar routes, endpoint URLs, operation names, and Java names are not authoritative."
+                    ),
+                    _mapping_next_action(
+                        source_repository_id,
+                        contract_kind,
+                        contract_key,
+                        repository.repository_id,
+                        candidate.contract_key,
+                    ),
+                )
+            )
+    return tuple(candidates)
+
+
+def _mapping_next_action(
+    source_repository_id: str,
+    contract_kind: str,
+    contract_key: str,
+    target_repository_id: str | None = None,
+    target_contract_key: str | None = None,
+) -> dict[str, object]:
+    arguments: dict[str, object] = {
+        "source_repo": source_repository_id,
+        "kind": contract_kind,
+        "key": contract_key,
+    }
+    if target_repository_id is not None:
+        arguments["target_repo"] = target_repository_id
+    if target_contract_key is not None:
+        arguments["target_key"] = target_contract_key
+    return {
+        "command": "changescope catalog register-mapping",
+        "arguments": arguments,
+        "reason": "A human must verify the contract relationship before traversal can continue.",
+    }
+
+
+def _with_next_action(item: UnresolvedItem, next_action: dict[str, object]) -> UnresolvedItem:
+    return replace(item, next_action=next_action)
 
 
 def _rest_target_matches(requested: RESTChangeTarget, candidate: RESTChangeTarget) -> bool:

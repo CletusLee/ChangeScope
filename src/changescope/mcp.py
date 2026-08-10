@@ -140,6 +140,9 @@ class ChangeScopeMCPServer:
                         'build_profiles', 'runtime_profiles',
                         'rest', 'rest_http_method', 'rest_path',
                         'rest_consumes', 'rest_produces', 'rest_params', 'rest_headers',
+                        'traversal_mode', 'repository_limit', 'depth_limit',
+                        'relationship_limit', 'response_limit',
+                        'scope',
                     },
                 )
                 payload = self._analyze_impact(arguments)
@@ -504,6 +507,26 @@ class ChangeScopeMCPServer:
             raise MCPError(-32602, 'REST targets require http_method and path strings.')
         if has_rest:
             rest_http_method = rest_http_method.upper()
+        traversal_mode = arguments.get(
+            'scope',
+            arguments.get(
+                'traversal_mode',
+                'verified_workspace' if self.config.mode == 'workspace' else 'repository_only',
+            ),
+        )
+        if not isinstance(traversal_mode, str):
+            raise MCPError(-32602, 'traversal_mode must be repository_only or verified_workspace.')
+        traversal_mode = traversal_mode.strip().lower().replace('-', '_')
+        if traversal_mode in {'repository', 'repo'}:
+            traversal_mode = 'repository_only'
+        if traversal_mode in {'workspace', 'verified_workspace_only'}:
+            traversal_mode = 'verified_workspace'
+        if traversal_mode == 'verified_workspace' and self.config.mode != 'workspace':
+            raise MCPError(-32602, 'verified_workspace traversal requires the MCP server to be configured with a Workspace Catalog.')
+        repository_limit = self._integer(arguments, 'repository_limit', 10, minimum=1)
+        depth_limit = self._integer(arguments, 'depth_limit', 2, minimum=0)
+        relationship_limit = self._integer(arguments, 'relationship_limit', 100, minimum=1)
+        response_limit = self._integer(arguments, 'response_limit', 100, minimum=1)
         wsdl_path = self._relative_path(soap_wsdl, 'soap.wsdl') if has_soap else None
         request = ImpactRequest(
             repository_root,
@@ -530,6 +553,13 @@ class ChangeScopeMCPServer:
                 )
                 if has_rest else None
             ),
+            traversal_mode=traversal_mode,
+            workspace_root=self.config.workspace_root if traversal_mode == 'verified_workspace' else None,
+            repository_id=repository_id,
+            repository_limit=repository_limit,
+            depth_limit=depth_limit,
+            relationship_limit=relationship_limit,
+            response_limit=response_limit,
         )
         result = self.application.execute(request)
         if result.outcome == 'index_missing':
@@ -603,6 +633,7 @@ class ChangeScopeMCPServer:
                 'mode': self.config.mode,
                 'outcome': 'configured',
                 'catalog_exists': False,
+                'authority': self._authority_report('repository_only'),
                 'repositories': [
                     {
                         'repository_id': 'current',
@@ -617,6 +648,7 @@ class ChangeScopeMCPServer:
             'mode': self.config.mode,
             'outcome': summary.outcome,
             'catalog_exists': summary.catalog_exists,
+            'authority': self._authority_report('verified_workspace'),
             'repositories': [self._catalog_repository_report(repository) for repository in summary.repositories],
             'mappings': [self._mapping_report(mapping) for mapping in summary.mappings],
         }
@@ -969,6 +1001,8 @@ class ChangeScopeMCPServer:
                     'profile': relationship.profile,
                     'business_view': relationship.business_view,
                     'language': relationship.language,
+                    'repository_id': getattr(relationship, 'repository_id', None),
+                    'catalog_provenance': getattr(relationship, 'catalog_provenance', None),
                 }
                 for relationship in result.relationships
             ],
@@ -980,6 +1014,7 @@ class ChangeScopeMCPServer:
                     'start_line': item.start_line,
                     'end_line': item.end_line,
                     'evidence_handle': item.evidence_handle,
+                    'next_action': item.next_action,
                 }
                 for item in result.unresolved_items
             ],
@@ -995,6 +1030,36 @@ class ChangeScopeMCPServer:
                 for surface in getattr(result, 'manual_verification_surfaces', ())
             ],
             'snapshot': ChangeScopeMCPServer._snapshot_report(result.snapshot),
+            'repository_id': getattr(result, 'repository_id', None),
+            'snapshots': {
+                repository_id: ChangeScopeMCPServer._snapshot_report(snapshot)
+                for repository_id, snapshot in getattr(result, 'repository_snapshots', ())
+            },
+            'traversal': {
+                'mode': getattr(result, 'traversal_mode', 'repository_only'),
+                'repositories': list(getattr(result, 'traversed_repositories', ())),
+                'depth': getattr(result, 'traversal_depth', 0),
+                'limited': getattr(result, 'traversal_limited', False),
+                'limit_reason': getattr(result, 'traversal_limit_reason', None),
+                'verified_links': [ChangeScopeMCPServer._mapping_report(mapping) for mapping in getattr(result, 'verified_links', ())],
+            },
+            'authority': ChangeScopeMCPServer._authority_report(getattr(result, 'traversal_mode', 'repository_only')),
+        }
+
+    @staticmethod
+    def _authority_report(traversal_mode: str) -> dict[str, Any]:
+        if traversal_mode == 'verified_workspace':
+            return {
+                'kind': 'workspace_catalog',
+                'read_only': True,
+                'verified_links_only': True,
+                'description': 'Cross-repository continuation is authorized only by explicit Workspace Catalog mappings.',
+            }
+        return {
+            'kind': 'repository_index',
+            'read_only': True,
+            'verified_links_only': False,
+            'description': 'Repository-only impact is grounded in the local Repository Index.',
         }
 
     @staticmethod
@@ -1204,6 +1269,20 @@ def _impact_tool_definition() -> dict[str, Any]:
                 'profiles': {'type': 'array', 'items': {'type': 'string'}},
                 'build_profiles': {'type': 'array', 'items': {'type': 'string'}},
                 'runtime_profiles': {'type': 'array', 'items': {'type': 'string'}},
+                'traversal_mode': {
+                    'type': 'string',
+                    'enum': ['repository_only', 'verified_workspace'],
+                    'description': 'Repository-only analysis or continuation through Verified Cross-Repository Links.',
+                },
+                'scope': {
+                    'type': 'string',
+                    'enum': ['repository_only', 'verified_workspace'],
+                    'description': 'Alias for traversal_mode.',
+                },
+                'repository_limit': {'type': 'integer', 'minimum': 1, 'maximum': 100},
+                'depth_limit': {'type': 'integer', 'minimum': 0, 'maximum': 20},
+                'relationship_limit': {'type': 'integer', 'minimum': 1, 'maximum': 10000},
+                'response_limit': {'type': 'integer', 'minimum': 1, 'maximum': 10000},
             },
             'required': ['repository_id'],
             'anyOf': [
