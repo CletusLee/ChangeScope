@@ -21,7 +21,7 @@ ChangeScope is not a generic code-search, code-memory, or full semantic call-gra
 
 ## Current status
 
-The current release is a JRE-free local-analysis capability covering Java, Spring/Spring Boot, annotation- and descriptor-backed WildFly EJB, Quarkus, WildFly & JBoss SOAP Web Services (JAX-WS / WSDL / XSD), legacy VB.NET 2003 WinForms applications without requiring Visual Studio or the .NET runtime, and cross-repository analysis via the Workspace Catalog. The application service is exposed through a CLI; an MCP adapter is planned.
+The current release is a JRE-free local-analysis capability covering Java, Spring/Spring Boot, annotation- and descriptor-backed WildFly EJB, Quarkus, WildFly & JBoss SOAP Web Services (JAX-WS / WSDL / XSD), legacy VB.NET 2003 WinForms applications without requiring Visual Studio or the .NET runtime, and cross-repository analysis via the Workspace Catalog. The same application-service seam is exposed through the CLI and a local stdio MCP server.
 
 ### Validation benchmarks
 
@@ -128,6 +128,24 @@ Recognizes and connects:
   - `changescope evidence <handle>`: context window view.
   - `changescope source <path> <start-line> <end-line>`: explicit line range view.
 
+### Local stdio MCP
+
+Start the model-facing adapter against one explicitly configured repository:
+
+```powershell
+changescope-mcp --repository-root .
+```
+
+For a registered Workspace Catalog, use Workspace Mode instead:
+
+```powershell
+changescope-mcp --workspace-root .
+```
+
+The server publishes five tools—`index_repository`, `discover_contracts`, `analyze_impact`, `get_evidence`, and `read_source_range`—and read-only catalog, Repository Index status, and Index Snapshot resources. Indexing is explicit; discovery and impact refresh an existing index when local inputs change. Impact supports `handles_only`, `primary`, and `context_bundle` evidence modes with deterministic item and character limits. Verified workspace traversal follows only explicit catalog mappings and reports stale or unverified links as structured unresolved items.
+
+The server uses JSON-RPC over stdio only. It does not open a network listener, scan outside the configured repository or Registered Workspace, mutate the Workspace Catalog, fetch remote source, or run a background indexer. Normal analysis outcomes such as `resolved`, `partial`, `ambiguous`, `not_found`, `index_missing`, `stale_target`, and `unsupported` are returned as structured results; malformed requests and filesystem-boundary violations are MCP errors.
+
 ## Installation
 
 Requirements:
@@ -189,12 +207,13 @@ Run the full repository test suite with:
 python -m unittest discover -s tests -v
 ```
 
-The test suite contains **224 unit and integration tests (100% passing)** covering:
+The test suite contains **248 unit and integration tests (100% passing)** covering:
 - Repository discovery & Java AST parsing;
 - Spring Boot beans, properties, and XML;
 - WildFly EJB session beans, descriptors, and interfaces;
 - Quarkus CDI, REST, REST Client, Security, and Native Image boundaries;
 - Workspace Catalog repository registration and mapping resolution;
+- local stdio MCP tool/resource schemas, progress, bounded impact response modes, and workspace traversal;
 - WildFly & JBoss SOAP WSDL/XSD payload graphs, portable endpoints, EJB SOAP beans, handlers, policies, cross-repo continuation, and report parity; and
 - Runtime-free VB.NET 2003 WinForms parser facade, case-insensitive symbol resolution, late-bound call reporting, WinForms event wiring, multi-project process launches, ADO.NET & appSettings config boundaries, COM interop boundaries, and affected tests.
 

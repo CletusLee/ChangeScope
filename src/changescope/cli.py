@@ -65,6 +65,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     impact_command.add_argument("--depth-limit", type=int, default=2)
     impact_command.add_argument("--relationship-limit", type=int, default=100)
     impact_command.add_argument("--response-limit", type=int, default=100)
+    impact_command.add_argument(
+        "--evidence-mode", choices=("handles_only", "primary", "context_bundle"),
+        default="primary", help="source response mode for impact reports",
+    )
+    impact_command.add_argument("--max-items", type=int, default=None)
+    impact_command.add_argument("--max-characters", type=int, default=12_000)
     evidence_command = subcommands.add_parser("evidence", help="retrieve bounded source evidence")
     evidence_command.add_argument("evidence_handle")
     evidence_command.add_argument("--context-lines", type=int, default=2)
@@ -147,6 +153,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 depth_limit=parsed.depth_limit,
                 relationship_limit=parsed.relationship_limit,
                 response_limit=parsed.response_limit,
+                evidence_mode=parsed.evidence_mode,
+                max_items=parsed.max_items,
+                max_characters=parsed.max_characters,
             )
         )
         _render_impact_result(result, parsed.format)
@@ -287,8 +296,8 @@ def _report_path(path: Path) -> str:
     return path.as_posix()
 
 
-def _render_source_navigation(result, output_format: str) -> None:
-    report = {
+def _source_navigation_report(result) -> dict[str, object]:
+    return {
         "evidence_handle": result.evidence_handle,
         "path": _report_path(result.path),
         "start_line": result.start_line,
@@ -298,6 +307,10 @@ def _render_source_navigation(result, output_format: str) -> None:
         "continuation_start_line": result.continuation_start_line,
         "continuation_start_column": result.continuation_start_column,
     }
+
+
+def _render_source_navigation(result, output_format: str) -> None:
+    report = _source_navigation_report(result)
     if output_format == "json":
         print(json.dumps(report, indent=2, sort_keys=True))
         return
@@ -441,6 +454,16 @@ def _impact_report(result: ImpactResult) -> dict[str, object]:
             ],
         },
         "authority": _authority_report(getattr(result, "traversal_mode", "repository_only")),
+        "evidence_mode": getattr(result, "evidence_mode", "primary"),
+        "primary_source_context": (
+            _source_navigation_report(result.primary_source_context)
+            if getattr(result, "primary_source_context", None) is not None else None
+        ),
+        "source_contexts": [
+            _source_navigation_report(context)
+            for context in getattr(result, "source_contexts", ())
+        ],
+        "truncated": getattr(result, "truncated", False),
     }
 
 

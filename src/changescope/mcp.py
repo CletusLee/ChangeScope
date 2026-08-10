@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass
+import hashlib
+import hmac
 import json
 from pathlib import Path
+import secrets
 import sys
 from typing import Any, Callable, TextIO
 from urllib.parse import quote
@@ -73,6 +77,7 @@ class ChangeScopeMCPServer:
             config = MCPServerConfig(repository_root, workspace_root)
         self.config = config
         self.application = application or ChangeScopeApplication()
+        self._cursor_secret = secrets.token_bytes(32)
 
     def list_tools(self) -> list[dict[str, Any]]:
         return _tool_definitions()
@@ -127,7 +132,7 @@ class ChangeScopeMCPServer:
                         'soap_wsdl', 'soap_port_type', 'soap_operation',
                         'rest', 'rest_http_method', 'rest_path',
                         'rest_consumes', 'rest_produces', 'rest_params', 'rest_headers',
-                        'limit', 'offset',
+                        'limit', 'offset', 'cursor',
                     },
                 )
                 payload = self._discover_contracts(arguments)
@@ -142,7 +147,8 @@ class ChangeScopeMCPServer:
                         'rest_consumes', 'rest_produces', 'rest_params', 'rest_headers',
                         'traversal_mode', 'repository_limit', 'depth_limit',
                         'relationship_limit', 'response_limit',
-                        'scope',
+                        'scope', 'evidence_mode', 'response_mode',
+                        'max_items', 'max_characters',
                     },
                 )
                 payload = self._analyze_impact(arguments)
@@ -151,7 +157,7 @@ class ChangeScopeMCPServer:
                     arguments,
                     {
                         'repository_id', 'evidence_handle', 'context_lines',
-                        'max_characters', 'enclosing_symbol',
+                        'max_characters', 'enclosing_symbol', 'cursor',
                     },
                 )
                 payload = self._get_evidence(arguments)
@@ -160,7 +166,7 @@ class ChangeScopeMCPServer:
                     arguments,
                     {
                         'repository_id', 'path', 'start_line', 'end_line',
-                        'start_column', 'max_characters',
+                        'start_column', 'max_characters', 'cursor',
                     },
                 )
                 payload = self._read_source_range(arguments)
@@ -332,6 +338,15 @@ class ChangeScopeMCPServer:
     def _discover_contracts(self, arguments: dict[str, Any]) -> dict[str, Any]:
         repository_id = self._repository_id(arguments)
         repository_root = self._resolve_repository(repository_id)
+        cursor_payload = None
+        if arguments.get('cursor') is not None:
+            cursor_payload = self._decode_cursor(arguments['cursor'], 'discover_contracts')
+            if 'offset' in arguments:
+                raise MCPError(-32602, 'A discovery cursor supplies the offset; do not provide offset with cursor.')
+            if cursor_payload.get('repository_id') != repository_id:
+                raise MCPError(-32602, 'The discovery cursor belongs to a different repository.')
+            if cursor_payload.get('query') != self._discovery_cursor_query(arguments):
+                raise MCPError(-32602, 'The discovery cursor does not match the requested query.')
         if arguments.get('terms') is not None and arguments.get('search_terms') is not None:
             raise MCPError(-32602, 'Specify either terms or search_terms, not both.')
         terms_value = arguments.get('terms', arguments.get('search_terms'))
@@ -403,10 +418,19 @@ class ChangeScopeMCPServer:
         if rest_http_method is not None:
             rest_http_method = rest_http_method.upper()
         wsdl_path = self._relative_path(soap_wsdl, 'soap.wsdl') if soap_wsdl is not None else None
-        limit = self._integer(arguments, 'limit', 50, minimum=1)
+        default_limit = cursor_payload.get('limit', 50) if cursor_payload is not None else 50
+        limit = self._integer(arguments, 'limit', default_limit, minimum=1)
         if limit > 100:
             raise MCPError(-32602, 'limit must be less than or equal to 100.')
-        offset = self._integer(arguments, 'offset', 0, minimum=0)
+        if cursor_payload is not None:
+            cursor_limit = cursor_payload.get('limit')
+            if not isinstance(cursor_limit, int) or cursor_limit != limit:
+                raise MCPError(-32602, 'The discovery cursor does not match the requested page size.')
+            offset = cursor_payload.get('offset')
+            if not isinstance(offset, int) or offset < 0:
+                raise MCPError(-32602, 'The discovery cursor has an invalid offset.')
+        else:
+            offset = self._integer(arguments, 'offset', 0, minimum=0)
         result = self.application.execute(
             ContractDiscoveryRequest(
                 repository_root,
@@ -436,6 +460,21 @@ class ChangeScopeMCPServer:
                 'tool': 'index_repository',
                 'arguments': {'repository_id': repository_id},
             }
+        if cursor_payload is not None and cursor_payload.get('snapshot') != self._snapshot_key(result.snapshot):
+            raise MCPError(-32602, 'The discovery cursor is stale for the current Index Snapshot.')
+        payload['next_cursor'] = (
+            self._encode_cursor(
+                {
+                    'repository_id': repository_id,
+                    'query': self._discovery_cursor_query(arguments),
+                    'limit': result.limit,
+                    'offset': result.next_offset,
+                    'snapshot': self._snapshot_key(result.snapshot),
+                },
+                'discover_contracts',
+            )
+            if result.has_more else None
+        )
         return payload
 
     def _analyze_impact(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -527,6 +566,16 @@ class ChangeScopeMCPServer:
         depth_limit = self._integer(arguments, 'depth_limit', 2, minimum=0)
         relationship_limit = self._integer(arguments, 'relationship_limit', 100, minimum=1)
         response_limit = self._integer(arguments, 'response_limit', 100, minimum=1)
+        evidence_mode = arguments.get('evidence_mode', arguments.get('response_mode', 'primary'))
+        if not isinstance(evidence_mode, str):
+            raise MCPError(-32602, 'evidence_mode must be handles_only, primary, or context_bundle.')
+        evidence_mode = evidence_mode.strip().lower().replace('-', '_')
+        if evidence_mode not in {'handles_only', 'primary', 'context_bundle'}:
+            raise MCPError(-32602, 'evidence_mode must be handles_only, primary, or context_bundle.')
+        max_items = arguments.get('max_items')
+        if max_items is not None:
+            max_items = self._integer(arguments, 'max_items', None, minimum=1)
+        max_characters = self._integer(arguments, 'max_characters', 12_000, minimum=1)
         wsdl_path = self._relative_path(soap_wsdl, 'soap.wsdl') if has_soap else None
         request = ImpactRequest(
             repository_root,
@@ -560,6 +609,9 @@ class ChangeScopeMCPServer:
             depth_limit=depth_limit,
             relationship_limit=relationship_limit,
             response_limit=response_limit,
+            max_items=max_items,
+            evidence_mode=evidence_mode,
+            max_characters=max_characters,
         )
         result = self.application.execute(request)
         if result.outcome == 'index_missing':
@@ -572,26 +624,57 @@ class ChangeScopeMCPServer:
         status = self.application.execute(RepositoryStatusRequest(repository_root))
         if not isinstance(status, RepositoryIndexStatus):
             raise MCPError(-32603, 'The application service returned an unexpected repository status.')
+        cursor_payload = None
+        if arguments.get('cursor') is not None:
+            cursor_payload = self._decode_cursor(arguments['cursor'], 'get_evidence')
+            if cursor_payload.get('repository_id') != repository_id:
+                raise MCPError(-32602, 'The evidence cursor belongs to a different repository.')
+            if set(arguments) - {'repository_id', 'cursor'}:
+                raise MCPError(-32602, 'A source cursor must be used without changing the original request.')
         evidence_handle = arguments.get('evidence_handle')
+        if cursor_payload is not None:
+            evidence_handle = cursor_payload.get('evidence_handle')
         if not isinstance(evidence_handle, str) or not evidence_handle:
             raise MCPError(-32602, 'evidence_handle must be a non-empty string.')
         if not status.index_exists or status.outcome != 'ready':
             return self._missing_index(repository_id, evidence_handle)
-        context_lines = self._integer(arguments, 'context_lines', 2, minimum=0)
-        max_characters = self._integer(arguments, 'max_characters', 4000, minimum=1)
-        enclosing_symbol = arguments.get('enclosing_symbol', False)
-        if not isinstance(enclosing_symbol, bool):
-            raise MCPError(-32602, 'enclosing_symbol must be a boolean.')
-        result = self.application.execute(
-            EvidenceRequest(
-                repository_root,
-                evidence_handle,
-                context_lines,
-                max_characters,
-                enclosing_symbol,
+        if cursor_payload is not None:
+            if cursor_payload.get('snapshot') != self._snapshot_key(status.snapshot):
+                raise MCPError(-32602, 'The evidence cursor is stale for the current Index Snapshot.')
+            max_characters = int(cursor_payload['max_characters'])
+            result = self.application.execute(
+                SourceRequest(
+                    repository_root,
+                    Path(cursor_payload['path']),
+                    int(cursor_payload['start_line']),
+                    int(cursor_payload['end_line']),
+                    int(cursor_payload['max_characters']),
+                    int(cursor_payload['start_column']),
+                )
             )
+            navigation = self._navigation_report(result)
+            navigation['evidence_handle'] = evidence_handle
+        else:
+            context_lines = self._integer(arguments, 'context_lines', 2, minimum=0)
+            max_characters = self._integer(arguments, 'max_characters', 4000, minimum=1)
+            enclosing_symbol = arguments.get('enclosing_symbol', False)
+            if not isinstance(enclosing_symbol, bool):
+                raise MCPError(-32602, 'enclosing_symbol must be a boolean.')
+            result = self.application.execute(
+                EvidenceRequest(
+                    repository_root,
+                    evidence_handle,
+                    context_lines,
+                    max_characters,
+                    enclosing_symbol,
+                )
+            )
+            navigation = self._navigation_report(result)
+        navigation['snapshot'] = self._snapshot_report(status.snapshot)
+        navigation['next_cursor'] = self._navigation_cursor(
+            repository_id, status.snapshot, navigation, 'get_evidence', max_characters
         )
-        return {'repository_id': repository_id, 'outcome': 'resolved', **self._navigation_report(result)}
+        return {'repository_id': repository_id, 'outcome': 'resolved', **navigation}
 
     def _read_source_range(self, arguments: dict[str, Any]) -> dict[str, Any]:
         repository_id = self._repository_id(arguments)
@@ -601,11 +684,26 @@ class ChangeScopeMCPServer:
             raise MCPError(-32603, 'The application service returned an unexpected repository status.')
         if not status.index_exists or status.outcome != 'ready':
             return self._missing_index(repository_id, 'source_range')
-        path = self._relative_path(arguments.get('path'), 'path')
-        start_line = self._integer(arguments, 'start_line', None, minimum=1)
-        end_line = self._integer(arguments, 'end_line', None, minimum=1)
-        start_column = self._integer(arguments, 'start_column', 0, minimum=0)
-        max_characters = self._integer(arguments, 'max_characters', 4000, minimum=1)
+        cursor_payload = None
+        if arguments.get('cursor') is not None:
+            cursor_payload = self._decode_cursor(arguments['cursor'], 'read_source_range')
+            if cursor_payload.get('repository_id') != repository_id:
+                raise MCPError(-32602, 'The source cursor belongs to a different repository.')
+            if set(arguments) - {'repository_id', 'cursor'}:
+                raise MCPError(-32602, 'A source cursor must be used without changing the original request.')
+            if cursor_payload.get('snapshot') != self._snapshot_key(status.snapshot):
+                raise MCPError(-32602, 'The source cursor is stale for the current Index Snapshot.')
+            path = self._relative_path(cursor_payload.get('path'), 'path')
+            start_line = self._integer({'start_line': cursor_payload.get('start_line')}, 'start_line', None, minimum=1)
+            end_line = self._integer({'end_line': cursor_payload.get('end_line')}, 'end_line', None, minimum=1)
+            start_column = self._integer({'start_column': cursor_payload.get('start_column')}, 'start_column', 0, minimum=0)
+            max_characters = self._integer({'max_characters': cursor_payload.get('max_characters')}, 'max_characters', None, minimum=1)
+        else:
+            path = self._relative_path(arguments.get('path'), 'path')
+            start_line = self._integer(arguments, 'start_line', None, minimum=1)
+            end_line = self._integer(arguments, 'end_line', None, minimum=1)
+            start_column = self._integer(arguments, 'start_column', 0, minimum=0)
+            max_characters = self._integer(arguments, 'max_characters', 4000, minimum=1)
         if end_line < start_line:
             raise MCPError(-32602, 'end_line must be greater than or equal to start_line.')
         result = self.application.execute(
@@ -618,7 +716,12 @@ class ChangeScopeMCPServer:
                 start_column,
             )
         )
-        return {'repository_id': repository_id, 'outcome': 'resolved', **self._navigation_report(result)}
+        navigation = self._navigation_report(result)
+        navigation['snapshot'] = self._snapshot_report(status.snapshot)
+        navigation['next_cursor'] = self._navigation_cursor(
+            repository_id, status.snapshot, navigation, 'read_source_range', max_characters
+        )
+        return {'repository_id': repository_id, 'outcome': 'resolved', **navigation}
 
     def _catalog_payload(self) -> dict[str, Any]:
         if self.config.mode == 'workspace':
@@ -683,6 +786,122 @@ class ChangeScopeMCPServer:
             'outcome': status.outcome,
             'snapshot': self._snapshot_report(status.snapshot),
         }
+
+    def _navigation_cursor(
+        self,
+        repository_id: str,
+        snapshot: Any,
+        navigation: dict[str, Any],
+        tool: str,
+        max_characters: int,
+    ) -> str | None:
+        if not navigation.get('truncated'):
+            return None
+        start_line = navigation.get('continuation_start_line')
+        start_column = navigation.get('continuation_start_column')
+        path = navigation.get('path')
+        if not isinstance(start_line, int) or not isinstance(start_column, int) or not isinstance(path, str):
+            return None
+        end_line = navigation.get('end_line')
+        if not isinstance(end_line, int):
+            return None
+        return self._encode_cursor(
+            {
+                'repository_id': repository_id,
+                'snapshot': self._snapshot_key(snapshot),
+                'evidence_handle': navigation.get('evidence_handle'),
+                'path': path,
+                'start_line': start_line,
+                'end_line': max(end_line, start_line),
+                'start_column': start_column,
+                'max_characters': max_characters,
+            },
+            tool,
+        )
+
+    def _encode_cursor(self, payload: dict[str, Any], tool: str) -> str:
+        body = json.dumps(
+            {'version': 1, 'tool': tool, **payload},
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+        signature = hmac.new(self._cursor_secret, body, hashlib.sha256).digest()
+        encoded = base64.urlsafe_b64encode(body + b'.' + signature).decode('ascii')
+        return encoded.rstrip('=')
+
+    def _decode_cursor(self, value: Any, expected_tool: str) -> dict[str, Any]:
+        if not isinstance(value, str) or not value:
+            raise MCPError(-32602, 'cursor must be an opaque non-empty string.')
+        try:
+            raw = base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
+            if len(raw) <= 33 or raw[-33] != ord('.'):
+                raise ValueError
+            body, signature = raw[:-33], raw[-32:]
+        except (ValueError, TypeError):
+            raise MCPError(-32602, 'cursor is not a valid continuation cursor.') from None
+        expected_signature = hmac.new(self._cursor_secret, body, hashlib.sha256).digest()
+        if not hmac.compare_digest(signature, expected_signature):
+            raise MCPError(-32602, 'cursor is not valid for this MCP server instance.')
+        try:
+            payload = json.loads(body.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise MCPError(-32602, 'cursor payload is invalid.') from None
+        if (
+            not isinstance(payload, dict)
+            or payload.get('version') != 1
+            or payload.get('tool') != expected_tool
+        ):
+            raise MCPError(-32602, 'cursor is not valid for this tool.')
+        return payload
+
+    @staticmethod
+    def _discovery_cursor_query(arguments: dict[str, Any]) -> str:
+        query = {
+            key: value
+            for key, value in arguments.items()
+            if key not in {'cursor', 'offset', 'limit'}
+        }
+        return json.dumps(query, sort_keys=True, separators=(',', ':'))
+
+    @staticmethod
+    def _snapshot_key(snapshot: Any) -> str:
+        report = ChangeScopeMCPServer._snapshot_report(snapshot)
+        if snapshot is not None:
+            import sqlite3
+
+            database_path = snapshot.repository_root / '.changescope' / 'index.sqlite'
+            try:
+                connection = sqlite3.connect(database_path)
+                try:
+                    indexed_rows = connection.execute(
+                        'SELECT path, status, content_hash FROM source_files ORDER BY path'
+                    ).fetchall()
+                finally:
+                    connection.close()
+                current_rows = []
+                for path, status, _content_hash in indexed_rows:
+                    source_path = snapshot.repository_root / Path(path)
+                    try:
+                        current_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+                    except OSError:
+                        current_hash = 'unreadable'
+                    current_rows.append((path, status, current_hash))
+                report = {
+                    **report,
+                    'index_fingerprint': hashlib.sha256(
+                        json.dumps(
+                            (indexed_rows, current_rows),
+                            separators=(',', ':'),
+                        ).encode('utf-8')
+                    ).hexdigest(),
+                }
+            except sqlite3.Error:
+                report = {**report, 'index_fingerprint': None}
+        return json.dumps(
+            report,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
 
     def _configured_repositories(self) -> dict[str, Path]:
         if self.config.mode == 'repository':
@@ -1044,6 +1263,16 @@ class ChangeScopeMCPServer:
                 'verified_links': [ChangeScopeMCPServer._mapping_report(mapping) for mapping in getattr(result, 'verified_links', ())],
             },
             'authority': ChangeScopeMCPServer._authority_report(getattr(result, 'traversal_mode', 'repository_only')),
+            'evidence_mode': getattr(result, 'evidence_mode', 'primary'),
+            'primary_source_context': (
+                ChangeScopeMCPServer._navigation_report(result.primary_source_context)
+                if getattr(result, 'primary_source_context', None) is not None else None
+            ),
+            'source_contexts': [
+                ChangeScopeMCPServer._navigation_report(context)
+                for context in getattr(result, 'source_contexts', ())
+            ],
+            'truncated': getattr(result, 'truncated', False),
         }
 
     @staticmethod
@@ -1283,12 +1512,27 @@ def _impact_tool_definition() -> dict[str, Any]:
                 'depth_limit': {'type': 'integer', 'minimum': 0, 'maximum': 20},
                 'relationship_limit': {'type': 'integer', 'minimum': 1, 'maximum': 10000},
                 'response_limit': {'type': 'integer', 'minimum': 1, 'maximum': 10000},
+                'evidence_mode': {
+                    'type': 'string',
+                    'enum': ['handles_only', 'primary', 'context_bundle'],
+                    'default': 'primary',
+                    'description': 'Source response mode: handles only, one primary context, or a bounded context bundle.',
+                },
+                'response_mode': {
+                    'type': 'string',
+                    'enum': ['handles_only', 'primary', 'context_bundle'],
+                    'description': 'Alias for evidence_mode.',
+                },
+                'max_items': {'type': 'integer', 'minimum': 1, 'maximum': 10000},
+                'max_characters': {'type': 'integer', 'minimum': 1, 'maximum': 1000000},
             },
             'required': ['repository_id'],
             'anyOf': [
                 {'required': ['target']},
                 {'required': ['soap']},
                 {'required': ['soap_wsdl', 'soap_port_type', 'soap_operation']},
+                {'required': ['rest']},
+                {'required': ['rest_http_method', 'rest_path']},
             ],
         },
     }
@@ -1307,8 +1551,13 @@ def _evidence_tool_definition() -> dict[str, Any]:
                 'context_lines': {'type': 'integer', 'minimum': 0},
                 'max_characters': {'type': 'integer', 'minimum': 1},
                 'enclosing_symbol': {'type': 'boolean'},
+                'cursor': {'type': 'string', 'description': 'Opaque snapshot-bound continuation cursor.'},
             },
-            'required': ['repository_id', 'evidence_handle'],
+            'required': ['repository_id'],
+            'oneOf': [
+                {'required': ['evidence_handle']},
+                {'required': ['cursor']},
+            ],
         },
     }
 
@@ -1327,8 +1576,13 @@ def _source_tool_definition() -> dict[str, Any]:
                 'end_line': {'type': 'integer', 'minimum': 1},
                 'start_column': {'type': 'integer', 'minimum': 0},
                 'max_characters': {'type': 'integer', 'minimum': 1},
+                'cursor': {'type': 'string', 'description': 'Opaque snapshot-bound continuation cursor.'},
             },
-            'required': ['repository_id', 'path', 'start_line', 'end_line'],
+            'required': ['repository_id'],
+            'oneOf': [
+                {'required': ['path', 'start_line', 'end_line']},
+                {'required': ['cursor']},
+            ],
         },
     }
 

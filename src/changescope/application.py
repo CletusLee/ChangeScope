@@ -489,6 +489,8 @@ class ImpactRequest:
     max_depth: int | None = None
     max_relationships: int | None = None
     max_items: int | None = None
+    evidence_mode: str = "primary"
+    max_characters: int = 12_000
 
     def __post_init__(self) -> None:
         aliases = (
@@ -513,6 +515,14 @@ class ImpactRequest:
             raise ValueError("Repository limit must be positive and depth limit cannot be negative.")
         if self.relationship_limit < 1 or self.response_limit < 1:
             raise ValueError("Relationship and response limits must be positive.")
+        evidence_mode = self.evidence_mode.strip().lower().replace("-", "_")
+        if evidence_mode not in {"handles_only", "primary", "context_bundle"}:
+            raise ValueError("Evidence mode must be handles_only, primary, or context_bundle.")
+        object.__setattr__(self, "evidence_mode", evidence_mode)
+        if self.max_characters < 1:
+            raise ValueError("The impact source character limit must be positive.")
+        if self.max_items is not None and self.max_items < 1:
+            raise ValueError("The impact item limit must be positive.")
 
 
 @dataclass(frozen=True)
@@ -675,6 +685,10 @@ class ImpactResult:
     traversal_limited: bool = False
     traversal_limit_reason: str | None = None
     verified_links: tuple[CatalogMapping, ...] = ()
+    evidence_mode: str = "primary"
+    primary_source_context: SourceNavigation | None = None
+    source_contexts: tuple[SourceNavigation, ...] = ()
+    truncated: bool = False
 
     @property
     def snapshots(self) -> dict[str, IndexSnapshot]:
@@ -802,8 +816,133 @@ class ChangeScopeApplication:
         if isinstance(request, CatalogSummaryRequest):
             return _workspace_catalog_summary(request.catalog_root)
         if isinstance(request, ImpactRequest) and request.traversal_mode == "verified_workspace":
-            return _impact_workspace(request)
+            return _shape_impact_result(_impact_workspace(request), request)
+        if isinstance(request, ImpactRequest):
+            return _shape_impact_result(_impact_repository(request), request)
         return _impact_repository(request)
+
+
+def _shape_impact_result(result: ImpactResult, request: ImpactRequest) -> ImpactResult:
+    """Add bounded source context without changing the analysis relationship model."""
+    candidates = result.candidates
+    relationships = result.relationships
+    unresolved_items = result.unresolved_items
+    manual_verification_surfaces = result.manual_verification_surfaces
+    truncated = result.truncated
+    if request.max_items is not None:
+        for collection_name, collection in (
+            ("candidates", candidates),
+            ("relationships", relationships),
+            ("unresolved_items", unresolved_items),
+            ("manual_verification_surfaces", manual_verification_surfaces),
+        ):
+            if len(collection) <= request.max_items:
+                continue
+            truncated = True
+            if collection_name == "candidates":
+                candidates = collection[:request.max_items]
+            elif collection_name == "relationships":
+                relationships = collection[:request.max_items]
+            elif collection_name == "unresolved_items":
+                unresolved_items = collection[:request.max_items]
+            else:
+                manual_verification_surfaces = collection[:request.max_items]
+
+    primary: SourceNavigation | None = None
+    contexts: list[SourceNavigation] = []
+    if result.outcome in {"resolved", "partial"} and request.evidence_mode != "handles_only":
+        target = _primary_source_target(result)
+        if target is not None:
+            try:
+                primary = _read_bounded_source(
+                    result.snapshot.repository_root if result.snapshot else request.repository_root.resolve(),
+                    target.path,
+                    target.start_line,
+                    target.end_line,
+                    target.evidence_handle,
+                    request.max_characters,
+                )
+            except ValueError:
+                primary = None
+            if primary is not None:
+                contexts.append(primary)
+                truncated = truncated or primary.truncated
+
+        if request.evidence_mode == "context_bundle" and contexts:
+            used_characters = len(primary.content)
+            for relationship in _prioritized_relationships(relationships):
+                if relationship.evidence_handle == primary.evidence_handle:
+                    continue
+                remaining = request.max_characters - used_characters
+                if remaining <= 0:
+                    truncated = True
+                    break
+                try:
+                    context = _read_bounded_source(
+                        result.snapshot.repository_root if result.snapshot else request.repository_root.resolve(),
+                        relationship.path,
+                        relationship.start_line,
+                        relationship.end_line,
+                        relationship.evidence_handle,
+                        remaining,
+                    )
+                except ValueError:
+                    continue
+                if context.truncated:
+                    truncated = True
+                    continue
+                contexts.append(context)
+                used_characters += len(context.content)
+        if request.max_items is not None and len(contexts) > request.max_items:
+            contexts = contexts[:request.max_items]
+            truncated = True
+
+    outcome = result.outcome
+    if truncated and outcome == "resolved":
+        outcome = "partial"
+    return replace(
+        result,
+        outcome=outcome,
+        candidates=tuple(candidates),
+        relationships=tuple(relationships),
+        unresolved_items=tuple(unresolved_items),
+        manual_verification_surfaces=tuple(manual_verification_surfaces),
+        evidence_mode=request.evidence_mode,
+        primary_source_context=primary,
+        source_contexts=tuple(contexts),
+        truncated=truncated,
+    )
+
+
+def _primary_source_target(result: ImpactResult) -> ImpactTarget | None:
+    if result.target is not None and ("#" in result.target.signature or result.target.language == "vbnet"):
+        return result.target
+    for relationship in result.relationships:
+        if "implementation" in relationship.kind.lower() or "endpoint" in relationship.kind.lower():
+            return ImpactTarget(
+                relationship.caller,
+                relationship.path,
+                relationship.start_line,
+                relationship.end_line,
+                relationship.evidence_handle,
+                relationship.language,
+            )
+    return result.target
+
+
+def _prioritized_relationships(
+    relationships: tuple[ImpactRelationship, ...],
+) -> tuple[ImpactRelationship, ...]:
+    def priority(relationship: ImpactRelationship) -> tuple[int, int]:
+        kind = relationship.kind.lower()
+        confidence = {"high": 0, "medium": 1, "low": 2}.get(relationship.confidence, 3)
+        if "test" in kind:
+            return (2, confidence)
+        if "configuration" in kind or "config" in kind:
+            return (3, confidence)
+        return (0 if confidence == 0 else 1, confidence)
+
+    return tuple(sorted(relationships, key=priority))
 
 
 def _evidence_context(request: EvidenceRequest) -> SourceNavigation:
